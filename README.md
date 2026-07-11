@@ -1,6 +1,8 @@
 # whence
 
-**Trace every pull request back to the agent, machine, and terminal tab that made it — so you can jump straight back to the session that's still running.**
+*Whence came this pull request?*
+
+**Trace every one back to the agent, machine, and terminal tab that made it — so you can jump straight back to the session that's still running.**
 
 If you drive a lot of AI coding agents (Claude Code, Codex) across several
 machines and a wall of [cmux](https://cmux.com) tabs, your PR queue turns into a
