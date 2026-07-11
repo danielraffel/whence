@@ -53,7 +53,13 @@ DEFAULT_CONFIG = {
 
 
 def sh(*a, **k):
-    return subprocess.run(a, capture_output=True, text=True, **k)
+    # Bounded + graceful: a missing binary (e.g. no cmux) or a slow network call
+    # degrades to an empty result instead of crashing or hanging the caller.
+    k.setdefault("timeout", 15)
+    try:
+        return subprocess.run(a, capture_output=True, text=True, **k)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        return subprocess.CompletedProcess(a, 1, "", str(e))
 
 
 def load_config(cli_hide: str) -> dict:
@@ -208,6 +214,173 @@ def repo_allowed(cfg: dict) -> bool:
     return True
 
 
+# The one cross-agent trigger: wrap the command that opens the PR. Every agent
+# shells out to one of these, so a PATH shim catches them all — no per-agent hook,
+# no Shipyard requirement. Key = tool name, value = the sh test that means "a PR
+# was just opened" (so the shim only stamps on PR-creating invocations). We cover
+# every common way a PR gets opened: the GitHub CLIs (`gh`/`ghapp pr create`) and
+# the orchestrators (`shipyard pr`, `pulp pr`). Over-firing is harmless — whence
+# no-ops when the branch has no PR — so it's fine to err toward catching more.
+PR_TOOLS = {
+    "shipyard": '[ "$1" = pr ]',
+    "pulp":     '[ "$1" = pr ]',
+    "gh":       '[ "$1" = pr ] && [ "$2" = create ]',
+    "ghapp":    '[ "$1" = pr ] && [ "$2" = create ]',
+}
+PATH_MARK_RE = re.compile(r"\n*# >>> whence shims >>>.*?# <<< whence shims <<<\n", re.S)
+
+
+def _real_tool(name: str, shim_dir: pathlib.Path) -> str:
+    """Resolve the real binary for `name`, skipping our own shim dir (so a
+    re-install never points a shim at itself)."""
+    sd = os.path.realpath(shim_dir)
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if not d or os.path.realpath(d) == sd:
+            continue
+        p = os.path.join(d, name)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return ""
+
+
+def install_hook(print_only: bool) -> int:
+    """Install (or print) the PATH shim that stamps every future PR at open time,
+    for any agent, without depending on Shipyard."""
+    shim_dir = CFG_DIR / "shims"
+    made = []
+    for tool, trig in PR_TOOLS.items():
+        real = _real_tool(tool, shim_dir)
+        if real:
+            made.append((tool, real, trig))
+    block = ("# >>> whence shims >>>  (managed by `whence --install-hook`; safe to delete)\n"
+             f'case ":$PATH:" in *":{shim_dir}:"*) ;; *) export PATH="{shim_dir}:$PATH" ;; esac\n'
+             "# <<< whence shims <<<\n")
+
+    def shim_body(tool, trig):
+        # Resolve the real tool at call time (PATH minus our own shim dir) rather
+        # than baking an absolute path — robust to the tool being upgraded, moved,
+        # or removed, and self-recursion-proof. Then run the stamp in the
+        # FOREGROUND: a detached job is reaped when an agent harness cleans up the
+        # command's process group, so it must finish before the shim returns.
+        # whence bounds its own calls (~15s each), never blocks the exit code, and
+        # stays best-effort (errors swallowed). If the real tool is gone, degrade
+        # to a clean "command not found" instead of a confusing exec error.
+        return (
+            f"#!/bin/sh\n"
+            f"# whence shim for {tool}: run the real command, then stamp the PR (best-effort).\n"
+            f'__shim_dir="{shim_dir}"\n'
+            f'__real=""; __oldifs=$IFS; IFS=:\n'
+            f"for __d in $PATH; do\n"
+            f'  [ -n "$__d" ] || continue\n'
+            f'  [ "$__d" = "$__shim_dir" ] && continue\n'
+            f'  if [ -x "$__d/{tool}" ]; then __real="$__d/{tool}"; break; fi\n'
+            f"done\n"
+            f"IFS=$__oldifs\n"
+            f'if [ -z "$__real" ]; then echo "{tool}: command not found" >&2; exit 127; fi\n'
+            f'"$__real" "$@"; __rc=$?\n'
+            f'if {trig}; then command -v whence >/dev/null 2>&1 && '
+            f"whence --auto >/dev/null 2>&1 || true; fi\n"
+            f"exit $__rc\n")
+
+    if print_only:
+        print(f"# shim dir: {shim_dir}")
+        for tool, real, trig in made:
+            print(f"# {tool}  ->  {real}")
+        print("\n# shell snippet (add to ~/.zshenv, and ~/.bashrc if you use bash):\n" + block)
+        return 0
+    if not made:
+        print("whence: found no PR tool (shipyard/gh/pulp) on PATH — nothing to shim.\n"
+              "  Install one, or wire an agent hook instead (see the README).", file=sys.stderr)
+        return 1
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    for tool, real, trig in made:
+        f = shim_dir / tool
+        f.write_text(shim_body(tool, trig))
+        f.chmod(0o755)
+    targets = [pathlib.Path(os.path.expanduser("~/.zshenv"))]  # always: universal zsh init
+    bashrc = pathlib.Path(os.path.expanduser("~/.bashrc"))
+    if bashrc.exists():
+        targets.append(bashrc)
+    for rcp in targets:
+        cur = rcp.read_text() if rcp.exists() else ""
+        cur = PATH_MARK_RE.sub("\n", cur).rstrip()
+        rcp.write_text((cur + "\n\n" + block) if cur else block)
+    print(f"whence: installed PR shims in {shim_dir}")
+    for tool, real, _ in made:
+        print(f"  {tool:9} -> {real}")
+    print("PATH updated in: " + ", ".join(str(t) for t in targets))
+    print("Open a new shell/tab (or `source ~/.zshenv`) to activate. "
+          "Every PR opened after that self-stamps.")
+    return 0
+
+
+def uninstall_hook() -> int:
+    """Remove the shims and the PATH block — full, clean reversal of --install-hook."""
+    shim_dir = CFG_DIR / "shims"
+    removed = []
+    if shim_dir.exists():
+        for f in sorted(shim_dir.iterdir()):
+            f.unlink(); removed.append(f.name)
+        try:
+            shim_dir.rmdir()
+        except OSError:
+            pass
+    for rc in ("~/.zshenv", "~/.bashrc"):
+        rcp = pathlib.Path(os.path.expanduser(rc))
+        if not rcp.exists():
+            continue
+        cur = rcp.read_text()
+        new = PATH_MARK_RE.sub("\n", cur)
+        new = new.rstrip() + "\n" if new.strip() else ""
+        if new != cur:
+            rcp.write_text(new)
+    print(f"whence: removed shims {removed or '(none)'} and the PATH block.")
+    print("Open a new shell/tab for it to take full effect.")
+    return 0
+
+
+def _best_gh() -> str:
+    """Pick the GitHub CLI to use for whence's own calls: gh if present, else
+    ghapp (App-token). Lets machines that only have ghapp work with zero config."""
+    from shutil import which
+    return "gh" if which("gh") else ("ghapp" if which("ghapp") else "gh")
+
+
+def setup(host: str | None) -> int:
+    """One-shot guided setup: name the machine, write the config (auto-picking the
+    GitHub CLI), and install the every-future-PR hook. Reports what it will catch."""
+    from shutil import which
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    hf = CFG_DIR / "host-label"
+    if host and host.strip():
+        hf.write_text(host.strip() + "\n"); hs = host.strip()
+    elif hf.exists() and hf.read_text().strip():
+        hs = hf.read_text().strip()
+    else:
+        hs = socket.gethostname().split(".")[0]
+        hf.write_text(hs + "\n")
+    cf = CFG_DIR / "config.json"
+    cfg = dict(DEFAULT_CONFIG)
+    if cf.exists():
+        try: cfg = json.loads(cf.read_text())
+        except Exception: pass
+    # Auto-pick the GitHub CLI unless the user already set a non-default one.
+    if not cfg.get("gh") or cfg.get("gh") == "gh":
+        cfg["gh"] = _best_gh()
+    cf.write_text(json.dumps(cfg, indent=2) + "\n")
+
+    print(f"whence setup")
+    print(f"  machine label : {hs}   ({hf})")
+    print(f"  github CLI    : {cfg['gh']}   (for whence's own calls)")
+    print(f"  config        : {cf}")
+    have = [t for t in PR_TOOLS if which(t)]
+    print(f"  will catch PRs opened via: {', '.join(have) or '(none found — install gh/ghapp/shipyard/pulp)'}")
+    print()
+    rc = install_hook(print_only=False)
+    print("\nSetup complete. New PRs from this machine self-stamp once you open a fresh shell/tab.")
+    return rc
+
+
 def write_default_config(force: bool) -> None:
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     f = CFG_DIR / "config.json"
@@ -242,8 +415,25 @@ def main() -> int:
     ap.add_argument("--init", action="store_true", help="write an editable config with every knob")
     ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
     ap.add_argument("--show", action="store_true", help="print the effective config and where it lives")
+    ap.add_argument("--setup", action="store_true",
+                    help="guided one-shot: name the machine, write config, install the hook")
+    ap.add_argument("--host", help="machine label to use with --setup (default: hostname)")
+    ap.add_argument("--install-hook", action="store_true",
+                    help="install the PATH shim so every future PR self-stamps (any agent)")
+    ap.add_argument("--uninstall-hook", action="store_true",
+                    help="remove the shim and PATH block (full reversal of --install-hook)")
+    ap.add_argument("--print-hook", action="store_true",
+                    help="print the shim + shell snippet without writing anything")
     args = ap.parse_args()
 
+    if args.setup:
+        return setup(args.host)
+    if args.print_hook:
+        return install_hook(print_only=True)
+    if args.install_hook:
+        return install_hook(print_only=False)
+    if args.uninstall_hook:
+        return uninstall_hook()
     if args.init:
         write_default_config(args.force); return 0
 

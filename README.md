@@ -47,9 +47,16 @@ run it** (or wire a hook). Setup is **once per machine**:
 
 ```bash
 git clone https://github.com/danielraffel/whence     # put `whence` on your PATH
-echo m3 > ~/.config/whence/host-label                 # name this machine (any string)
-# also needs: python3, gh (authenticated), and cmux for the tab/session fields
+whence --setup --host m3                               # name this machine + install the every-PR hook
+# also needs: python3, a GitHub CLI (gh or ghapp), and cmux for the tab/session fields
 ```
+
+`whence --setup` is the guided one-shot: it names the machine, writes the config
+(auto-selecting `gh` or `ghapp` based on what's installed), installs the
+every-future-PR hook, and prints exactly **which PR commands it will catch** on
+this machine. Prefer to do it in pieces? `whence --init` (config),
+`echo m3 > ~/.config/whence/host-label` (name), `whence --install-hook` (hook)
+are the same steps by hand.
 
 After that it works in **every repo you run it in** — there is no per-repo
 install. GitHub labels are per-repo, so the first time it stamps in a given repo
@@ -91,18 +98,47 @@ whence --apply
 
 Re-running is idempotent — it replaces its own labels/footer, never piling up.
 
-### Auto-stamp on every PR
+### Auto-stamp on every PR — the one-liner (recommended)
 
-Pick whichever fits your flow — the tool is just a script, so it drops into any
-hook that fires around PR creation:
+```bash
+whence --install-hook          # once per machine
+```
 
-- **Shell wrapper** — alias it over your PR command so it always runs after:
-  ```bash
-  gpr() { gh pr create "$@" && python3 /path/to/whence --apply; }
-  ```
-- **Claude Code hook** — see [`examples/claude-code-hook.md`](examples/claude-code-hook.md).
-- **Merge orchestrators** (e.g. Shipyard) — call it from the PR-open step so
-  every agent's PR is stamped centrally. See [`examples/shipyard.md`](examples/shipyard.md).
+This is the **one mechanism that works for every agent**. It doesn't hook any
+particular agent — it wraps the *command that opens the PR* with a tiny PATH
+shim, and stamps the branch's PR right after. It covers **every common way a PR
+gets opened** — `gh pr create`, `ghapp pr create`, `shipyard pr`, `pulp pr`
+(whichever of those you have installed) — so no matter which path an agent takes,
+the PR gets stamped. One install, no per-agent config, and **no dependency on
+Shipyard** (it wraps plain `gh`/`ghapp` just as happily). Open a new shell/tab
+and every PR from then on self-stamps.
+
+Over-firing is harmless: if a command runs that didn't actually open a PR, whence
+just finds no PR for the branch and does nothing — so it errs toward catching
+more, never toward missing one. Uninstall any time with `whence --uninstall-hook`
+(removes the shim and the PATH block).
+
+Why a command shim and not "an agent hook": each agent's hook system is a
+*different* config, and most of cmux's agents have no PR-time hook at all. The PR
+command is the one layer they all share. The shim runs in the agent's own shell,
+so the session/tab it captures is real; it never blocks or changes the PR
+command's result; and because stamping is idempotent, it's safe even if a second
+mechanism (below) also fires.
+
+```bash
+whence --print-hook            # see exactly what it would install, write nothing
+```
+
+The shim lives in `~/.config/whence/shims/` and prepends that dir to `PATH` via a
+clearly-marked block in `~/.zshenv` (and `~/.bashrc` if present). Delete the block
+to uninstall.
+
+**Other ways** (optional; they coexist with the shim — stamping is idempotent):
+
+- **Claude Code / Codex hook** — if you'd rather trigger from the agent. See
+  [`examples/claude-code-hook.md`](examples/claude-code-hook.md).
+- **Merge orchestrators** (e.g. Shipyard) — stamp centrally at the PR-open step.
+  See [`examples/shipyard.md`](examples/shipyard.md).
 - **As an agent skill** — [`skill/SKILL.md`](skill/SKILL.md) tells an agent to
   stamp its PR right after opening it.
 
