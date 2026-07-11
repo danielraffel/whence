@@ -110,18 +110,18 @@ dependable choice for "every PR this agent opens gets stamped." One command wire
 it:
 
 ```bash
-whence --install-agent-hook          # Claude (global) + Codex (this repo)
+whence --install-agent-hook          # Claude + Codex, both global
 whence --install-agent-hook claude   # just Claude
-whence --install-agent-hook codex    # just Codex, in the current repo
+whence --install-agent-hook codex    # just Codex
 ```
 
 It writes a small `pr-hook.sh` and registers a `PostToolUse` hook that runs
-`whence --hook` — which reads the tool call, and stamps only when the command
-actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). **Claude**
-is global (`~/.claude/settings.json`). **Codex** only reads each repo's own
-`.codex/hooks.json` and gates hooks behind a trust prompt, so run the `codex`
-variant inside each repo you want covered — Codex will ask you to trust it once.
-(cmux also wires Claude's hooks automatically.) See
+`whence --hook` — which reads the tool call and stamps only when the command
+actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). Both are
+**global, once per machine**: Claude via `~/.claude/settings.json`, Codex via
+`~/.codex/hooks.json` — no per-repo install. Codex gates hooks behind trust, so
+it asks you to trust the whence hook once on its next run. (cmux also wires
+Claude's hooks automatically.) See
 [`examples/claude-code-hook.md`](examples/claude-code-hook.md) for the manual form.
 
 **Best-effort, zero per-agent config — the shell hook.**

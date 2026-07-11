@@ -472,17 +472,16 @@ def install_agent_hook(scope: str) -> int:
                           "Bash", {})
         did.append("claude (~/.claude/settings.json, global)")
     if scope in ("all", "codex"):
-        top = sh("git", "rev-parse", "--show-toplevel").stdout.strip() or os.getcwd()
-        _wire_posttooluse(pathlib.Path(top) / ".codex/hooks.json",
+        _wire_posttooluse(pathlib.Path(os.path.expanduser("~/.codex/hooks.json")),
                           "Bash|Shell|shell|local_shell|exec", {"timeout": 20000})
-        did.append(f"codex ({top}/.codex/hooks.json, this repo)")
+        did.append("codex (~/.codex/hooks.json, global)")
     print(f"whence: wrote {PR_HOOK}")
     for d in did:
         print(f"  wired {d}")
     if scope in ("all", "codex"):
-        print("\nCodex note: Codex reads each repo's own .codex/hooks.json and gates it\n"
-              "behind trust — it will ask you to trust the hook on its next run here.\n"
-              "Run `whence --install-agent-hook codex` inside each repo you want covered.")
+        print("\nCodex note: this is Codex's GLOBAL hooks file — it applies to every repo,\n"
+              "no per-repo install. Codex gates hooks behind trust, so it will ask you to\n"
+              "trust the whence hook once on its next run.")
     return 0
 
 
