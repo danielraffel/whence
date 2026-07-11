@@ -199,8 +199,15 @@ def collect() -> dict:
         p["jump"] = f"cmux surface focus {surface}"
         p["relaunch"] = f"cmux surface resume get --surface {surface}"  # exact cmd, any agent
 
-    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
-           or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or "")
+    # Session id must be CONSISTENT with the detected agent — never pair claude's
+    # session with codex's resume syntax (or vice versa) if both env vars leak in.
+    if agent == "claude":
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    elif agent == "codex":
+        sid = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or ""
+    else:
+        sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+               or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or "")
     if not sid and restore:
         m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", restore)
         sid = m.group(0) if m else ""
