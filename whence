@@ -41,6 +41,9 @@ KNOWN_URL = {"claude": "https://claude.ai/code/{bridge}"}
 MARK_RE = re.compile(r"<!-- whence( .*?)? -->.*?<!-- /whence -->\n?", re.S)
 OLD_PREFIXES = ("agent:", "host:", "ws:")
 
+# What counts as "a PR was just opened", matched against an agent hook's command.
+PR_CMD_RE = re.compile(r"(?:gh|ghapp) pr create|shipyard pr|pulp pr")
+
 # The whole config, every knob shown at its default. `whence --init` writes this.
 # Flip any field false to drop it; set labels/footer false to drop a whole surface;
 # set repos.mode to "allow"/"deny" with a list to scope which repos get stamped.
@@ -390,6 +393,75 @@ def uninstall_hook() -> int:
     return 0
 
 
+PR_HOOK = CFG_DIR / "pr-hook.sh"
+
+
+def _write_pr_hook() -> pathlib.Path:
+    """Write the tiny stdin shim an agent's PostToolUse hook runs. It just pipes
+    the tool JSON into `whence --hook` (all parsing/matching happens in-process,
+    so there's no fragile shell quoting). whence is called by absolute path
+    because plain `whence` is a zsh builtin."""
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    whence_bin = os.path.realpath(sys.argv[0])
+    PR_HOOK.write_text(
+        "#!/bin/sh\n"
+        "# whence agent PR hook — an agent PostToolUse hook pipes the tool-call JSON\n"
+        "# to this on stdin; whence decides whether it opened a PR and stamps it.\n"
+        "# Always exits 0 so a stamping hiccup never breaks the agent.\n"
+        f'"{whence_bin}" --hook || true\n'
+        "exit 0\n")
+    PR_HOOK.chmod(0o755)
+    return PR_HOOK
+
+
+def _wire_posttooluse(path: pathlib.Path, matcher: str, extra: dict) -> None:
+    """Idempotently add a PostToolUse entry pointing at pr-hook.sh to a Claude/
+    Codex-style hooks JSON (they share the schema)."""
+    d = {}
+    if path.exists():
+        try: d = json.loads(path.read_text())
+        except Exception: d = {}
+    ptu = d.setdefault("hooks", {}).setdefault("PostToolUse", [])
+    cmd = str(PR_HOOK)
+    def has(e): return any(x.get("command", "").endswith("pr-hook.sh") for x in e.get("hooks", []))
+    mine = [e for e in ptu if e.get("matcher") == matcher or has(e)]
+    entry = {"type": "command", "command": cmd, **extra}
+    if any(has(e) for e in ptu):
+        for e in ptu:
+            if has(e):
+                e["hooks"] = [x for x in e["hooks"] if not x.get("command", "").endswith("pr-hook.sh")] + [entry]
+    elif mine:
+        mine[0].setdefault("hooks", []).append(entry)
+    else:
+        ptu.append({"matcher": matcher, "hooks": [entry]})
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(d, indent=2) + "\n")
+
+
+def install_agent_hook(scope: str) -> int:
+    """Wire the reliable in-process agent hooks: Claude globally, Codex per-repo
+    (Codex only reads a repo's own .codex/hooks.json, and gates it behind trust)."""
+    _write_pr_hook()
+    did = []
+    if scope in ("all", "claude"):
+        _wire_posttooluse(pathlib.Path(os.path.expanduser("~/.claude/settings.json")),
+                          "Bash", {})
+        did.append("claude (~/.claude/settings.json, global)")
+    if scope in ("all", "codex"):
+        top = sh("git", "rev-parse", "--show-toplevel").stdout.strip() or os.getcwd()
+        _wire_posttooluse(pathlib.Path(top) / ".codex/hooks.json",
+                          "Bash|Shell|shell|local_shell|exec", {"timeout": 20000})
+        did.append(f"codex ({top}/.codex/hooks.json, this repo)")
+    print(f"whence: wrote {PR_HOOK}")
+    for d in did:
+        print(f"  wired {d}")
+    if scope in ("all", "codex"):
+        print("\nCodex note: Codex reads each repo's own .codex/hooks.json and gates it\n"
+              "behind trust — it will ask you to trust the hook on its next run here.\n"
+              "Run `whence --install-agent-hook codex` inside each repo you want covered.")
+    return 0
+
+
 def _best_gh() -> str:
     """Pick the GitHub CLI to use for whence's own calls: gh if present, else
     ghapp (App-token). Lets machines that only have ghapp work with zero config."""
@@ -503,8 +575,15 @@ def main() -> int:
                     help="print the shim + shell snippet without writing anything")
     ap.add_argument("--resync", action="store_true",
                     help="re-stamp this tab's open PRs with the current name (on demand)")
+    ap.add_argument("--install-agent-hook", nargs="?", const="all", choices=["all", "claude", "codex"],
+                    metavar="all|claude|codex",
+                    help="wire the reliable in-process agent hook (Claude global, Codex per-repo)")
+    ap.add_argument("--hook", action="store_true",
+                    help="internal: read an agent's tool JSON from stdin and stamp if it opened a PR")
     args = ap.parse_args()
 
+    if args.install_agent_hook:
+        return install_agent_hook(args.install_agent_hook)
     if args.resync:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -522,6 +601,23 @@ def main() -> int:
 
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
+
+    if args.hook:
+        # Agent PostToolUse: read the tool JSON, stamp only if it opened a PR.
+        if sys.stdin.isatty():   # run by hand with no piped input — don't block
+            return 0
+        try: raw = sys.stdin.read()
+        except Exception: raw = ""
+        cmd = ""
+        try:
+            d = json.loads(raw); ti = d.get("tool_input") or d.get("toolInput") or {}
+            cmd = ti.get("command") or ti.get("cmd") or ""
+        except Exception:
+            cmd = ""
+        if not PR_CMD_RE.search(cmd or raw):
+            return 0
+        args.auto = True   # a PR was opened → fall through and stamp it quietly
+
     post_labels = cfg["labels"] and not args.no_labels
     post_footer = cfg["footer"] and not args.no_footer
 

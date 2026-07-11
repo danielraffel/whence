@@ -106,10 +106,23 @@ There are two triggers; they're idempotent, so use either or both.
 
 **Reliable — your agent's own hook.** An agent hook fires *in the agent's
 process*, so it always runs regardless of how the agent shells out. It's the
-dependable choice for "every PR this agent opens gets stamped." Claude Code and
-Codex both support it (and cmux wires Claude's automatically). See
-[`examples/claude-code-hook.md`](examples/claude-code-hook.md) — it just runs
-`whence --auto` after a PR command.
+dependable choice for "every PR this agent opens gets stamped." One command wires
+it:
+
+```bash
+whence --install-agent-hook          # Claude (global) + Codex (this repo)
+whence --install-agent-hook claude   # just Claude
+whence --install-agent-hook codex    # just Codex, in the current repo
+```
+
+It writes a small `pr-hook.sh` and registers a `PostToolUse` hook that runs
+`whence --hook` — which reads the tool call, and stamps only when the command
+actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). **Claude**
+is global (`~/.claude/settings.json`). **Codex** only reads each repo's own
+`.codex/hooks.json` and gates hooks behind a trust prompt, so run the `codex`
+variant inside each repo you want covered — Codex will ask you to trust it once.
+(cmux also wires Claude's hooks automatically.) See
+[`examples/claude-code-hook.md`](examples/claude-code-hook.md) for the manual form.
 
 **Best-effort, zero per-agent config — the shell hook.**
 
