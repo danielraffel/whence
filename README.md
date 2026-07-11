@@ -197,9 +197,14 @@ settings any time (so you never have to wonder where it lives).
   "footer": true,
   "colors": { "agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df" },
   "repos": { "mode": "all", "list": [] },
-  "gh": "gh"
+  "gh": "gh",
+  "label_maxlen": 24
 }
 ```
+
+Long tab/workspace names are clipped to `label_maxlen` chars (default 24) with a
+`…` on the **queue label** only — the **footer always keeps the full name**. Set
+it shorter or longer to taste.
 
 | To drop… | Set |
 |----------|-----|

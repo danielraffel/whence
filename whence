@@ -54,6 +54,7 @@ DEFAULT_CONFIG = {
     "colors": dict(DEFAULT_COLORS),
     "repos": {"mode": "all", "list": []},
     "gh": "gh",
+    "label_maxlen": 24,
 }
 
 
@@ -70,7 +71,7 @@ def sh(*a, **k):
 def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
-           "footer": True, "labels": True, "gh": ""}
+           "footer": True, "labels": True, "gh": "", "label_maxlen": 24}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -81,6 +82,7 @@ def load_config(cli_hide: str) -> dict:
             cfg["footer"] = bool(d.get("footer", True))   # post the PR-description footer?
             cfg["labels"] = bool(d.get("labels", True))   # post the queue labels?
             cfg["gh"] = str(d.get("gh", "") or "")        # gh binary, e.g. "ghapp" (App-token auth)
+            cfg["label_maxlen"] = int(d.get("label_maxlen", 24))  # clip long labels to N chars + …
             # "fields": {"host": false, ...} — the easy per-field on/off switch.
             for name, on in (d.get("fields") or {}).items():
                 if not on:
@@ -229,11 +231,20 @@ def visible(field: str, p: dict, hide: set) -> bool:
     return field not in hide and bool(p.get(field))
 
 
+def _clip(s: str, n: int) -> str:
+    """Shorten a label to n chars, ending with … — long tab/workspace names make
+    unreadable queue chips. The full name still lives in the footer."""
+    s = s.strip()
+    if n <= 0 or len(s) <= n:
+        return s[:50]  # GitHub's hard label max
+    return s[:max(1, n - 1)].rstrip() + "…"
+
+
 def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
     out = []
     for f in LABEL_FIELDS:
         if visible(f, p, cfg["hide"]):
-            out.append((p[f][:50], cfg["colors"].get(f, "ededed")))
+            out.append((_clip(p[f], cfg.get("label_maxlen", 24)), cfg["colors"].get(f, "ededed")))
     return out
 
 
