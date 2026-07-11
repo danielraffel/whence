@@ -26,9 +26,11 @@ GH = "gh"                                          # resolved in main: WHENCE_GH
 CFG_DIR = pathlib.Path.home() / ".config/whence"
 
 # Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
-FIELDS = ["agent", "host", "tab", "session", "resume", "url", "jump", "relaunch", "stamped"]
-LABEL_FIELDS = ["agent", "host", "tab"]
-DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "tab": "8250df"}
+# `workspace` = cmux workspace name; `tab` = the per-tab (surface) title you
+# navigate by — the one you need most to find your way back.
+FIELDS = ["agent", "host", "workspace", "tab", "session", "resume", "url", "jump", "relaunch", "stamped"]
+LABEL_FIELDS = ["agent", "host", "workspace", "tab"]
+DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df"}
 
 # Friendly resume syntax for agents whose CLI we've verified. ANY other agent
 # still works via the cmux-sourced `relaunch` command below — this is just for a
@@ -114,6 +116,67 @@ def cmux_ws_name(ws_id: str) -> str:
     return ""
 
 
+import unicodedata
+
+
+def clean_title(t: str) -> str:
+    """Strip cmux's leading status glyphs — spinner braille (⠙⠦⠐…), run/err/dirty
+    emoji (🏃 ❌ ✳ …), and separators — leaving the human tab name."""
+    i = 0
+    while i < len(t):
+        ch = t[i]
+        if (ch.isspace() or unicodedata.category(ch).startswith("S")
+                or 0x2800 <= ord(ch) <= 0x28FF or ord(ch) >= 0x1F000):
+            i += 1
+            continue
+        break
+    return t[i:].strip()
+
+
+def cmux_workspace(ws_id: str) -> str:
+    """The workspace name — your custom title if you set one, else cmux's
+    (drifting) auto-title. See `has_custom_title` in `cmux rpc workspace.list`."""
+    if not ws_id:
+        return ""
+    name = cmux_ws_name(ws_id)
+    r = sh("cmux", "rpc", "workspace.list")
+    if r.returncode == 0:
+        try:
+            for w in json.loads(r.stdout).get("workspaces", []):
+                if w.get("id") == ws_id:
+                    if w.get("has_custom_title") and w.get("custom_title"):
+                        return clean_title(w["custom_title"])
+                    break
+        except Exception:
+            pass
+    return clean_title(name)
+
+
+def cmux_tab_title(surface_id: str) -> tuple[str, str]:
+    """The per-tab (surface) title — the name you navigate by — plus its cmux
+    ref (e.g. `surface:13`) ONLY when another tab shares the same title (so two
+    "pulp" tabs are tellable apart, but unique names stay clean). JSON-driven
+    from `cmux rpc surface.list`; re-running whence re-reads the current title."""
+    if not surface_id:
+        return "", ""
+    r = sh("cmux", "rpc", "surface.list")
+    if r.returncode == 0:
+        try:
+            surfaces = json.loads(r.stdout).get("surfaces", [])
+            counts, mine = {}, None
+            for s in surfaces:
+                t = clean_title(s.get("title") or "")
+                counts[t] = counts.get(t, 0) + 1
+                if s.get("id") == surface_id:
+                    mine = (t, s.get("ref") or "")
+            if mine:
+                t, ref = mine
+                return t, (ref if t and counts.get(t, 0) > 1 else "")
+        except Exception:
+            pass
+    return "", ""
+
+
 def collect() -> dict:
     agent = os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
@@ -123,7 +186,9 @@ def collect() -> dict:
     p = {f: "" for f in FIELDS}
     p["agent"] = agent
     p["host"] = host_label()
-    p["tab"] = cmux_ws_name(os.environ.get("CMUX_WORKSPACE_ID", ""))
+    p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""))
+    tab, ref = cmux_tab_title(surface)
+    p["tab"] = f"{tab} ({ref})" if (tab and ref) else tab
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     restore = ""
@@ -169,9 +234,14 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
         f"**{lbl}** {fmt}" for f, lbl, fmt in [
             ("agent", "Agent", f"`{p['agent']}`"),
             ("host", "Machine", f"`{p['host']}`"),
-            ("tab", "cmux tab", p["tab"]),
         ] if visible(f, p, hide))
-    rows = [line1] if line1 else []
+    # navigation line: workspace then tab — the tab title is the "find my way back" key
+    nav = "  ·  ".join(
+        f"**{lbl}** {fmt}" for f, lbl, fmt in [
+            ("workspace", "Workspace", f"`{p['workspace']}`"),
+            ("tab", "Tab", f"`{p['tab']}`"),
+        ] if visible(f, p, hide))
+    rows = [r for r in (line1, nav) if r]
     for f, lbl, val in [
         ("session", "Session", f"`{p['session']}`"),
         ("resume", "Resume", f"`{p['resume']}`"),
@@ -227,114 +297,88 @@ PR_TOOLS = {
     "gh":       '[ "$1" = pr ] && [ "$2" = create ]',
     "ghapp":    '[ "$1" = pr ] && [ "$2" = create ]',
 }
-PATH_MARK_RE = re.compile(r"\n*# >>> whence shims >>>.*?# <<< whence shims <<<\n", re.S)
+HOOK_MARK_RE = re.compile(r"\n*# >>> whence hook >>>.*?# <<< whence hook <<<\n", re.S)
+HOOK_FILE = CFG_DIR / "hook.sh"
 
 
-def _real_tool(name: str, shim_dir: pathlib.Path) -> str:
-    """Resolve the real binary for `name`, skipping our own shim dir (so a
-    re-install never points a shim at itself)."""
-    sd = os.path.realpath(shim_dir)
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        if not d or os.path.realpath(d) == sd:
-            continue
-        p = os.path.join(d, name)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return ""
+def _hook_source_block() -> str:
+    return ("# >>> whence hook >>>  (managed by `whence --install-hook`; safe to delete)\n"
+            f'[ -f "{HOOK_FILE}" ] && . "{HOOK_FILE}"\n'
+            "# <<< whence hook <<<\n")
+
+
+def _hook_file_text() -> tuple[str, list]:
+    """Build the sourced functions file. A shell FUNCTION beats PATH lookup in
+    EVERY shell mode (interactive or not), so — unlike a PATH-dir shim — it can't
+    be shadowed by a later .zshrc reordering PATH. Each function runs the REAL
+    tool via `command` (which skips functions → no recursion, and no double-stamp
+    when one tool internally spawns another), then stamps best-effort."""
+    from shutil import which
+    tools = [(t, trig) for t, trig in PR_TOOLS.items() if which(t)]
+    lines = [
+        "# whence hook — sourced by your shell init. Thin wrappers around the",
+        "# PR-opening commands that stamp the branch's PR right after it opens.",
+        "# A function beats PATH, so this fires regardless of PATH order; `command`",
+        "# runs the real tool (no recursion); the stamp never changes the exit code.",
+        "# NB: `command whence` — plain `whence` is a zsh BUILTIN (like `which`), so",
+        "# `command` is required to reach this script rather than the builtin.",
+        "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
+    ]
+    for tool, trig in tools:
+        lines.append(
+            f'{tool}() {{ command {tool} "$@"; __whence_rc=$?; '
+            f"if {trig}; then __whence_stamp; fi; return $__whence_rc; }}")
+    return "\n".join(lines) + "\n", [t for t, _ in tools]
 
 
 def install_hook(print_only: bool) -> int:
-    """Install (or print) the PATH shim that stamps every future PR at open time,
-    for any agent, without depending on Shipyard."""
-    shim_dir = CFG_DIR / "shims"
-    made = []
-    for tool, trig in PR_TOOLS.items():
-        real = _real_tool(tool, shim_dir)
-        if real:
-            made.append((tool, real, trig))
-    block = ("# >>> whence shims >>>  (managed by `whence --install-hook`; safe to delete)\n"
-             f'case ":$PATH:" in *":{shim_dir}:"*) ;; *) export PATH="{shim_dir}:$PATH" ;; esac\n'
-             "# <<< whence shims <<<\n")
-
-    def shim_body(tool, trig):
-        # Resolve the real tool at call time (PATH minus our own shim dir) rather
-        # than baking an absolute path — robust to the tool being upgraded, moved,
-        # or removed, and self-recursion-proof. Then run the stamp in the
-        # FOREGROUND: a detached job is reaped when an agent harness cleans up the
-        # command's process group, so it must finish before the shim returns.
-        # whence bounds its own calls (~15s each), never blocks the exit code, and
-        # stays best-effort (errors swallowed). If the real tool is gone, degrade
-        # to a clean "command not found" instead of a confusing exec error.
-        return (
-            f"#!/bin/sh\n"
-            f"# whence shim for {tool}: run the real command, then stamp the PR (best-effort).\n"
-            f'__shim_dir="{shim_dir}"\n'
-            f'__real=""; __oldifs=$IFS; IFS=:\n'
-            f"for __d in $PATH; do\n"
-            f'  [ -n "$__d" ] || continue\n'
-            f'  [ "$__d" = "$__shim_dir" ] && continue\n'
-            f'  if [ -x "$__d/{tool}" ]; then __real="$__d/{tool}"; break; fi\n'
-            f"done\n"
-            f"IFS=$__oldifs\n"
-            f'if [ -z "$__real" ]; then echo "{tool}: command not found" >&2; exit 127; fi\n'
-            f'"$__real" "$@"; __rc=$?\n'
-            f'if {trig}; then command -v whence >/dev/null 2>&1 && '
-            f"whence --auto >/dev/null 2>&1 || true; fi\n"
-            f"exit $__rc\n")
-
+    """Install (or print) the shell-function hook that stamps every future PR at
+    open time, for any agent, without depending on Shipyard."""
+    text, tools = _hook_file_text()
+    block = _hook_source_block()
     if print_only:
-        print(f"# shim dir: {shim_dir}")
-        for tool, real, trig in made:
-            print(f"# {tool}  ->  {real}")
-        print("\n# shell snippet (add to ~/.zshenv, and ~/.bashrc if you use bash):\n" + block)
+        print(f"# hook file: {HOOK_FILE}")
+        print(f"# wraps: {', '.join(tools) or '(no PR tool found on PATH)'}")
+        print("\n# ---- hook.sh ----\n" + text)
+        print("# add to ~/.zshenv (and ~/.bashrc if you use bash):\n" + block)
         return 0
-    if not made:
-        print("whence: found no PR tool (shipyard/gh/pulp) on PATH — nothing to shim.\n"
+    if not tools:
+        print("whence: found no PR tool (shipyard/pulp/gh/ghapp) on PATH — nothing to wrap.\n"
               "  Install one, or wire an agent hook instead (see the README).", file=sys.stderr)
         return 1
-    shim_dir.mkdir(parents=True, exist_ok=True)
-    for tool, real, trig in made:
-        f = shim_dir / tool
-        f.write_text(shim_body(tool, trig))
-        f.chmod(0o755)
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    HOOK_FILE.write_text(text)
     targets = [pathlib.Path(os.path.expanduser("~/.zshenv"))]  # always: universal zsh init
     bashrc = pathlib.Path(os.path.expanduser("~/.bashrc"))
     if bashrc.exists():
         targets.append(bashrc)
     for rcp in targets:
         cur = rcp.read_text() if rcp.exists() else ""
-        cur = PATH_MARK_RE.sub("\n", cur).rstrip()
+        cur = HOOK_MARK_RE.sub("\n", cur).rstrip()
         rcp.write_text((cur + "\n\n" + block) if cur else block)
-    print(f"whence: installed PR shims in {shim_dir}")
-    for tool, real, _ in made:
-        print(f"  {tool:9} -> {real}")
-    print("PATH updated in: " + ", ".join(str(t) for t in targets))
+    print(f"whence: wrote hook {HOOK_FILE}")
+    print(f"  wraps: {', '.join(tools)}")
+    print("  sourced from: " + ", ".join(str(t) for t in targets))
     print("Open a new shell/tab (or `source ~/.zshenv`) to activate. "
           "Every PR opened after that self-stamps.")
     return 0
 
 
 def uninstall_hook() -> int:
-    """Remove the shims and the PATH block — full, clean reversal of --install-hook."""
-    shim_dir = CFG_DIR / "shims"
-    removed = []
-    if shim_dir.exists():
-        for f in sorted(shim_dir.iterdir()):
-            f.unlink(); removed.append(f.name)
-        try:
-            shim_dir.rmdir()
-        except OSError:
-            pass
+    """Remove the hook file and the sourcing block — full reversal of --install-hook."""
+    existed = HOOK_FILE.exists()
+    if existed:
+        HOOK_FILE.unlink()
     for rc in ("~/.zshenv", "~/.bashrc"):
         rcp = pathlib.Path(os.path.expanduser(rc))
         if not rcp.exists():
             continue
         cur = rcp.read_text()
-        new = PATH_MARK_RE.sub("\n", cur)
+        new = HOOK_MARK_RE.sub("\n", cur)
         new = new.rstrip() + "\n" if new.strip() else ""
         if new != cur:
             rcp.write_text(new)
-    print(f"whence: removed shims {removed or '(none)'} and the PATH block.")
+    print(f"whence: removed hook {'file' if existed else '(none)'} and the sourcing block.")
     print("Open a new shell/tab for it to take full effect.")
     return 0
 
@@ -381,6 +425,31 @@ def setup(host: str | None) -> int:
     return rc
 
 
+def resync() -> int:
+    """Refresh THIS tab's open PRs with the current name — on demand, no tracking.
+    Each PR whence stamped carries this tab's stable surface id in its footer, so
+    we just search open PRs for it and re-stamp (idempotent). Run it after you
+    rename a tab; nothing monitors in the background."""
+    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    if not surface:
+        print("whence: no CMUX_SURFACE_ID in this shell — can't identify this tab's PRs",
+              file=sys.stderr)
+        return 2
+    r = sh(GH, "pr", "list", "--state", "open", "--search", surface,
+           "--json", "number", "-q", ".[].number")
+    nums = [x for x in r.stdout.split() if x.strip()]
+    if not nums:
+        print("whence: no open PRs stamped from this tab — nothing to resync")
+        return 0
+    print(f"whence: refreshing {len(nums)} open PR(s) from this tab: "
+          + ", ".join("#" + n for n in nums))
+    self = os.path.realpath(sys.argv[0])
+    for n in nums:
+        sh(sys.executable, self, "--pr", n, "--apply")
+        print(f"  #{n} refreshed")
+    return 0
+
+
 def write_default_config(force: bool) -> None:
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     f = CFG_DIR / "config.json"
@@ -404,6 +473,7 @@ def prior_labels(body: str) -> list:
 
 
 def main() -> int:
+    global GH
     ap = argparse.ArgumentParser(description="Stamp a PR with agent/session/machine/tab provenance.")
     ap.add_argument("--pr"); ap.add_argument("--branch")
     ap.add_argument("--hide", help="comma list of fields to omit this run: " + ",".join(FIELDS))
@@ -424,8 +494,14 @@ def main() -> int:
                     help="remove the shim and PATH block (full reversal of --install-hook)")
     ap.add_argument("--print-hook", action="store_true",
                     help="print the shim + shell snippet without writing anything")
+    ap.add_argument("--resync", action="store_true",
+                    help="re-stamp this tab's open PRs with the current name (on demand)")
     args = ap.parse_args()
 
+    if args.resync:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        return resync()
     if args.setup:
         return setup(args.host)
     if args.print_hook:
@@ -438,7 +514,6 @@ def main() -> int:
         write_default_config(args.force); return 0
 
     cfg = load_config(args.hide)
-    global GH
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
     post_labels = cfg["labels"] and not args.no_labels
     post_footer = cfg["footer"] and not args.no_footer

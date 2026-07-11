@@ -13,8 +13,10 @@ follow-up you have no idea which of your twelve open sessions to go ask.
 `whence` fixes that. On every PR it stamps:
 
 - **Color-coded queue labels** — the agent (any cmux agent — `claude`, `codex`,
-  `opencode`, `gemini`, `cursor`, …), the machine (any name you choose), and the
-  cmux **tab name** — so the queue is legible at a glance.
+  `opencode`, `gemini`, `cursor`, …), the machine (any name you choose), the cmux
+  **workspace** name, and the **tab** title — so the queue is legible at a glance.
+  (Two tabs sharing a title get the cmux `surface:N` ref appended so you can still
+  tell them apart.)
 - **A visible "🔎 Provenance" footer** in the PR body with the **session id**,
   the exact **resume command** (`claude --resume …` / `codex resume …`), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
@@ -98,25 +100,42 @@ whence --apply
 
 Re-running is idempotent — it replaces its own labels/footer, never piling up.
 
-### Auto-stamp on every PR — the one-liner (recommended)
+### Auto-stamp on every PR
+
+There are two triggers; they're idempotent, so use either or both.
+
+**Reliable — your agent's own hook.** An agent hook fires *in the agent's
+process*, so it always runs regardless of how the agent shells out. It's the
+dependable choice for "every PR this agent opens gets stamped." Claude Code and
+Codex both support it (and cmux wires Claude's automatically). See
+[`examples/claude-code-hook.md`](examples/claude-code-hook.md) — it just runs
+`whence --auto` after a PR command.
+
+**Best-effort, zero per-agent config — the shell hook.**
 
 ```bash
 whence --install-hook          # once per machine
 ```
 
-This is the **one mechanism that works for every agent**. It doesn't hook any
-particular agent — it wraps the *command that opens the PR* with a tiny PATH
-shim, and stamps the branch's PR right after. It covers **every common way a PR
-gets opened** — `gh pr create`, `ghapp pr create`, `shipyard pr`, `pulp pr`
-(whichever of those you have installed) — so no matter which path an agent takes,
-the PR gets stamped. One install, no per-agent config, and **no dependency on
-Shipyard** (it wraps plain `gh`/`ghapp` just as happily). Open a new shell/tab
-and every PR from then on self-stamps.
+This wraps the *command that opens the PR* with a small **shell function**
+(written to `~/.config/whence/hook.sh`, sourced from `~/.zshenv`) that stamps the
+branch's PR right after. It covers **every common way a PR gets opened** —
+`gh pr create`, `ghapp pr create`, `shipyard pr`, `pulp pr` (whichever you have)
+— with no per-agent config and no Shipyard dependency. A function beats `PATH`
+(so a `.zshrc` PATH reorder can't shadow it) and calls the real tool via
+`command` (no recursion, no double-stamp).
 
-Over-firing is harmless: if a command runs that didn't actually open a PR, whence
-just finds no PR for the branch and does nothing — so it errs toward catching
-more, never toward missing one. Uninstall any time with `whence --uninstall-hook`
-(removes the shim and the PATH block).
+Its limit, honestly: it only fires in shells that load your init file, so it
+catches PRs you open in a normal terminal and in agents whose command shell
+sources `~/.zshenv` — but an agent that runs commands in a bare shell
+(`bash -c`, no rc) won't trigger it. That's why the agent hook above is the
+reliable path; the shell hook is a convenient net for everything else. Over-firing
+is harmless (whence no-ops when the branch has no PR). Uninstall with
+`whence --uninstall-hook`.
+
+> **zsh note:** `whence` is a zsh builtin (like `which`), so at an interactive
+> zsh prompt run **`command whence …`** (or the full path) to reach this tool.
+> The hooks already do this internally; it only matters when you type it by hand.
 
 Why a command shim and not "an agent hook": each agent's hook system is a
 *different* config, and most of cmux's agents have no PR-time hook at all. The PR
@@ -129,9 +148,14 @@ mechanism (below) also fires.
 whence --print-hook            # see exactly what it would install, write nothing
 ```
 
-The shim lives in `~/.config/whence/shims/` and prepends that dir to `PATH` via a
-clearly-marked block in `~/.zshenv` (and `~/.bashrc` if present). Delete the block
-to uninstall.
+The functions live in `~/.config/whence/hook.sh`, sourced by a clearly-marked
+block in `~/.zshenv` (and `~/.bashrc` if present). `whence --uninstall-hook`
+removes both.
+
+**Keep a tab's PRs current.** whence captures the tab title at PR-open. If you
+rename a tab later and want its already-open PRs updated, run `whence --resync`
+from that tab — it finds this tab's open PRs (by the surface id already in their
+footers — no tracking, no daemon) and re-stamps them with the current name.
 
 **Other ways** (optional; they coexist with the shim — stamping is idempotent):
 
@@ -152,13 +176,13 @@ settings any time (so you never have to wonder where it lives).
 ```json
 {
   "fields": {
-    "agent": true, "host": true, "tab": true,
+    "agent": true, "host": true, "workspace": true, "tab": true,
     "session": true, "resume": true, "url": true,
     "jump": true, "relaunch": true, "stamped": true
   },
   "labels": true,
   "footer": true,
-  "colors": { "agent": "1f6feb", "host": "1a7f37", "tab": "8250df" },
+  "colors": { "agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df" },
   "repos": { "mode": "all", "list": [] },
   "gh": "gh"
 }

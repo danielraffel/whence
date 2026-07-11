@@ -15,7 +15,7 @@ Add to `~/.claude/settings.json` (or a project `.claude/settings.json`):
         "hooks": [
           {
             "type": "command",
-            "command": "if grep -qiE 'gh pr create|shipyard pr|pulp pr' <<<\"$CLAUDE_TOOL_INPUT\"; then python3 ~/code/whence/whence --apply >/dev/null 2>&1 || true; fi"
+            "command": "if grep -qiE 'gh pr create|ghapp pr create|shipyard pr|pulp pr' <<<\"$CLAUDE_TOOL_INPUT\"; then command whence --auto >/dev/null 2>&1 || true; fi"
           }
         ]
       }
