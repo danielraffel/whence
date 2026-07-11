@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib
+import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib, tempfile
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
@@ -76,19 +76,26 @@ def load_config(cli_hide: str) -> dict:
     if f.exists():
         try:
             d = json.loads(f.read_text())
-            cfg["hide"] |= set(d.get("hide", []))
-            cfg["colors"].update(d.get("colors", {}))
-            cfg["repos"] = d.get("repos", {})   # {"mode":"all|allow|deny","list":["owner/repo"]}
-            cfg["footer"] = bool(d.get("footer", True))   # post the PR-description footer?
-            cfg["labels"] = bool(d.get("labels", True))   # post the queue labels?
-            cfg["gh"] = str(d.get("gh", "") or "")        # gh binary, e.g. "ghapp" (App-token auth)
-            cfg["label_maxlen"] = int(d.get("label_maxlen", 24))  # clip long labels to N chars + …
-            # "fields": {"host": false, ...} — the easy per-field on/off switch.
-            for name, on in (d.get("fields") or {}).items():
-                if not on:
-                    cfg["hide"].add(name)
         except Exception as e:
             print(f"whence: ignoring bad config.json: {e}", file=sys.stderr)
+            d = {}
+        if not isinstance(d, dict):
+            d = {}
+        # Each field is read independently — a single bad value keeps that field's
+        # default instead of discarding the whole config.
+        def field(key, apply):
+            if key in d:
+                try: apply(d[key])
+                except Exception: print(f"whence: ignoring bad config field '{key}'", file=sys.stderr)
+        field("hide", lambda v: cfg["hide"].update(set(v)))
+        field("colors", lambda v: cfg["colors"].update(v))
+        field("repos", lambda v: cfg.__setitem__("repos", v if isinstance(v, dict) else cfg["repos"]))
+        field("footer", lambda v: cfg.__setitem__("footer", bool(v)))
+        field("labels", lambda v: cfg.__setitem__("labels", bool(v)))
+        field("gh", lambda v: cfg.__setitem__("gh", str(v or "")))
+        field("label_maxlen", lambda v: cfg.__setitem__("label_maxlen", int(v)))
+        # "fields": {"host": false, ...} — the easy per-field on/off switch.
+        field("fields", lambda v: [cfg["hide"].add(n) for n, on in v.items() if not on])
     for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
         cfg["hide"] |= {x.strip() for x in src.split(",") if x.strip()}
     unknown = cfg["hide"] - set(FIELDS)
@@ -429,7 +436,10 @@ def _write_pr_hook() -> pathlib.Path:
         "# the precise check (command field, not the whole payload) and stamps.\n"
         "# Always exits 0 so a stamping hiccup never breaks the agent.\n"
         "in=$(cat 2>/dev/null)\n"
-        "case \"$in\" in\n"
+        "# match only the command (in tool_input, before tool_response) — never the\n"
+        "# command's OUTPUT — so a command whose output mentions a PR verb is ignored.\n"
+        'head=${in%%\\"tool_response\\"*}\n'
+        "case \"$head\" in\n"
         "  *\"pr create\"*|*\"shipyard pr\"*|*\"pulp pr\"*)\n"
         f'    printf \'%s\' "$in" | "{whence_bin}" --hook || true ;;\n'
         "esac\n"
@@ -719,9 +729,13 @@ def main() -> int:
     stripped = MARK_RE.sub("", body).rstrip()
     newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
     if newbody != body:
-        tmp = pathlib.Path("/tmp") / f"whence-body-{pr}.md"
-        tmp.write_text(newbody)
-        sh(GH, "pr", "edit", pr, "--body-file", str(tmp))
+        fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
+        try:
+            os.write(fd, newbody.encode()); os.close(fd)
+            sh(GH, "pr", "edit", pr, "--body-file", tmpname)
+        finally:
+            try: os.unlink(tmpname)
+            except OSError: pass
     print(f"\n✓ PR #{pr}: " + (", ".join(names) if names else "labels off")
           + (" + footer" if post_footer else " · footer off"))
     return 0
