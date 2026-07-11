@@ -43,6 +43,10 @@ OLD_PREFIXES = ("agent:", "host:", "ws:")
 
 # What counts as "a PR was just opened", matched against an agent hook's command.
 PR_CMD_RE = re.compile(r"(?:gh|ghapp) pr create|shipyard pr|pulp pr")
+# A push may create a PR later (a daemon opens it, or `shipyard pr` pushes then
+# opens asynchronously). We can't stamp a PR that doesn't exist yet, but we CAN
+# record the branch's provenance now so the sweep stamps the PR when it appears.
+PUSH_RE = re.compile(r"\bgit\s+push\b|\bshipyard\s+pr\b|\bpulp\s+pr\b")
 
 # The whole config, every knob shown at its default. `whence --init` writes this.
 # Flip any field false to drop it; set labels/footer false to drop a whole surface;
@@ -584,6 +588,193 @@ def prior_labels(body: str) -> list:
     return []
 
 
+def _now_epoch() -> int:
+    return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
+
+
+def _throttled(name: str, secs: int) -> bool:
+    """True at most once per `secs`, recording the tick — so the maintenance the
+    hook does (sweep, self-update) doesn't run on every single tool call."""
+    st = CFG_DIR / f".last-{name}"
+    try: last = int(st.read_text().strip())
+    except Exception: last = 0
+    if _now_epoch() - last < secs:
+        return False
+    st.parent.mkdir(parents=True, exist_ok=True)
+    st.write_text(str(_now_epoch()))
+    return True
+
+
+def is_stamped(body: str) -> bool:
+    return bool(MARK_RE.search(body or ""))
+
+
+def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool) -> list:
+    """Write the labels + footer for provenance `p` onto PR #pr. Idempotent:
+    replaces whence's own prior labels/footer, never stacks. Shared by the live
+    hook path and the ledger sweep so both stamp identically."""
+    labels = labels_for(p, cfg) if post_labels else []
+    names = [n for n, _ in labels]
+    ft = footer(p, cfg, names) if post_footer else ""
+    body = sh(GH, "pr", "view", pr, "--json", "body", "-q", ".body").stdout
+    keep = set(names)
+    existing = sh(GH, "pr", "view", pr, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
+    stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
+    for s in sorted(x for x in stale if x):
+        sh(GH, "pr", "edit", pr, "--remove-label", s)
+    for n, c in labels:
+        sh(GH, "label", "create", n, "--color", c, "--force")
+    if names:
+        sh(GH, "pr", "edit", pr, *sum([["--add-label", n] for n in names], []))
+    stripped = MARK_RE.sub("", body).rstrip()
+    newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
+    if newbody != body:
+        fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
+        try:
+            os.write(fd, newbody.encode()); os.close(fd)
+            sh(GH, "pr", "edit", pr, "--body-file", tmpname)
+        finally:
+            try: os.unlink(tmpname)
+            except OSError: pass
+    return names
+
+
+# ── Branch→provenance ledger + sweep ────────────────────────────────────────
+# Reliable coverage without an orchestrator hook. The live in-shell stamp only
+# sees a PR it can resolve at push time from the agent's cwd — it MISSES a PR
+# opened inside a git worktree (the hook runs from the home cwd, wrong branch),
+# one opened later by a detached daemon (e.g. shipyard-local), one opened
+# elsewhere while this shell only pushed, and one whose create command was
+# killed before the hook ran. So split the work: CAPTURE the branch's provenance
+# when the push/PR command fires (env is live then), and SWEEP later — stamp
+# whatever PR turns up for that branch, using the captured provenance. Keyed on
+# the git branch, which every path shares, so it needs no Shipyard dependency.
+LEDGER = CFG_DIR / "branch-ledger.json"
+
+
+def _git(cwd, *a):
+    return sh("git", "-C", cwd, *a) if cwd else sh("git", *a)
+
+
+def _cmd_cwd(cmd: str):
+    """Target of a leading `cd <path> &&` so a PR opened inside a worktree records
+    the worktree's branch, not the hook's home cwd."""
+    m = re.match(r"""\s*cd\s+('([^']*)'|"([^"]*)"|(\S+))\s*&&""", cmd or "")
+    return (m.group(2) or m.group(3) or m.group(4)) if m else None
+
+
+def _repo_branch(cwd):
+    url = _git(cwd, "config", "--get", "remote.origin.url").stdout.strip()
+    m = re.search(r"[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    slug = m.group(1) if m else ""
+    br = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    return slug, br
+
+
+def _load_ledger() -> dict:
+    try: return json.loads(LEDGER.read_text()) if LEDGER.exists() else {}
+    except Exception: return {}
+
+
+def ledger_record(cmd: str, p: dict) -> None:
+    """Remember which tab/session/machine owns this branch, keyed owner/repo#branch."""
+    slug, br = _repo_branch(_cmd_cwd(cmd))
+    if not slug or not br or br in ("HEAD", ""):
+        return
+    led = _load_ledger()
+    led[f"{slug}#{br}"] = {"p": {k: p.get(k, "") for k in FIELDS}, "ts": _now_epoch()}
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    LEDGER.write_text(json.dumps(led))
+
+
+def sweep(cfg: dict) -> int:
+    """Stamp every open PR whose head branch is in the ledger but not stamped yet,
+    using the LEDGER's provenance (the tab that made the branch) — never the
+    sweeping session's. Idempotent; prunes ledger entries older than 14 days."""
+    led = _load_ledger()
+    if not led:
+        return 0
+    post_labels, post_footer = cfg["labels"], cfg["footer"]
+    now, keep, n = _now_epoch(), {}, 0
+    for key, rec in led.items():
+        if now - rec.get("ts", 0) > 14 * 86400:
+            continue
+        keep[key] = rec
+        slug, _, br = key.partition("#")
+        if not slug or not br:
+            continue
+        res = sh(GH, "pr", "list", "--repo", slug, "--head", br,
+                 "--state", "open", "--json", "number,body")
+        try: prs = json.loads(res.stdout or "[]")
+        except Exception: prs = []
+        for pr in prs:
+            if is_stamped(pr.get("body", "")):
+                continue
+            p = {f: rec["p"].get(f, "") for f in FIELDS}
+            apply_stamp(str(pr["number"]), p, cfg, post_labels, post_footer)
+            n += 1
+    LEDGER.write_text(json.dumps(keep))
+    return n
+
+
+# ── Multi-machine sync: self-update (pull) + deploy (fan-out) ────────────────
+# Any machine can be the one you edit whence on. Two mechanisms keep the rest
+# current: self_update() converges each machine to origin/main automatically
+# (throttled, from the hook — no cron, no push from the author); deploy() pushes
+# your change and SSHes your personal host list to pull+reinstall instantly. The
+# host list lives only in ~/.config/whence/hosts, never in the repo, because it's
+# specific to your fleet — other whence users don't need it.
+HOSTS = CFG_DIR / "hosts"
+
+
+def _self_clone() -> pathlib.Path:
+    here = pathlib.Path(__file__).resolve().parent
+    return here if (here / ".git").exists() else (pathlib.Path.home() / ".local/share/whence")
+
+
+def self_update(force: bool = False) -> bool:
+    """Fast-forward this whence clone to origin/main so every machine picks up a
+    change made on any other machine — no matter which one made it. Throttled to
+    once/day from the hook; reinstalls the agent hook only if the clone moved."""
+    clone = _self_clone()
+    if not (clone / ".git").exists():
+        return False
+    if not force and not _throttled("selfupdate", 86400):
+        return False
+    before = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
+    _git(str(clone), "pull", "--ff-only", "--quiet")
+    after = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
+    if before and after and before != after:
+        install_agent_hook("all")
+        return True
+    return False
+
+
+def deploy() -> int:
+    """Push local whence changes, then SSH each host in ~/.config/whence/hosts to
+    pull + reinstall — instant propagation from whichever machine you edited on.
+    Unreachable hosts are skipped (they self-update on their next stamp)."""
+    clone = _self_clone()
+    ahead = _git(str(clone), "rev-list", "--count", "@{u}..HEAD").stdout.strip()
+    if ahead not in ("", "0"):
+        r = _git(str(clone), "push")
+        print("pushed local whence changes" if r.returncode == 0 else "local push FAILED")
+    if not HOSTS.exists():
+        print(f"whence: no host list — add one hostname per line to {HOSTS}")
+        return 0
+    hosts = [h.strip() for h in HOSTS.read_text().splitlines()
+             if h.strip() and not h.lstrip().startswith("#")]
+    rc = 0
+    for h in hosts:
+        remote = ("cd ~/.local/share/whence && git pull --ff-only --quiet && "
+                  "./whence --install-agent-hook all >/dev/null 2>&1 && echo whence-ok")
+        r = sh("ssh", "-o", "ConnectTimeout=8", h, remote)
+        ok = r.returncode == 0 and "whence-ok" in r.stdout
+        print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on next stamp'}")
+        rc = rc or (0 if ok else 1)
+    return rc
+
+
 def main() -> int:
     global GH
     ap = argparse.ArgumentParser(description="Stamp a PR with agent/session/machine/tab provenance.")
@@ -608,6 +799,13 @@ def main() -> int:
                     help="print the shim + shell snippet without writing anything")
     ap.add_argument("--resync", action="store_true",
                     help="re-stamp this tab's open PRs with the current name (on demand)")
+    ap.add_argument("--sweep", action="store_true",
+                    help="stamp any open PR in the branch-ledger that isn't stamped yet "
+                         "(catches worktree/daemon/push-only/timed-out PRs)")
+    ap.add_argument("--deploy", action="store_true",
+                    help="push local whence changes, then SSH ~/.config/whence/hosts to pull+reinstall")
+    ap.add_argument("--self-update", dest="selfupdate", action="store_true",
+                    help="fast-forward this whence clone to the repo now and reinstall the hook")
     ap.add_argument("--install-agent-hook", nargs="?", const="all", choices=["all", "claude", "codex"],
                     metavar="all|claude|codex",
                     help="wire the reliable in-process agent hook (Claude global, Codex per-repo)")
@@ -617,10 +815,20 @@ def main() -> int:
 
     if args.install_agent_hook:
         return install_agent_hook(args.install_agent_hook)
+    if args.deploy:
+        return deploy()
+    if args.selfupdate:
+        print("whence: updated to latest" if self_update(force=True) else "whence: already current")
+        return 0
     if args.resync:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         return resync()
+    if args.sweep:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        print(f"whence: swept {sweep(cfg)} PR(s)")
+        return 0
     if args.setup:
         return setup(args.host)
     if args.print_hook:
@@ -635,28 +843,31 @@ def main() -> int:
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
-    hook_agent = hook_sid = ""
+    hook_agent = hook_sid = hook_cmd = ""
+    hook_is_pr = hook_is_push = False
     if args.hook:
-        # Agent PostToolUse: read the tool JSON, stamp only if it opened a PR.
-        # The payload carries the true identity (session_id + transcript_path),
-        # which is more reliable than env vars that can leak between sessions.
+        # Agent PostToolUse: read the tool JSON. A PR-create command stamps now;
+        # a push (which may open a PR later, via a daemon) records the branch's
+        # provenance for the sweep. The payload carries the true identity
+        # (session_id + transcript_path), more reliable than leak-prone env vars.
         if sys.stdin.isatty():   # run by hand with no piped input — don't block
             return 0
         try: raw = sys.stdin.read()
         except Exception: raw = ""
-        cmd = ""
         try:
             d = json.loads(raw); ti = d.get("tool_input") or d.get("toolInput") or {}
-            cmd = ti.get("command") or ti.get("cmd") or ""
+            hook_cmd = ti.get("command") or ti.get("cmd") or ""
             hook_sid = d.get("session_id") or ""
             tp = d.get("transcript_path") or ""
             hook_agent = ("codex" if "/.codex" in tp else
                           "claude" if "/.claude" in tp else "")
         except Exception:
-            cmd = ""
-        if not PR_CMD_RE.search(cmd or raw):
+            hook_cmd = ""
+        hook_is_pr = bool(PR_CMD_RE.search(hook_cmd or raw))
+        hook_is_push = bool(PUSH_RE.search(hook_cmd or ""))
+        if not (hook_is_pr or hook_is_push):
             return 0
-        args.auto = True   # a PR was opened → fall through and stamp it quietly
+        args.auto = True   # quiet mode for both; a push returns before stamping
 
     post_labels = cfg["labels"] and not args.no_labels
     post_footer = cfg["footer"] and not args.no_footer
@@ -692,6 +903,18 @@ def main() -> int:
             p["resume"] = KNOWN_RESUME[p["agent"]].format(sid=p["session"])
         elif p["agent"] not in KNOWN_RESUME:
             p["resume"] = ""
+        # Capture this branch's provenance while the env is live, then run the
+        # cheap throttled maintenance: converge to the repo + backfill any PR the
+        # live stamp couldn't reach (worktree / daemon / push-only / timed-out).
+        if hook_is_pr or hook_is_push:
+            ledger_record(hook_cmd, p)
+        try: self_update()                       # throttled once/day internally
+        except Exception: pass
+        try:
+            if _throttled("sweep", 120): sweep(cfg)
+        except Exception: pass
+        if not hook_is_pr:                        # a push only records + sweeps
+            return 0
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
     ft = footer(p, cfg, names) if post_footer else ""
@@ -714,28 +937,7 @@ def main() -> int:
             return 0
         print("whence: could not resolve a PR", file=sys.stderr); return 2
 
-    body = sh(GH, "pr", "view", pr, "--json", "body", "-q", ".body").stdout
-    # Labels: apply the current set, or (if disabled) remove any we left before.
-    keep = set(names)
-    existing = sh(GH, "pr", "view", pr, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
-    stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
-    for s in sorted(x for x in stale if x):
-        sh(GH, "pr", "edit", pr, "--remove-label", s)
-    for n, c in labels:
-        sh(GH, "label", "create", n, "--color", c, "--force")
-    if names:
-        sh(GH, "pr", "edit", pr, *sum([["--add-label", n] for n in names], []))
-    # Footer: post it, or (if disabled) strip any prior footer we left behind.
-    stripped = MARK_RE.sub("", body).rstrip()
-    newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
-    if newbody != body:
-        fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
-        try:
-            os.write(fd, newbody.encode()); os.close(fd)
-            sh(GH, "pr", "edit", pr, "--body-file", tmpname)
-        finally:
-            try: os.unlink(tmpname)
-            except OSError: pass
+    names = apply_stamp(pr, p, cfg, post_labels, post_footer)
     print(f"\n✓ PR #{pr}: " + (", ".join(names) if names else "labels off")
           + (" + footer" if post_footer else " · footer off"))
     return 0

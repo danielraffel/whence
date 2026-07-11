@@ -179,6 +179,51 @@ footers — no tracking, no daemon) and re-stamps them with the current name.
 - **As an agent skill** — [`skill/SKILL.md`](skill/SKILL.md) tells an agent to
   stamp its PR right after opening it.
 
+### Catching every PR — the branch ledger + sweep
+
+The live hook can only stamp a PR it can *see* at push time from the agent's
+shell. That misses a few real cases: a PR opened inside a **git worktree** (the
+hook runs from the home cwd, on the wrong branch), a PR opened **later by a
+detached daemon** (e.g. a merge bot that pushes now and opens the PR minutes
+later), a shell that only **pushed** while the PR was opened elsewhere, and a
+**PR-create command that was killed** before the hook ran.
+
+whence closes all of these by splitting capture from stamping:
+
+1. **Capture.** Whenever the hook sees a `git push` (or a `shipyard pr` / `pulp
+   pr`), it records `owner/repo#branch → {agent, host, workspace, tab, session}`
+   into `~/.config/whence/branch-ledger.json`. The env is live at that moment, so
+   the tab is captured correctly — and a leading `cd <worktree> &&` is honored, so
+   worktree branches record right.
+2. **Sweep.** `whence --sweep` scans the ledger and stamps any open PR whose head
+   branch is listed **but not yet stamped**, using the *ledger's* provenance (the
+   tab that made the branch) — never the sweeping machine's. It runs
+   automatically (throttled) on every hook fire, so a daemon-opened PR gets
+   stamped within a couple of minutes without you doing anything.
+
+Because it keys on the **git branch** — the one thing every path shares — it needs
+no orchestrator integration and no per-repo setup. Run it by hand any time with
+`whence --sweep`.
+
+### Keeping several machines in sync
+
+If you drive whence from more than one machine, you want a change made on *any*
+one of them to reach the others — without caring which machine you edited on. The
+repo is the source of truth; two mechanisms keep every machine current:
+
+- **Automatic (self-update).** On its next stamp, each machine fast-forwards its
+  own clone to the repo (throttled to once/day) and reinstalls the hook if
+  anything moved. Zero setup, no cron — a machine that was offline catches up on
+  its own. Force it now with `whence --self-update`.
+- **Instant (deploy fan-out).** Right after you push a change, `whence --deploy`
+  pushes your local commits, then SSHes each host in `~/.config/whence/hosts`
+  (one hostname per line) to pull + reinstall immediately. Unreachable hosts are
+  skipped — they'll self-update on their next stamp.
+
+The host list is **personal** — it lives only in `~/.config/whence/hosts`, never
+in the repo, because your fleet is yours. Most whence users run one machine and
+never touch any of this; it's here for the multi-machine case.
+
 ## Configure anything — one file, every knob
 
 Everything is on by default; turn off whatever you want. Run **`whence --init`**
