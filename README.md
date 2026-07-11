@@ -62,8 +62,13 @@ auto-stamp — and you can scope it either way:
 | Stamp by hand, any repo | run `whence --apply` when you want |
 | Auto-stamp **every** repo | a global shell alias or Claude Code hook (`~/.claude/settings.json`) running `whence --auto` |
 | Auto-stamp **one** repo | a project hook in that repo's `.claude/settings.json` |
+| Turn it off in **one repo**, instantly | drop an empty `.whence-off` file in that repo's root (`touch .whence-off`) — gitignore it to keep it private, or commit it to disable for everyone |
 | Global hook, but **skip** some repos | `"repos": {"mode":"deny","list":["owner/secret"]}` in config |
 | Global hook, but **only** certain repos | `"repos": {"mode":"allow","list":["owner/a","owner/b"]}` |
+
+So there are two independent off-switches for repos: a **`.whence-off` file in the
+repo** (local, instant, no config) and the **`repos` list in your global config**
+(central). Either one turns it off.
 
 `whence --auto` is the hook-safe mode: it applies quietly and **exits without
 touching anything** if the repo is excluded or the branch has no PR yet — so one
@@ -99,23 +104,42 @@ hook that fires around PR creation:
 - **As an agent skill** — [`skill/SKILL.md`](skill/SKILL.md) tells an agent to
   stamp its PR right after opening it.
 
-## Configure what gets posted
+## Configure anything — one file, every knob
 
-Everything is optional and lives in `~/.config/whence/config.json` — no code edits:
+Everything is on by default; turn off whatever you want. Run **`whence --init`**
+to drop a fully-populated config at `~/.config/whence/config.json`, then flip
+values. **`whence --show`** prints the file's location and your effective
+settings any time (so you never have to wonder where it lives).
 
 ```json
 {
-  "hide":   ["url", "stamped"],
-  "colors": { "agent": "1f6feb", "host": "1a7f37", "tab": "8250df" }
+  "fields": {
+    "agent": true, "host": true, "tab": true,
+    "session": true, "resume": true, "url": true,
+    "jump": true, "relaunch": true, "stamped": true
+  },
+  "labels": true,
+  "footer": true,
+  "colors": { "agent": "1f6feb", "host": "1a7f37", "tab": "8250df" },
+  "repos": { "mode": "all", "list": [] }
 }
 ```
 
-- **Hide fields** — omit any of `agent, host, tab, session, resume, url, jump,
-  relaunch, stamped`. A hidden field drops from both the labels and the footer.
-  Quick per-run: `WHENCE_HIDE=url,session whence --apply`, or `--hide url,session`.
-- **Colors** — any GitHub label hex, per category.
-- **Machine label** — `WHENCE_HOST_LABEL` env wins over the `host-label` file.
-- **`gh` binary** — `WHENCE_GH=ghapp` (or any `gh`-compatible CLI) for App-token auth.
+| To drop… | Set |
+|----------|-----|
+| the **machine name** | `"fields": { "host": false }` |
+| the **agent name** | `"fields": { "agent": false }` |
+| the tab / session / url / any field | `"fields": { "url": false }`, … |
+| the **whole PR-description footer** (keep labels) | `"footer": false` |
+| the **labels** (keep footer) | `"labels": false` |
+
+A field set false disappears from **both** the labels and the footer. Prefer a
+one-off? `--hide host,agent`, `--no-footer`, `--no-labels`, or
+`WHENCE_HIDE=url,session` do the same without editing the file.
+
+**Colors:** any GitHub label hex, per category. **Machine label:**
+`WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:**
+`WHENCE_GH=ghapp` for App-token auth.
 
 ## Any agent, any machine
 

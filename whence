@@ -39,13 +39,26 @@ KNOWN_URL = {"claude": "https://claude.ai/code/{bridge}"}
 MARK_RE = re.compile(r"<!-- whence( .*?)? -->.*?<!-- /whence -->\n?", re.S)
 OLD_PREFIXES = ("agent:", "host:", "ws:")
 
+# The whole config, every knob shown at its default. `whence --init` writes this.
+# Flip any field false to drop it; set labels/footer false to drop a whole surface;
+# set repos.mode to "allow"/"deny" with a list to scope which repos get stamped.
+DEFAULT_CONFIG = {
+    "fields": {f: True for f in FIELDS},
+    "labels": True,
+    "footer": True,
+    "colors": dict(DEFAULT_COLORS),
+    "repos": {"mode": "all", "list": []},
+}
+
 
 def sh(*a, **k):
     return subprocess.run(a, capture_output=True, text=True, **k)
 
 
 def load_config(cli_hide: str) -> dict:
-    cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {}}
+    # footer/labels default ON; either can be turned off globally or per-run.
+    cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
+           "footer": True, "labels": True}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -53,6 +66,12 @@ def load_config(cli_hide: str) -> dict:
             cfg["hide"] |= set(d.get("hide", []))
             cfg["colors"].update(d.get("colors", {}))
             cfg["repos"] = d.get("repos", {})   # {"mode":"all|allow|deny","list":["owner/repo"]}
+            cfg["footer"] = bool(d.get("footer", True))   # post the PR-description footer?
+            cfg["labels"] = bool(d.get("labels", True))   # post the queue labels?
+            # "fields": {"host": false, ...} — the easy per-field on/off switch.
+            for name, on in (d.get("fields") or {}).items():
+                if not on:
+                    cfg["hide"].add(name)
         except Exception as e:
             print(f"whence: ignoring bad config.json: {e}", file=sys.stderr)
     for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
@@ -168,8 +187,12 @@ def resolve_pr(args) -> str:
 
 
 def repo_allowed(cfg: dict) -> bool:
-    """Per-repo enable/disable. Default: every repo. Configure with
-    "repos": {"mode": "allow"|"deny", "list": ["owner/repo", ...]}."""
+    """Per-repo enable/disable. Two ways, either turns it off here:
+    1. Drop a `.whence-off` file in the repo root  →  disabled in that repo.
+    2. Global list in config: "repos": {"mode":"allow"|"deny","list":["owner/repo"]}."""
+    top = sh("git", "rev-parse", "--show-toplevel").stdout.strip()
+    if top and (pathlib.Path(top) / ".whence-off").exists():
+        return False
     r = cfg.get("repos") or {}
     mode = r.get("mode", "all")
     if mode == "all":
@@ -183,34 +206,80 @@ def repo_allowed(cfg: dict) -> bool:
     return True
 
 
+def write_default_config(force: bool) -> None:
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    f = CFG_DIR / "config.json"
+    if f.exists() and not force:
+        print(f"whence: config already exists at {f}\n"
+              f"  edit it, or re-run `whence --init --force` to reset it to defaults")
+        return
+    f.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    print(f"whence: wrote {f}\n"
+          f"  Flip any \"fields\" value to false to drop it (labels + footer).\n"
+          f"  Set \"labels\": false or \"footer\": false to drop a whole surface.\n"
+          f"  Scope repos with \"repos\": {{\"mode\":\"allow\"|\"deny\",\"list\":[\"owner/repo\"]}}.")
+
+
+def prior_labels(body: str) -> list:
+    m = re.search(r"<!-- whence (\{.*?\}) -->", body)
+    if m:
+        try: return json.loads(m.group(1)).get("labels", [])
+        except Exception: pass
+    return []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Stamp a PR with agent/session/machine/tab provenance.")
     ap.add_argument("--pr"); ap.add_argument("--branch")
-    ap.add_argument("--hide", help="comma list of fields to omit: " + ",".join(FIELDS))
+    ap.add_argument("--hide", help="comma list of fields to omit this run: " + ",".join(FIELDS))
+    ap.add_argument("--no-footer", action="store_true", help="don't post the PR-description footer")
+    ap.add_argument("--no-labels", action="store_true", help="don't post the queue labels")
     ap.add_argument("--apply", action="store_true", help="mutate the PR (default: dry-run)")
     ap.add_argument("--auto", action="store_true",
-                    help="hook mode: apply, stay quiet, and skip silently if the repo is "
-                         "excluded or has no PR (safe to fire from a global hook)")
+                    help="hook mode: apply, quiet, skip silently if the repo is off or has no PR")
+    ap.add_argument("--init", action="store_true", help="write an editable config with every knob")
+    ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
+    ap.add_argument("--show", action="store_true", help="print the effective config and where it lives")
     args = ap.parse_args()
+
+    if args.init:
+        write_default_config(args.force); return 0
+
     cfg = load_config(args.hide)
+    post_labels = cfg["labels"] and not args.no_labels
+    post_footer = cfg["footer"] and not args.no_footer
+
+    if args.show:
+        f = CFG_DIR / "config.json"
+        shown = [x for x in FIELDS if x not in cfg["hide"]]
+        rp = cfg.get("repos") or {}
+        scope = rp.get("mode", "all")
+        print(f"config file:  {f}  ({'exists' if f.exists() else 'not created — run: whence --init'})")
+        print(f"per-repo off: drop a `.whence-off` file in a repo's root to disable it there")
+        print(f"\nlabels posted: {post_labels}    footer posted: {post_footer}")
+        print(f"fields shown:  {', '.join(shown) or '(none)'}")
+        print(f"fields hidden: {', '.join(sorted(cfg['hide'])) or '(none)'}")
+        print(f"repo scope:    {scope}" + (f"  {rp.get('list', [])}" if scope != "all" else "  (every repo)"))
+        return 0
+
     if not repo_allowed(cfg):
         if not args.auto:
-            print("whence: this repo is excluded by config (repos.mode) — skipping")
+            print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
+
     p = collect()
-    labels = labels_for(p, cfg)
+    labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
-    ft = footer(p, cfg, names)
+    ft = footer(p, cfg, names) if post_footer else ""
 
     if not args.auto:
         print("── Provenance ──")
         for k in FIELDS:
-            mark = "" if visible(k, p, cfg["hide"]) else "  (hidden)"
-            print(f"  {k:9} {p[k]}{mark}")
-        print("\n── Labels ──")
+            print(f"  {k:9} {p[k]}" + ("" if visible(k, p, cfg['hide']) else "  (hidden)"))
+        print("\n── Labels ──" if post_labels else "\n── Labels (disabled) ──")
         for n, c in labels:
             print(f"  #{c}  {n}")
-        print("\n── Footer ──\n" + ft)
+        print("\n── Footer ──\n" + ft if post_footer else "\n── Footer (disabled) ──")
     if not args.apply and not args.auto:
         print("\n[dry-run] pass --apply to stamp the PR")
         return 0
@@ -218,27 +287,29 @@ def main() -> int:
     pr = resolve_pr(args)
     if not pr:
         if args.auto:
-            return 0  # no PR yet — nothing to stamp, stay silent for hooks
+            return 0
         print("whence: could not resolve a PR", file=sys.stderr); return 2
+
     body = sh(GH, "pr", "view", pr, "--json", "body", "-q", ".body").stdout
-    prior = []
-    m = re.search(r"<!-- whence (\{.*?\}) -->", body)
-    if m:
-        try: prior = json.loads(m.group(1)).get("labels", [])
-        except Exception: pass
+    # Labels: apply the current set, or (if disabled) remove any we left before.
+    keep = set(names)
     existing = sh(GH, "pr", "view", pr, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
-    stale = (set(prior) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - set(names)
+    stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
     for s in sorted(x for x in stale if x):
         sh(GH, "pr", "edit", pr, "--remove-label", s)
     for n, c in labels:
         sh(GH, "label", "create", n, "--color", c, "--force")
     if names:
         sh(GH, "pr", "edit", pr, *sum([["--add-label", n] for n in names], []))
-    newbody = MARK_RE.sub("", body).rstrip() + "\n\n" + ft
-    tmp = pathlib.Path("/tmp") / f"whence-body-{pr}.md"
-    tmp.write_text(newbody)
-    sh(GH, "pr", "edit", pr, "--body-file", str(tmp))
-    print(f"\n✓ stamped PR #{pr}: {', '.join(names) or '(no labels)'}")
+    # Footer: post it, or (if disabled) strip any prior footer we left behind.
+    stripped = MARK_RE.sub("", body).rstrip()
+    newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
+    if newbody != body:
+        tmp = pathlib.Path("/tmp") / f"whence-body-{pr}.md"
+        tmp.write_text(newbody)
+        sh(GH, "pr", "edit", pr, "--body-file", str(tmp))
+    print(f"\n✓ PR #{pr}: " + (", ".join(names) if names else "labels off")
+          + (" + footer" if post_footer else " · footer off"))
     return 0
 
 
