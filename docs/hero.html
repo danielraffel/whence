@@ -1,0 +1,65 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 14px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+    color: #1f2328; background: #eef1f4; padding: 34px; width: 940px; }
+  .cap { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: #656d76; margin: 4px 2px 10px; }
+  .card { background: #fff; border: 1px solid #d1d9e0; border-radius: 12px;
+    box-shadow: 0 1px 3px rgba(31,35,40,.06); overflow: hidden; }
+  /* --- queue row --- */
+  .row { display: flex; gap: 12px; padding: 16px 18px; align-items: flex-start; }
+  .oct { color: #1a7f37; flex: none; margin-top: 2px; }
+  .row .main { flex: 1; }
+  .title { font-size: 16px; font-weight: 600; color: #1f2328; display: inline; }
+  .labels { display: inline-flex; gap: 6px; margin-left: 8px; vertical-align: middle; }
+  .lbl { font-size: 12px; font-weight: 500; line-height: 18px; padding: 0 10px; border-radius: 999px;
+    color: #fff; white-space: nowrap; }
+  .meta { color: #656d76; font-size: 12.5px; margin-top: 6px; }
+  .bot { display: inline-block; border: 1px solid #d1d9e0; border-radius: 999px; padding: 0 7px;
+    font-size: 11px; color: #656d76; margin-left: 4px; }
+  /* --- footer (rendered markdown) --- */
+  .body { padding: 20px 22px; }
+  .rule { border: 0; border-top: 1px solid #d1d9e0; margin: 4px 0 16px; }
+  .body h3 { font-size: 17px; margin-bottom: 10px; }
+  .body p { margin: 0 0 7px; color: #1f2328; }
+  .body b { font-weight: 600; }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: #eff1f3; border-radius: 6px; padding: 1px 6px; color: #1f2328; }
+  a { color: #0969da; text-decoration: none; }
+  .sub { color: #656d76; font-size: 12px; }
+  .dot { color: #8c959f; padding: 0 4px; }
+  .stack { display: flex; flex-direction: column; gap: 26px; }
+</style></head>
+<body>
+  <div class="stack">
+    <div>
+      <div class="cap">In your PR queue — one glance tells you who, where, which tab</div>
+      <div class="card">
+        <div class="row">
+          <svg class="oct" width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M5 3.25a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm0 2.122a2.25 2.25 0 1 0-1.5 0v.878A2.25 2.25 0 0 0 5.75 8.5h1.5v2.128a2.251 2.251 0 1 0 1.5 0V8.5h1.5a2.25 2.25 0 0 0 2.25-2.25v-.878a2.25 2.25 0 1 0-1.5 0v.878a.75.75 0 0 1-.75.75h-4.5A.75.75 0 0 1 5 6.25v-.878Zm3.75 7.378a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm3-8.75a.75.75 0 1 1 0-1.5.75.75 0 0 1 0 1.5Z"></path></svg>
+          <div class="main">
+            <span class="title">ci: add config→doc drift gate (config_doc_check)</span><span class="labels"><span class="lbl" style="background:#1f6feb">claude</span><span class="lbl" style="background:#1a7f37">m3</span><span class="lbl" style="background:#8250df">pulp: ci-merge-queue-rollout</span></span>
+            <div class="meta">#5953 opened 2 hours ago by shipyard-local <span class="bot">Bot</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="cap">In the PR body — jump straight back to the session that made it</div>
+      <div class="card">
+        <div class="body">
+          <hr class="rule">
+          <h3>🔎 Provenance</h3>
+          <p><b>Agent</b> <code>claude</code> <span class="dot">·</span> <b>Machine</b> <code>m3</code> <span class="dot">·</span> <b>cmux tab</b> pulp: ci-merge-queue-rollout</p>
+          <p><b>Session</b> <code>2a56881b-5401-406f-a015-f9b715dfff46</code></p>
+          <p><b>Resume</b> <code>claude --resume 2a56881b-5401-406f-a015-f9b715dfff46</code></p>
+          <p><b>Restore URL</b> <a href="#">https://claude.ai/code/session_01NknueZYFeuoqEaRdn9kdVM</a></p>
+          <p><b>Jump to this tab</b> <code>cmux surface focus 1CD02392-5116-47A7-BE6A-5B4DCFAE9BEC</code></p>
+          <p><b>Relaunch (any agent)</b> <code>cmux surface resume get --surface 1CD02392-…</code></p>
+          <p class="sub">stamped 2026-07-11 00:15 UTC</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</body></html>

@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""whence — stamp a PR with the provenance of the agent that made it.
+
+Attaches, at PR-open time: prefix-free color-coded labels (agent, machine, cmux
+tab) and a visible footer (session id, resume/relaunch commands, restore URL,
+jump-to-tab). Works for ANY agent cmux launches — the resume/relaunch handles
+come from cmux's own per-tab session-restore, so no agent-specific config is
+needed. Every field is toggleable via config.
+
+Usage:
+  whence --pr 1234 [--apply]        # default is dry-run (prints only)
+  whence --apply                    # find the PR for the current branch
+  whence --pr 1234 --hide url,session --apply
+
+Config (all optional, ~/.config/whence/config.json):
+  {
+    "hide":   ["url"],                 # fields to omit (labels + footer rows)
+    "colors": {"agent":"1f6feb", "host":"1a7f37", "tab":"8250df"}
+  }
+Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
+"""
+from __future__ import annotations
+import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib
+
+GH = os.environ.get("WHENCE_GH", "gh")            # e.g. WHENCE_GH=ghapp
+CFG_DIR = pathlib.Path.home() / ".config/whence"
+
+# Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
+FIELDS = ["agent", "host", "tab", "session", "resume", "url", "jump", "relaunch", "stamped"]
+LABEL_FIELDS = ["agent", "host", "tab"]
+DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "tab": "8250df"}
+
+# Friendly resume syntax for agents whose CLI we've verified. ANY other agent
+# still works via the cmux-sourced `relaunch` command below — this is just for a
+# prettier line. Add your agent here (PRs welcome).
+KNOWN_RESUME = {"claude": "claude --resume {sid}", "codex": "codex resume {sid}"}
+KNOWN_URL = {"claude": "https://claude.ai/code/{bridge}"}
+
+MARK_RE = re.compile(r"<!-- whence( .*?)? -->.*?<!-- /whence -->\n?", re.S)
+OLD_PREFIXES = ("agent:", "host:", "ws:")
+
+
+def sh(*a, **k):
+    return subprocess.run(a, capture_output=True, text=True, **k)
+
+
+def load_config(cli_hide: str) -> dict:
+    cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {}}
+    f = CFG_DIR / "config.json"
+    if f.exists():
+        try:
+            d = json.loads(f.read_text())
+            cfg["hide"] |= set(d.get("hide", []))
+            cfg["colors"].update(d.get("colors", {}))
+            cfg["repos"] = d.get("repos", {})   # {"mode":"all|allow|deny","list":["owner/repo"]}
+        except Exception as e:
+            print(f"whence: ignoring bad config.json: {e}", file=sys.stderr)
+    for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
+        cfg["hide"] |= {x.strip() for x in src.split(",") if x.strip()}
+    unknown = cfg["hide"] - set(FIELDS)
+    if unknown:
+        print(f"whence: unknown hide field(s) ignored: {', '.join(sorted(unknown))} "
+              f"(valid: {', '.join(FIELDS)})", file=sys.stderr)
+    return cfg
+
+
+def host_label() -> str:
+    raw = socket.gethostname().split(".")[0]
+    label = os.environ.get("WHENCE_HOST_LABEL", "").strip()
+    if not label:
+        f = CFG_DIR / "host-label"
+        if f.exists():
+            label = f.read_text().strip()
+    return label or raw
+
+
+def cmux_ws_name(ws_id: str) -> str:
+    if not ws_id:
+        return ""
+    r = sh("cmux", "workspace", "list", "--id-format", "both")
+    if r.returncode != 0:
+        return ""
+    for line in r.stdout.splitlines():
+        if ws_id in line:
+            after = re.sub(r"\s*\[[^\]]*\]\s*$", "", line.split(ws_id, 1)[1]).strip()
+            return re.sub(r"^[\W_]+", "", after).strip()
+    return ""
+
+
+def collect() -> dict:
+    agent = os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
+        "claude" if os.environ.get("CLAUDECODE") else
+        "codex" if os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") else
+        "unknown")
+    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    p = {f: "" for f in FIELDS}
+    p["agent"] = agent
+    p["host"] = host_label()
+    p["tab"] = cmux_ws_name(os.environ.get("CMUX_WORKSPACE_ID", ""))
+    p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    restore = ""
+    if surface:
+        r = sh("cmux", "surface", "resume", "get", "--surface", surface)
+        if r.returncode == 0:
+            restore = r.stdout.strip()
+        p["jump"] = f"cmux surface focus {surface}"
+        p["relaunch"] = f"cmux surface resume get --surface {surface}"  # exact cmd, any agent
+
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+           or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or "")
+    if not sid and restore:
+        m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", restore)
+        sid = m.group(0) if m else ""
+    p["session"] = sid
+
+    if agent in KNOWN_RESUME and sid:
+        p["resume"] = KNOWN_RESUME[agent].format(sid=sid)
+    if agent in KNOWN_URL:
+        bridge = os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID", "")
+        if bridge:
+            p["url"] = KNOWN_URL[agent].format(bridge=bridge)
+    return p
+
+
+def visible(field: str, p: dict, hide: set) -> bool:
+    return field not in hide and bool(p.get(field))
+
+
+def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
+    out = []
+    for f in LABEL_FIELDS:
+        if visible(f, p, cfg["hide"]):
+            out.append((p[f][:50], cfg["colors"].get(f, "ededed")))
+    return out
+
+
+def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
+    hide = cfg["hide"]
+    tag = json.dumps({"labels": label_names}, ensure_ascii=False)
+    line1 = "  ·  ".join(
+        f"**{lbl}** {fmt}" for f, lbl, fmt in [
+            ("agent", "Agent", f"`{p['agent']}`"),
+            ("host", "Machine", f"`{p['host']}`"),
+            ("tab", "cmux tab", p["tab"]),
+        ] if visible(f, p, hide))
+    rows = [line1] if line1 else []
+    for f, lbl, val in [
+        ("session", "Session", f"`{p['session']}`"),
+        ("resume", "Resume", f"`{p['resume']}`"),
+        ("url", "Restore URL", p["url"]),
+        ("jump", "Jump to this tab", f"`{p['jump']}`"),
+        ("relaunch", "Relaunch (any agent)", f"`{p['relaunch']}`"),
+    ]:
+        if visible(f, p, hide):
+            rows.append(f"**{lbl}** {val}")
+    if visible("stamped", p, hide):
+        rows.append(f"<sub>stamped {p['stamped']}</sub>")
+    body = "  \n".join(r for r in rows if r)
+    return f"<!-- whence {tag} -->\n\n---\n### 🔎 Provenance\n{body}\n<!-- /whence -->"
+
+
+def resolve_pr(args) -> str:
+    if args.pr:
+        return str(args.pr)
+    br = args.branch or sh("git", "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    return sh(GH, "pr", "view", br, "--json", "number", "-q", ".number").stdout.strip()
+
+
+def repo_allowed(cfg: dict) -> bool:
+    """Per-repo enable/disable. Default: every repo. Configure with
+    "repos": {"mode": "allow"|"deny", "list": ["owner/repo", ...]}."""
+    r = cfg.get("repos") or {}
+    mode = r.get("mode", "all")
+    if mode == "all":
+        return True
+    slug = sh(GH, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
+    lst = set(r.get("list", []))
+    if mode == "allow":
+        return slug in lst
+    if mode == "deny":
+        return slug not in lst
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Stamp a PR with agent/session/machine/tab provenance.")
+    ap.add_argument("--pr"); ap.add_argument("--branch")
+    ap.add_argument("--hide", help="comma list of fields to omit: " + ",".join(FIELDS))
+    ap.add_argument("--apply", action="store_true", help="mutate the PR (default: dry-run)")
+    ap.add_argument("--auto", action="store_true",
+                    help="hook mode: apply, stay quiet, and skip silently if the repo is "
+                         "excluded or has no PR (safe to fire from a global hook)")
+    args = ap.parse_args()
+    cfg = load_config(args.hide)
+    if not repo_allowed(cfg):
+        if not args.auto:
+            print("whence: this repo is excluded by config (repos.mode) — skipping")
+        return 0
+    p = collect()
+    labels = labels_for(p, cfg)
+    names = [n for n, _ in labels]
+    ft = footer(p, cfg, names)
+
+    if not args.auto:
+        print("── Provenance ──")
+        for k in FIELDS:
+            mark = "" if visible(k, p, cfg["hide"]) else "  (hidden)"
+            print(f"  {k:9} {p[k]}{mark}")
+        print("\n── Labels ──")
+        for n, c in labels:
+            print(f"  #{c}  {n}")
+        print("\n── Footer ──\n" + ft)
+    if not args.apply and not args.auto:
+        print("\n[dry-run] pass --apply to stamp the PR")
+        return 0
+
+    pr = resolve_pr(args)
+    if not pr:
+        if args.auto:
+            return 0  # no PR yet — nothing to stamp, stay silent for hooks
+        print("whence: could not resolve a PR", file=sys.stderr); return 2
+    body = sh(GH, "pr", "view", pr, "--json", "body", "-q", ".body").stdout
+    prior = []
+    m = re.search(r"<!-- whence (\{.*?\}) -->", body)
+    if m:
+        try: prior = json.loads(m.group(1)).get("labels", [])
+        except Exception: pass
+    existing = sh(GH, "pr", "view", pr, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
+    stale = (set(prior) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - set(names)
+    for s in sorted(x for x in stale if x):
+        sh(GH, "pr", "edit", pr, "--remove-label", s)
+    for n, c in labels:
+        sh(GH, "label", "create", n, "--color", c, "--force")
+    if names:
+        sh(GH, "pr", "edit", pr, *sum([["--add-label", n] for n in names], []))
+    newbody = MARK_RE.sub("", body).rstrip() + "\n\n" + ft
+    tmp = pathlib.Path("/tmp") / f"whence-body-{pr}.md"
+    tmp.write_text(newbody)
+    sh(GH, "pr", "edit", pr, "--body-file", str(tmp))
+    print(f"\n✓ stamped PR #{pr}: {', '.join(names) or '(no labels)'}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
