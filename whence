@@ -424,9 +424,15 @@ def _write_pr_hook() -> pathlib.Path:
     PR_HOOK.write_text(
         "#!/bin/sh\n"
         "# whence agent PR hook — an agent PostToolUse hook pipes the tool-call JSON\n"
-        "# to this on stdin; whence decides whether it opened a PR and stamps it.\n"
+        "# to this on stdin. A cheap shell pre-filter avoids starting Python on the\n"
+        "# ~99% of commands that clearly aren't a PR-open; whence --hook then does\n"
+        "# the precise check (command field, not the whole payload) and stamps.\n"
         "# Always exits 0 so a stamping hiccup never breaks the agent.\n"
-        f'"{whence_bin}" --hook || true\n'
+        "in=$(cat 2>/dev/null)\n"
+        "case \"$in\" in\n"
+        "  *\"pr create\"*|*\"shipyard pr\"*|*\"pulp pr\"*)\n"
+        f'    printf \'%s\' "$in" | "{whence_bin}" --hook || true ;;\n'
+        "esac\n"
         "exit 0\n")
     PR_HOOK.chmod(0o755)
     return PR_HOOK
