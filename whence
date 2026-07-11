@@ -625,8 +625,11 @@ def main() -> int:
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
+    hook_agent = hook_sid = ""
     if args.hook:
         # Agent PostToolUse: read the tool JSON, stamp only if it opened a PR.
+        # The payload carries the true identity (session_id + transcript_path),
+        # which is more reliable than env vars that can leak between sessions.
         if sys.stdin.isatty():   # run by hand with no piped input — don't block
             return 0
         try: raw = sys.stdin.read()
@@ -635,6 +638,10 @@ def main() -> int:
         try:
             d = json.loads(raw); ti = d.get("tool_input") or d.get("toolInput") or {}
             cmd = ti.get("command") or ti.get("cmd") or ""
+            hook_sid = d.get("session_id") or ""
+            tp = d.get("transcript_path") or ""
+            hook_agent = ("codex" if "/.codex" in tp else
+                          "claude" if "/.claude" in tp else "")
         except Exception:
             cmd = ""
         if not PR_CMD_RE.search(cmd or raw):
@@ -663,6 +670,18 @@ def main() -> int:
         return 0
 
     p = collect()
+    if args.hook:
+        # Prefer the hook payload's identity over env (which can leak across
+        # sessions): the session id is authoritative; use the transcript's agent
+        # only when env couldn't name one. Keep resume consistent with both.
+        if hook_agent and p["agent"] in ("", "unknown"):
+            p["agent"] = hook_agent
+        if hook_sid:
+            p["session"] = hook_sid
+        if p["agent"] in KNOWN_RESUME and p["session"]:
+            p["resume"] = KNOWN_RESUME[p["agent"]].format(sid=p["session"])
+        elif p["agent"] not in KNOWN_RESUME:
+            p["resume"] = ""
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
     ft = footer(p, cfg, names) if post_footer else ""
