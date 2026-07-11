@@ -232,12 +232,19 @@ def visible(field: str, p: dict, hide: set) -> bool:
 
 
 def _clip(s: str, n: int) -> str:
-    """Shorten a label to n chars, ending with … — long tab/workspace names make
-    unreadable queue chips. The full name still lives in the footer."""
+    """Shorten a label to ~n chars, ending with … — long tab/workspace names make
+    unreadable queue chips. Prefers a whole-word break (may fall a little short of
+    n rather than cut mid-word), but hard-caps a runaway single word so nothing
+    blows past the limit. The full name always lives in the footer."""
     s = s.strip()
     if n <= 0 or len(s) <= n:
         return s[:50]  # GitHub's hard label max
-    return s[:max(1, n - 1)].rstrip() + "…"
+    budget = max(1, n - 1)                       # leave room for the …
+    head = s[:budget]
+    sp = head.rfind(" ")
+    if sp >= int(budget * 0.6):                  # a word break close enough to keep
+        head = head[:sp]
+    return head.rstrip() + "…"
 
 
 def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
