@@ -22,7 +22,7 @@ Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 from __future__ import annotations
 import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib
 
-GH = os.environ.get("WHENCE_GH", "gh")            # e.g. WHENCE_GH=ghapp
+GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
 
 # Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
@@ -48,6 +48,7 @@ DEFAULT_CONFIG = {
     "footer": True,
     "colors": dict(DEFAULT_COLORS),
     "repos": {"mode": "all", "list": []},
+    "gh": "gh",
 }
 
 
@@ -58,7 +59,7 @@ def sh(*a, **k):
 def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
-           "footer": True, "labels": True}
+           "footer": True, "labels": True, "gh": ""}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -68,6 +69,7 @@ def load_config(cli_hide: str) -> dict:
             cfg["repos"] = d.get("repos", {})   # {"mode":"all|allow|deny","list":["owner/repo"]}
             cfg["footer"] = bool(d.get("footer", True))   # post the PR-description footer?
             cfg["labels"] = bool(d.get("labels", True))   # post the queue labels?
+            cfg["gh"] = str(d.get("gh", "") or "")        # gh binary, e.g. "ghapp" (App-token auth)
             # "fields": {"host": false, ...} — the easy per-field on/off switch.
             for name, on in (d.get("fields") or {}).items():
                 if not on:
@@ -246,6 +248,8 @@ def main() -> int:
         write_default_config(args.force); return 0
 
     cfg = load_config(args.hide)
+    global GH
+    GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
     post_labels = cfg["labels"] and not args.no_labels
     post_footer = cfg["footer"] and not args.no_footer
 

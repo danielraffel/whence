@@ -123,7 +123,8 @@ settings any time (so you never have to wonder where it lives).
   "labels": true,
   "footer": true,
   "colors": { "agent": "1f6feb", "host": "1a7f37", "tab": "8250df" },
-  "repos": { "mode": "all", "list": [] }
+  "repos": { "mode": "all", "list": [] },
+  "gh": "gh"
 }
 ```
 
@@ -140,8 +141,9 @@ one-off? `--hide host,agent`, `--no-footer`, `--no-labels`, or
 `WHENCE_HIDE=url,session` do the same without editing the file.
 
 **Colors:** any GitHub label hex, per category. **Machine label:**
-`WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:**
-`WHENCE_GH=ghapp` for App-token auth.
+`WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:** set
+`"gh": "ghapp"` in config (or `WHENCE_GH=ghapp`) to authenticate as a GitHub
+App instead of the shared personal token.
 
 ## Any agent, any machine
 
