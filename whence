@@ -48,6 +48,57 @@ PR_CMD_RE = re.compile(r"(?:gh|ghapp) pr create|shipyard pr|pulp pr")
 # record the branch's provenance now so the sweep stamps the PR when it appears.
 PUSH_RE = re.compile(r"\bgit\s+push\b|\bshipyard\s+pr\b|\bpulp\s+pr\b")
 
+# The command's OUTPUT names its own outcome — the PR URL that `gh`/`shipyard`
+# print, or the `To github.com:owner/repo.git` + refspec that `git push` prints.
+# That is the ONLY cwd-independent source of truth we get. Inferring the repo and
+# branch from the hook's cwd instead is what silently drops PRs: an agent hook
+# runs in the SESSION's project root, which is NOT the worktree the command ran
+# in, so anything shipped from a worktree resolved the wrong branch and no-op'd.
+# Reading the output works no matter what shells out to what — gh, shipyard, pulp,
+# a bare `git push`, a script — because they all have to print where the code went.
+PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?/pull/(\d+)\b")
+NEW_PR_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+?)(?:\.git)?/pull/new/(\S+)")
+PUSH_TO_RE = re.compile(r"^To (?:(?:\w+://)?(?:[\w.-]+@)?github\.com[:/])"
+                        r"([\w.-]+/[\w.-]+?)(?:\.git)?/?$", re.M)
+# `   abc1234..def5678  fix/x -> fix/x`, ` * [new branch]  fix/x -> fix/x`,
+# ` + 999f...888e  fix/x -> fix/x (forced update)` — the trailing note is optional.
+REFSPEC_RE = re.compile(r"^[\s+*-]*(?:\[new branch\]|\[new tag\]|[0-9a-f]{4,}\.{2,3}[0-9a-f]{4,})"
+                        r"\s+\S+\s+->\s+(\S+?)(?:\s+\(.*\))?\s*$", re.M)
+
+
+def parse_outcome(payload: dict) -> tuple[str, str, str]:
+    """(repo_slug, branch, pr_number) as reported by the command itself.
+
+    Any field may be "" — a `git push` names a repo+branch but no PR (the PR may
+    not exist yet); a `gh pr create` names a repo+PR directly. Reads stdout AND
+    stderr: git writes its refspec summary to stderr."""
+    tr = payload.get("tool_response") or payload.get("toolResponse") or ""
+    if isinstance(tr, dict):
+        tr = "\n".join(str(tr.get(k) or "") for k in ("stdout", "stderr", "output", "content"))
+    elif not isinstance(tr, str):
+        tr = str(tr)
+    slug = branch = pr = ""
+    m = PR_URL_RE.search(tr)
+    if m:
+        slug, pr = m.group(1), m.group(2)
+    if not slug:
+        m = NEW_PR_RE.search(tr) or PUSH_TO_RE.search(tr)
+        if m:
+            slug = m.group(1)
+            if m.re is NEW_PR_RE:
+                branch = m.group(2)
+    if slug and not branch:
+        # Gated on `slug`: a refspec with no GitHub repo above it came from some
+        # OTHER remote, and pairing that branch with a cwd-derived GitHub slug
+        # would file the entry under a repo the push never touched.
+        m = REFSPEC_RE.search(tr)
+        if m and m.group(1) != "HEAD":
+            branch = m.group(1)
+            if branch.startswith("refs/heads/"):
+                branch = branch[len("refs/heads/"):]
+    return slug, branch, pr
+
+
 # The whole config, every knob shown at its default. `whence --init` writes this.
 # Flip any field false to drop it; set labels/footer false to drop a whole surface;
 # set repos.mode to "allow"/"deny" with a list to scope which repos get stamped.
@@ -119,19 +170,6 @@ def host_label() -> str:
     return label or raw
 
 
-def cmux_ws_name(ws_id: str) -> str:
-    if not ws_id:
-        return ""
-    r = sh("cmux", "workspace", "list", "--id-format", "both")
-    if r.returncode != 0:
-        return ""
-    for line in r.stdout.splitlines():
-        if ws_id in line:
-            after = re.sub(r"\s*\[[^\]]*\]\s*$", "", line.split(ws_id, 1)[1]).strip()
-            return re.sub(r"^[\W_]+", "", after).strip()
-    return ""
-
-
 import unicodedata
 
 
@@ -150,11 +188,15 @@ def clean_title(t: str) -> str:
 
 
 def cmux_workspace(ws_id: str) -> str:
-    """The workspace name — your custom title if you set one, else cmux's
-    (drifting) auto-title. See `has_custom_title` in `cmux rpc workspace.list`."""
+    """The workspace name — ONLY when you gave it a custom title.
+
+    cmux auto-titles an unnamed workspace from one of the agent tabs inside it, so
+    the auto-title IS some tab's title — at best redundant with the tab label, at
+    worst a DIFFERENT tab's name sitting under a "workspace" label. Unnamed means
+    no workspace label; naming a workspace is what opts you into one, and its
+    presence then tells you the workspace was named deliberately."""
     if not ws_id:
         return ""
-    name = cmux_ws_name(ws_id)
     r = sh("cmux", "rpc", "workspace.list")
     if r.returncode == 0:
         try:
@@ -165,7 +207,7 @@ def cmux_workspace(ws_id: str) -> str:
                     break
         except Exception:
             pass
-    return clean_title(name)
+    return ""
 
 
 def cmux_tab_title(surface_id: str) -> tuple[str, str]:
@@ -303,18 +345,22 @@ def resolve_pr(args) -> str:
     return sh(GH, "pr", "view", br, "--json", "number", "-q", ".number").stdout.strip()
 
 
-def repo_allowed(cfg: dict) -> bool:
+def repo_allowed(cfg: dict, slug: str = "") -> bool:
     """Per-repo enable/disable. Two ways, either turns it off here:
     1. Drop a `.whence-off` file in the repo root  →  disabled in that repo.
-    2. Global list in config: "repos": {"mode":"allow"|"deny","list":["owner/repo"]}."""
+    2. Global list in config: "repos": {"mode":"allow"|"deny","list":["owner/repo"]}.
+
+    `slug` is the repo the COMMAND touched. Pass it whenever it's known: resolving
+    the repo from the cwd instead would apply repo A's allow/deny rule to a PR in
+    repo B (the hook's cwd is the session root, not where the command ran)."""
     top = sh("git", "rev-parse", "--show-toplevel").stdout.strip()
-    if top and (pathlib.Path(top) / ".whence-off").exists():
+    if top and (pathlib.Path(top) / ".whence-off").exists() and not slug:
         return False
     r = cfg.get("repos") or {}
     mode = r.get("mode", "all")
     if mode == "all":
         return True
-    slug = sh(GH, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
+    slug = slug or sh(GH, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
     lst = set(r.get("list", []))
     if mode == "allow":
         return slug in lst
@@ -442,9 +488,11 @@ def _write_pr_hook() -> pathlib.Path:
         "in=$(cat 2>/dev/null)\n"
         "# match only the command (in tool_input, before tool_response) — never the\n"
         "# command's OUTPUT — so a command whose output mentions a PR verb is ignored.\n"
+        "# `git push` MUST be here: a push is how a PR the daemon opens later gets\n"
+        "# its branch into the ledger, and dropping it here silently killed that.\n"
         'head=${in%%\\"tool_response\\"*}\n'
         "case \"$head\" in\n"
-        "  *\"pr create\"*|*\"shipyard pr\"*|*\"pulp pr\"*)\n"
+        "  *\"pr create\"*|*\"shipyard pr\"*|*\"pulp pr\"*|*\"git push\"*)\n"
         f'    printf \'%s\' "$in" | "{whence_bin}" --hook || true ;;\n'
         "esac\n"
         "exit 0\n")
@@ -499,6 +547,60 @@ def install_agent_hook(scope: str) -> int:
     return 0
 
 
+SWEEP_PLIST = pathlib.Path(os.path.expanduser(
+    "~/Library/LaunchAgents/com.whence.sweep.plist"))
+SWEEP_EVERY = 600
+
+
+def install_sweep(uninstall: bool = False) -> int:
+    """Run the sweep on a timer instead of only when an agent happens to fire the
+    hook again.
+
+    Without this, the LAST PR of a session is never swept: the hook's sweep is
+    opportunistic (it piggybacks on the next push/PR command in that shell), so a
+    session that opens a PR and stops leaves it unstamped forever. macOS only —
+    elsewhere, add `whence --sweep` to cron (the sweep is idempotent and, once
+    entries are marked done, costs no API calls)."""
+    if sys.platform != "darwin":
+        print(f"whence: not macOS — add this to cron instead:\n"
+              f"  */{SWEEP_EVERY // 60} * * * * {os.path.realpath(sys.argv[0])} --sweep")
+        return 0
+    label = "com.whence.sweep"
+    if uninstall:
+        sh("launchctl", "bootout", f"gui/{os.getuid()}/{label}")
+        if SWEEP_PLIST.exists():
+            SWEEP_PLIST.unlink()
+        print("whence: removed the sweep timer")
+        return 0
+    whence_bin = os.path.realpath(sys.argv[0])
+    # launchd starts with a bare PATH; gh/ghapp/git live in the user's dirs.
+    path = ":".join([os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin",
+                     "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    SWEEP_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    SWEEP_PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{whence_bin}</string><string>--sweep</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{path}</string></dict>
+  <key>StartInterval</key><integer>{SWEEP_EVERY}</integer>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+""")
+    sh("launchctl", "bootout", f"gui/{os.getuid()}/{label}")
+    r = sh("launchctl", "bootstrap", f"gui/{os.getuid()}", str(SWEEP_PLIST))
+    if r.returncode != 0:
+        print(f"whence: could not load the sweep timer: {r.stderr.strip()}", file=sys.stderr)
+        return 1
+    print(f"whence: sweep timer every {SWEEP_EVERY // 60}m ({SWEEP_PLIST})")
+    return 0
+
+
 def _best_gh() -> str:
     """Pick the GitHub CLI to use for whence's own calls: gh if present, else
     ghapp (App-token). Lets machines that only have ghapp work with zero config."""
@@ -537,6 +639,10 @@ def setup(host: str | None) -> int:
     print(f"  will catch PRs opened via: {', '.join(have) or '(none found — install gh/ghapp/shipyard/pulp)'}")
     print()
     rc = install_hook(print_only=False)
+    print()
+    install_agent_hook("all")   # the in-process hook: sees worktrees the shell can't
+    print()
+    install_sweep()             # the backstop: catches whatever both hooks missed
     print("\nSetup complete. New PRs from this machine self-stamp once you open a fresh shell/tab.")
     return rc
 
@@ -609,30 +715,37 @@ def is_stamped(body: str) -> bool:
     return bool(MARK_RE.search(body or ""))
 
 
-def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool) -> list:
+def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool,
+                repo: str = "") -> list:
     """Write the labels + footer for provenance `p` onto PR #pr. Idempotent:
     replaces whence's own prior labels/footer, never stacks. Shared by the live
-    hook path and the ledger sweep so both stamp identically."""
+    hook path and the ledger sweep so both stamp identically.
+
+    `repo` ("owner/name") is REQUIRED for correctness whenever the caller knows
+    it: without it every `gh` call resolves the PR number against the cwd's repo,
+    so a sweep running from an unrelated checkout would stamp a same-numbered PR
+    in the WRONG repository."""
+    R = ["--repo", repo] if repo else []
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
     ft = footer(p, cfg, names) if post_footer else ""
-    body = sh(GH, "pr", "view", pr, "--json", "body", "-q", ".body").stdout
+    body = sh(GH, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
     keep = set(names)
-    existing = sh(GH, "pr", "view", pr, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
+    existing = sh(GH, "pr", "view", pr, *R, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
     stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
     for s in sorted(x for x in stale if x):
-        sh(GH, "pr", "edit", pr, "--remove-label", s)
+        sh(GH, "pr", "edit", pr, *R, "--remove-label", s)
     for n, c in labels:
-        sh(GH, "label", "create", n, "--color", c, "--force")
+        sh(GH, "label", "create", n, *R, "--color", c, "--force")
     if names:
-        sh(GH, "pr", "edit", pr, *sum([["--add-label", n] for n in names], []))
+        sh(GH, "pr", "edit", pr, *R, *sum([["--add-label", n] for n in names], []))
     stripped = MARK_RE.sub("", body).rstrip()
     newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
     if newbody != body:
         fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
         try:
             os.write(fd, newbody.encode()); os.close(fd)
-            sh(GH, "pr", "edit", pr, "--body-file", tmpname)
+            sh(GH, "pr", "edit", pr, *R, "--body-file", tmpname)
         finally:
             try: os.unlink(tmpname)
             except OSError: pass
@@ -650,6 +763,7 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
 # whatever PR turns up for that branch, using the captured provenance. Keyed on
 # the git branch, which every path shares, so it needs no Shipyard dependency.
 LEDGER = CFG_DIR / "branch-ledger.json"
+DEFAULT_BRANCHES = {"main", "master", "trunk", "develop"}
 
 
 def _git(cwd, *a):
@@ -676,10 +790,22 @@ def _load_ledger() -> dict:
     except Exception: return {}
 
 
-def ledger_record(cmd: str, p: dict) -> None:
-    """Remember which tab/session/machine owns this branch, keyed owner/repo#branch."""
-    slug, br = _repo_branch(_cmd_cwd(cmd))
+def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "") -> None:
+    """Remember which tab/session/machine owns this branch, keyed owner/repo#branch.
+
+    `slug`/`br` come from the command's own output when it named them — always
+    correct. Only when it named neither do we fall back to reading git in the
+    hook's cwd, which is right just when the command ran in the session's root
+    checkout (and wrong, silently, for every worktree)."""
+    if not slug or not br:
+        c_slug, c_br = _repo_branch(_cmd_cwd(cmd))
+        slug, br = slug or c_slug, br or c_br
     if not slug or not br or br in ("HEAD", ""):
+        return
+    if br in DEFAULT_BRANCHES:
+        # A push to main is not a PR branch. Recording it would leave the sweep
+        # asking "any PR with head=main?" — and stamp whatever unrelated PR that
+        # matched, with this session's provenance.
         return
     led = _load_ledger()
     led[f"{slug}#{br}"] = {"p": {k: p.get(k, "") for k in FIELDS}, "ts": _now_epoch()}
@@ -688,9 +814,15 @@ def ledger_record(cmd: str, p: dict) -> None:
 
 
 def sweep(cfg: dict) -> int:
-    """Stamp every open PR whose head branch is in the ledger but not stamped yet,
+    """Stamp every PR whose head branch is in the ledger but isn't stamped yet,
     using the LEDGER's provenance (the tab that made the branch) — never the
-    sweeping session's. Idempotent; prunes ledger entries older than 14 days."""
+    sweeping session's. Idempotent; prunes ledger entries older than 14 days.
+
+    `--state all`, NOT just open: an orchestrator that merges on green closes the
+    PR within minutes, so an open-only sweep loses exactly the PRs that sailed
+    through — and a merged PR is the one you most want to trace back later. An
+    entry is marked done once stamped, so a steady-state sweep costs no API calls
+    and the timer can run often."""
     led = _load_ledger()
     if not led:
         return 0
@@ -701,17 +833,19 @@ def sweep(cfg: dict) -> int:
             continue
         keep[key] = rec
         slug, _, br = key.partition("#")
-        if not slug or not br:
+        if not slug or not br or rec.get("done"):
             continue
         res = sh(GH, "pr", "list", "--repo", slug, "--head", br,
-                 "--state", "open", "--json", "number,body")
+                 "--state", "all", "--json", "number,body")
         try: prs = json.loads(res.stdout or "[]")
         except Exception: prs = []
         for pr in prs:
             if is_stamped(pr.get("body", "")):
+                rec["done"] = True
                 continue
             p = {f: rec["p"].get(f, "") for f in FIELDS}
-            apply_stamp(str(pr["number"]), p, cfg, post_labels, post_footer)
+            apply_stamp(str(pr["number"]), p, cfg, post_labels, post_footer, repo=slug)
+            rec["done"] = True
             n += 1
     LEDGER.write_text(json.dumps(keep))
     return n
@@ -786,6 +920,9 @@ def main() -> int:
     ap.add_argument("--auto", action="store_true",
                     help="hook mode: apply, quiet, skip silently if the repo is off or has no PR")
     ap.add_argument("--init", action="store_true", help="write an editable config with every knob")
+    ap.add_argument("--install-sweep", action="store_true",
+                    help="run the ledger sweep on a timer (launchd, every 10m)")
+    ap.add_argument("--uninstall-sweep", action="store_true", help="remove the sweep timer")
     ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
     ap.add_argument("--show", action="store_true", help="print the effective config and where it lives")
     ap.add_argument("--setup", action="store_true",
@@ -839,11 +976,16 @@ def main() -> int:
         return uninstall_hook()
     if args.init:
         write_default_config(args.force); return 0
+    if args.install_sweep:
+        return install_sweep()
+    if args.uninstall_sweep:
+        return install_sweep(uninstall=True)
 
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
     hook_agent = hook_sid = hook_cmd = ""
+    hook_slug = hook_br = hook_pr = ""
     hook_is_pr = hook_is_push = False
     if args.hook:
         # Agent PostToolUse: read the tool JSON. A PR-create command stamps now;
@@ -861,10 +1003,13 @@ def main() -> int:
             tp = d.get("transcript_path") or ""
             hook_agent = ("codex" if "/.codex" in tp else
                           "claude" if "/.claude" in tp else "")
+            hook_slug, hook_br, hook_pr = parse_outcome(d)
         except Exception:
             hook_cmd = ""
-        hook_is_pr = bool(PR_CMD_RE.search(hook_cmd or raw))
-        hook_is_push = bool(PUSH_RE.search(hook_cmd or ""))
+        # The output outranks the command name: anything that printed a PR URL
+        # opened a PR, no matter which wrapper it was spelled with.
+        hook_is_pr = bool(hook_pr) or bool(PR_CMD_RE.search(hook_cmd or ""))
+        hook_is_push = bool(PUSH_RE.search(hook_cmd or "")) or bool(hook_slug and hook_br)
         if not (hook_is_pr or hook_is_push):
             return 0
         args.auto = True   # quiet mode for both; a push returns before stamping
@@ -885,7 +1030,7 @@ def main() -> int:
         print(f"repo scope:    {scope}" + (f"  {rp.get('list', [])}" if scope != "all" else "  (every repo)"))
         return 0
 
-    if not repo_allowed(cfg):
+    if not repo_allowed(cfg, hook_slug):
         if not args.auto:
             print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
@@ -907,7 +1052,7 @@ def main() -> int:
         # cheap throttled maintenance: converge to the repo + backfill any PR the
         # live stamp couldn't reach (worktree / daemon / push-only / timed-out).
         if hook_is_pr or hook_is_push:
-            ledger_record(hook_cmd, p)
+            ledger_record(hook_cmd, p, hook_slug, hook_br)
         try: self_update()                       # throttled once/day internally
         except Exception: pass
         try:
@@ -931,13 +1076,15 @@ def main() -> int:
         print("\n[dry-run] pass --apply to stamp the PR")
         return 0
 
-    pr = resolve_pr(args)
+    pr, repo = (hook_pr, hook_slug) if hook_pr else (resolve_pr(args), "")
     if not pr:
+        # The command opened no PR we can name (e.g. a plain push, or a PR the
+        # daemon opens later). It's in the ledger — the sweep will catch it.
         if args.auto:
             return 0
         print("whence: could not resolve a PR", file=sys.stderr); return 2
 
-    names = apply_stamp(pr, p, cfg, post_labels, post_footer)
+    names = apply_stamp(pr, p, cfg, post_labels, post_footer, repo=repo)
     print(f"\n✓ PR #{pr}: " + (", ".join(names) if names else "labels off")
           + (" + footer" if post_footer else " · footer off"))
     return 0
