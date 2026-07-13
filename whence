@@ -345,18 +345,22 @@ def resolve_pr(args) -> str:
     return sh(GH, "pr", "view", br, "--json", "number", "-q", ".number").stdout.strip()
 
 
-def repo_allowed(cfg: dict) -> bool:
+def repo_allowed(cfg: dict, slug: str = "") -> bool:
     """Per-repo enable/disable. Two ways, either turns it off here:
     1. Drop a `.whence-off` file in the repo root  →  disabled in that repo.
-    2. Global list in config: "repos": {"mode":"allow"|"deny","list":["owner/repo"]}."""
+    2. Global list in config: "repos": {"mode":"allow"|"deny","list":["owner/repo"]}.
+
+    `slug` is the repo the COMMAND touched. Pass it whenever it's known: resolving
+    the repo from the cwd instead would apply repo A's allow/deny rule to a PR in
+    repo B (the hook's cwd is the session root, not where the command ran)."""
     top = sh("git", "rev-parse", "--show-toplevel").stdout.strip()
-    if top and (pathlib.Path(top) / ".whence-off").exists():
+    if top and (pathlib.Path(top) / ".whence-off").exists() and not slug:
         return False
     r = cfg.get("repos") or {}
     mode = r.get("mode", "all")
     if mode == "all":
         return True
-    slug = sh(GH, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
+    slug = slug or sh(GH, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").stdout.strip()
     lst = set(r.get("list", []))
     if mode == "allow":
         return slug in lst
@@ -759,6 +763,7 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
 # whatever PR turns up for that branch, using the captured provenance. Keyed on
 # the git branch, which every path shares, so it needs no Shipyard dependency.
 LEDGER = CFG_DIR / "branch-ledger.json"
+DEFAULT_BRANCHES = {"main", "master", "trunk", "develop"}
 
 
 def _git(cwd, *a):
@@ -796,6 +801,11 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "") -> None:
         c_slug, c_br = _repo_branch(_cmd_cwd(cmd))
         slug, br = slug or c_slug, br or c_br
     if not slug or not br or br in ("HEAD", ""):
+        return
+    if br in DEFAULT_BRANCHES:
+        # A push to main is not a PR branch. Recording it would leave the sweep
+        # asking "any PR with head=main?" — and stamp whatever unrelated PR that
+        # matched, with this session's provenance.
         return
     led = _load_ledger()
     led[f"{slug}#{br}"] = {"p": {k: p.get(k, "") for k in FIELDS}, "ts": _now_epoch()}
@@ -1020,7 +1030,7 @@ def main() -> int:
         print(f"repo scope:    {scope}" + (f"  {rp.get('list', [])}" if scope != "all" else "  (every repo)"))
         return 0
 
-    if not repo_allowed(cfg):
+    if not repo_allowed(cfg, hook_slug):
         if not args.auto:
             print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
