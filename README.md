@@ -206,6 +206,12 @@ of your own: none of them can push code without saying where it went.
 1. **Capture.** A push records `owner/repo#branch → {agent, host, workspace, tab,
    session}` into `~/.config/whence/branch-ledger.json`. The env is live at that
    moment, so the tab is captured correctly.
+
+   When the command produced no output to read — a **backgrounded** `shipyard pr`
+   hands the agent a task handle and opens the PR minutes later — whence falls back
+   to the `cd` in the command text, which is the only thing left that names the
+   worktree. It reads `cd X && …`, a `cd` on its own line, `cd "$WT"` against a
+   variable the same command set, and `git -C X`.
 2. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
    but isn't stamped yet, using the *ledger's* provenance (the tab that made the
    branch) — never the sweeping machine's. It covers **merged and closed** PRs,

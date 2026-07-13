@@ -69,6 +69,28 @@ OUTCOMES = [
 ]
 
 
+# How the worktree ACTUALLY gets named in a real command. A backgrounded
+# `shipyard pr` returns no output to parse and the hook's cwd is the session root,
+# so this `cd` is the only thing naming the worktree — and a miss here is a PR
+# with no label. Measured against ~330 real `shipyard pr` commands from a year of
+# transcripts: the old `cd X &&`-prefix-only parser read 46% of them, these forms
+# are the other half.
+def cwd_cases(tmp):
+    return [
+        ("cd X && cmd", f"cd {tmp} && shipyard pr", tmp),
+        ("cd on its own line", f"cd {tmp}\nshipyard pr --base main", tmp),
+        ("cd via a variable set in the same command", f'WT={tmp}\ncd "$WT"\nshipyard pr', tmp),
+        ("${BRACED} variable", f'WT={tmp}\ncd "${{WT}}" && shipyard pr', tmp),
+        ("quoted path", f"cd '{tmp}' && shipyard pr", tmp),
+        ("git -C, no cd at all", f"git -C {tmp} push origin HEAD", tmp),
+        ("the LAST cd wins", f"cd /tmp && echo hi\ncd {tmp} && shipyard pr", tmp),
+        ("env prefix before the tool", f"cd {tmp} && PULP_SKIP_DIFF_COVER=1 shipyard pr", tmp),
+        ("no cd — caller falls back to its own cwd", "shipyard pr --help", None),
+        ("a path that doesn't exist tells us nothing",
+         "cd /nonexistent/wt-xyz && shipyard pr", None),
+    ]
+
+
 def main() -> int:
     failed = 0
     for name, tr, want in OUTCOMES:
@@ -78,6 +100,16 @@ def main() -> int:
             print(f"FAIL  {name}\n      got={got}\n      want={want}")
         else:
             print(f"ok    {name}")
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, cmd, want in cwd_cases(tmp):
+            got = w._cmd_cwd(cmd)
+            if got != want:
+                failed += 1
+                print(f"FAIL  _cmd_cwd: {name}\n      got={got!r}\n      want={want!r}")
+            else:
+                print(f"ok    _cmd_cwd: {name}")
 
     # A workspace cmux auto-titled is just some tab's name wearing a workspace
     # label — the bug that put two tab-looking labels on one PR. No id, no label.
