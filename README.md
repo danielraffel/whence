@@ -17,6 +17,12 @@ follow-up you have no idea which of your twelve open sessions to go ask.
   **workspace** name, and the **tab** title — so the queue is legible at a glance.
   (Two tabs sharing a title get the cmux `surface:N` ref appended so you can still
   tell them apart.)
+
+  The workspace label appears only if you **named** the workspace. cmux auto-titles
+  an unnamed one after a tab inside it, so an auto-title is just some tab's name —
+  as a "workspace" label it is at best a duplicate and at worst a *different* tab's
+  title, which reads like whence mislabelled the PR. Name a workspace to opt into
+  the label; leave it unnamed and you get agent/host/tab only.
 - **A visible "🔎 Provenance" footer** in the PR body with the **session id**,
   the exact **resume command** (`claude --resume …` / `codex resume …`), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
@@ -36,7 +42,7 @@ attached to the PR:
 |------|---------------------|
 | Which agent | cmux `CMUX_AGENT_LAUNCH_KIND` (or `CLAUDECODE` / `CODEX_*`) |
 | Which machine | a one-token `~/.config/whence/host-label` you set per machine |
-| Which tab | `cmux workspace list` → the tab's human name |
+| Which tab | `cmux rpc surface.list` → the tab's human name |
 | How to resume it | `cmux surface resume get` → the exact relaunch command, for **any** agent |
 
 The clever bit: cmux already stores the exact restore command per tab, so Codex
@@ -179,31 +185,38 @@ footers — no tracking, no daemon) and re-stamps them with the current name.
 - **As an agent skill** — [`skill/SKILL.md`](skill/SKILL.md) tells an agent to
   stamp its PR right after opening it.
 
-### Catching every PR — the branch ledger + sweep
+### Catching every PR — read the output, then sweep
 
-The live hook can only stamp a PR it can *see* at push time from the agent's
-shell. That misses a few real cases: a PR opened inside a **git worktree** (the
-hook runs from the home cwd, on the wrong branch), a PR opened **later by a
-detached daemon** (e.g. a merge bot that pushes now and opens the PR minutes
-later), a shell that only **pushed** while the PR was opened elsewhere, and a
-**PR-create command that was killed** before the hook ran.
+**Never infer the repo or branch from the current directory.** An agent's hook
+runs in the *session's* project root, which is not the worktree the command ran
+in — so a PR shipped from a worktree resolves the wrong branch and is silently
+dropped. Nothing warns you; the label just never appears.
 
-whence closes all of these by splitting capture from stamping:
+Instead, whence reads the command's own **output**, which names the outcome no
+matter what shelled out to what:
 
-1. **Capture.** Whenever the hook sees a `git push` (or a `shipyard pr` / `pulp
-   pr`), it records `owner/repo#branch → {agent, host, workspace, tab, session}`
-   into `~/.config/whence/branch-ledger.json`. The env is live at that moment, so
-   the tab is captured correctly — and a leading `cd <worktree> &&` is honored, so
-   worktree branches record right.
-2. **Sweep.** `whence --sweep` scans the ledger and stamps any open PR whose head
-   branch is listed **but not yet stamped**, using the *ledger's* provenance (the
-   tab that made the branch) — never the sweeping machine's. It runs
-   automatically (throttled) on every hook fire, so a daemon-opened PR gets
-   stamped within a couple of minutes without you doing anything.
+| the command printed | whence learns |
+|---|---|
+| `https://github.com/o/r/pull/123` (`gh pr create`, an orchestrator) | the repo **and** the PR — stamp it now |
+| `To github.com:o/r.git` + `fix/x -> fix/x` (`git push`) | the repo **and** the branch — no PR yet, so remember it |
 
-Because it keys on the **git branch** — the one thing every path shares — it needs
-no orchestrator integration and no per-repo setup. Run it by hand any time with
-`whence --sweep`.
+This is why it works for `gh`, `shipyard`, `pulp`, a bare `git push`, or a script
+of your own: none of them can push code without saying where it went.
+
+1. **Capture.** A push records `owner/repo#branch → {agent, host, workspace, tab,
+   session}` into `~/.config/whence/branch-ledger.json`. The env is live at that
+   moment, so the tab is captured correctly.
+2. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
+   but isn't stamped yet, using the *ledger's* provenance (the tab that made the
+   branch) — never the sweeping machine's. It covers **merged and closed** PRs,
+   not just open ones: an orchestrator that merges on green closes the PR within
+   minutes, and those are exactly the PRs you later want to trace back.
+
+The sweep runs on a **timer** (`whence --install-sweep`, every 10 min), not only
+when an agent happens to fire the hook again — otherwise the last PR of a session
+would wait forever for a next command that never comes. Once an entry is stamped
+it is marked done, so a steady-state sweep costs no API calls. `whence --setup`
+installs the timer for you; run it by hand any time with `whence --sweep`.
 
 ### Keeping several machines in sync
 
