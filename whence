@@ -770,11 +770,44 @@ def _git(cwd, *a):
     return sh("git", "-C", cwd, *a) if cwd else sh("git", *a)
 
 
+_CD_RE = re.compile(r"""(?:^|&&|\|\||;|\n)\s*cd\s+('[^']*'|"[^"]*"|[^\s;&|]+)""")
+_GIT_C_RE = re.compile(r"""\bgit\s+-C\s+('[^']*'|"[^"]*"|[^\s;&|]+)""")
+_ASSIGN_RE = re.compile(r"""(?:^|&&|;|\n)\s*(\w+)=('[^']*'|"[^"]*"|[^\s;&|]+)""")
+
+
 def _cmd_cwd(cmd: str):
-    """Target of a leading `cd <path> &&` so a PR opened inside a worktree records
-    the worktree's branch, not the hook's home cwd."""
-    m = re.match(r"""\s*cd\s+('([^']*)'|"([^"]*)"|(\S+))\s*&&""", cmd or "")
-    return (m.group(2) or m.group(3) or m.group(4)) if m else None
+    """The directory the command actually ran in, read out of the command itself.
+
+    This is what stands between a worktree PR and no label at all. A backgrounded
+    `shipyard pr` returns no output for parse_outcome to read, and the hook's own
+    cwd is the session root — so the `cd` in the command text is the ONLY thing
+    left that names the worktree. It has to handle how the commands are really
+    written, not just the tidy form:
+
+        cd /wt && shipyard pr          cd on one line, command on the next
+        WT=/wt                         a variable, expanded below
+        cd "$WT"                       quoted, and referencing that variable
+        git -C /wt push                no cd at all
+
+    Takes the LAST cd (a command may cd twice), and only accepts a real directory
+    — a path that doesn't resolve means we learned nothing, not that we're in it."""
+    if not cmd:
+        return None
+    vars_ = {k: v.strip("'\"") for k, v in _ASSIGN_RE.findall(cmd)}
+
+    def resolve(raw: str):
+        v = raw.strip().strip("'\"")
+        # $VAR / ${VAR} — only ones this same command assigned; no shell, no eval.
+        v = re.sub(r"\$\{?(\w+)\}?", lambda m: vars_.get(m.group(1), ""), v)
+        v = os.path.expanduser(os.path.expandvars(v))
+        return v if v and os.path.isdir(v) else None
+
+    for rx in (_CD_RE, _GIT_C_RE):
+        for m in reversed(list(rx.finditer(cmd))):
+            got = resolve(m.group(1))
+            if got:
+                return got
+    return None
 
 
 def _repo_branch(cwd):
