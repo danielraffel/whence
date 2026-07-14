@@ -110,6 +110,15 @@ DEFAULT_CONFIG = {
     "repos": {"mode": "all", "list": []},
     "gh": "gh",
     "label_maxlen": 24,
+    # Names we must never publish — a cmux tab/workspace title that contains any of
+    # these (case-insensitive substring) is replaced before it can become a PR
+    # label or appear in the footer. Seed it with whatever your repo can't carry:
+    # vendor/framework names, code names, an unreleased product. cmux derives tab
+    # titles from the agent's prompt, so a title like "port the JUCE reverb" would
+    # otherwise land verbatim on a public PR. We can't rename a cmux tab (no such
+    # API), so redaction at publish time is the only enforcement.
+    "denylist": [],
+    "redact_placeholder": "(redacted)",
 }
 
 
@@ -126,7 +135,8 @@ def sh(*a, **k):
 def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
-           "footer": True, "labels": True, "gh": "", "label_maxlen": 24}
+           "footer": True, "labels": True, "gh": "", "label_maxlen": 24,
+           "denylist": [], "redact_placeholder": "(redacted)"}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -149,6 +159,9 @@ def load_config(cli_hide: str) -> dict:
         field("labels", lambda v: cfg.__setitem__("labels", bool(v)))
         field("gh", lambda v: cfg.__setitem__("gh", str(v or "")))
         field("label_maxlen", lambda v: cfg.__setitem__("label_maxlen", int(v)))
+        field("denylist", lambda v: cfg.__setitem__(
+            "denylist", [str(x).lower() for x in v if str(x).strip()]))
+        field("redact_placeholder", lambda v: cfg.__setitem__("redact_placeholder", str(v)))
         # "fields": {"host": false, ...} — the easy per-field on/off switch.
         field("fields", lambda v: [cfg["hide"].add(n) for n, on in v.items() if not on])
     for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
@@ -235,13 +248,63 @@ def cmux_tab_title(surface_id: str) -> tuple[str, str]:
     return "", ""
 
 
-def collect() -> dict:
+def _surface_ref(surface_id: str) -> str:
+    """This surface's cmux ref (`surface:16`) — a stable, name-free handle we can
+    show when the real title can't be published. Navigation never needs the title:
+    the footer's jump command uses the surface UUID regardless."""
+    if not surface_id:
+        return ""
+    r = sh("cmux", "rpc", "surface.list")
+    if r.returncode == 0:
+        try:
+            for sfc in json.loads(r.stdout).get("surfaces", []):
+                if sfc.get("id") == surface_id:
+                    return sfc.get("ref") or ""
+        except Exception:
+            pass
+    return ""
+
+
+def denied(value: str, cfg: dict) -> str:
+    """The first denylist term `value` contains (case-insensitive substring), or "".
+
+    Substring, not word-boundary, and fail-closed: a title that merely embeds a
+    denied token is redacted. Over-redacting a legitimate title is a cosmetic
+    annoyance; leaking a name you promised never to publish is not."""
+    low = (value or "").lower()
+    for term in cfg.get("denylist", []):
+        if term and term in low:
+            return term
+    return ""
+
+
+def redact(p: dict, cfg: dict, surface_id: str = "") -> list[str]:
+    """Replace any free-form NAME field (tab, workspace) that trips the denylist,
+    in place, before it can reach a label or the public footer. Returns the fields
+    that were redacted so the caller can note it. The opaque provenance — session
+    id, resume command, jump/relaunch surface UUIDs — is never a name and is left
+    intact, so a redacted PR is still fully navigable."""
+    hit = []
+    if not cfg.get("denylist"):
+        return hit
+    placeholder = cfg.get("redact_placeholder", "(redacted)")
+    for f in ("tab", "workspace"):
+        if denied(p.get(f, ""), cfg):
+            # A denied tab keeps its name-free cmux ref if we can get one — still
+            # useful in the queue; a denied workspace just drops to the placeholder.
+            p[f] = (_surface_ref(surface_id) or placeholder) if f == "tab" else placeholder
+            hit.append(f)
+    return hit
+
+
+def collect(cfg: dict | None = None) -> dict:
     agent = os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
         "codex" if os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") else
         "unknown")
     surface = os.environ.get("CMUX_SURFACE_ID", "")
     p = {f: "" for f in FIELDS}
+    p["_redacted"] = []
     p["agent"] = agent
     p["host"] = host_label()
     p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""))
@@ -277,6 +340,7 @@ def collect() -> dict:
         bridge = os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID", "")
         if bridge:
             p["url"] = KNOWN_URL[agent].format(bridge=bridge)
+    p["_redacted"] = redact(p, cfg if cfg is not None else load_config(""), surface)
     return p
 
 
@@ -884,6 +948,32 @@ def sweep(cfg: dict) -> int:
     return n
 
 
+def gc_labels(cfg: dict, repo: str) -> int:
+    """Delete every repo-level label whose name trips the denylist.
+
+    Redaction keeps whence from CREATING a denied label, but one can already exist
+    — created before you added the term, or by another tool — and a repo label
+    lives in the picker/autocomplete even after it's pulled off every PR. Deleting
+    the label removes it from every PR at once. Scoped to one repo and explicit
+    (never on a timer): deleting labels is destructive and cross-cutting."""
+    if not cfg.get("denylist"):
+        print("whence: denylist is empty — nothing to gc"); return 0
+    res = sh(GH, "label", "list", "--repo", repo, "--limit", "500",
+             "--json", "name", "-q", ".[].name")
+    if res.returncode != 0:
+        print(f"whence: could not list labels for {repo}: {res.stderr.strip()}",
+              file=sys.stderr)
+        return 1
+    hits = [n for n in res.stdout.splitlines() if n.strip() and denied(n, cfg)]
+    if not hits:
+        print(f"whence: no denied labels in {repo}"); return 0
+    for n in hits:
+        r = sh(GH, "label", "delete", n, "--repo", repo, "--yes")
+        print(f"  {'deleted' if r.returncode == 0 else 'FAILED '} {n!r}"
+              + (f"  ({denied(n, cfg)})" if r.returncode == 0 else f"  {r.stderr.strip()}"))
+    return 0
+
+
 # ── Multi-machine sync: self-update (pull) + deploy (fan-out) ────────────────
 # Any machine can be the one you edit whence on. Two mechanisms keep the rest
 # current: self_update() converges each machine to origin/main automatically
@@ -956,6 +1046,8 @@ def main() -> int:
     ap.add_argument("--install-sweep", action="store_true",
                     help="run the ledger sweep on a timer (launchd, every 10m)")
     ap.add_argument("--uninstall-sweep", action="store_true", help="remove the sweep timer")
+    ap.add_argument("--gc-labels", metavar="OWNER/REPO",
+                    help="delete repo-level labels that trip the denylist")
     ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
     ap.add_argument("--show", action="store_true", help="print the effective config and where it lives")
     ap.add_argument("--setup", action="store_true",
@@ -1009,6 +1101,10 @@ def main() -> int:
         return uninstall_hook()
     if args.init:
         write_default_config(args.force); return 0
+    if args.gc_labels:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        return gc_labels(cfg, args.gc_labels)
     if args.install_sweep:
         return install_sweep()
     if args.uninstall_sweep:
@@ -1068,7 +1164,7 @@ def main() -> int:
             print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
 
-    p = collect()
+    p = collect(cfg)
     if args.hook:
         # Prefer the hook payload's identity over env (which can leak across
         # sessions): the session id is authoritative; use the transcript's agent
@@ -1100,7 +1196,10 @@ def main() -> int:
     if not args.auto:
         print("── Provenance ──")
         for k in FIELDS:
-            print(f"  {k:9} {p[k]}" + ("" if visible(k, p, cfg['hide']) else "  (hidden)"))
+            note = "" if visible(k, p, cfg['hide']) else "  (hidden)"
+            if k in p.get("_redacted", []):
+                note = "  (REDACTED — matched denylist)"
+            print(f"  {k:9} {p[k]}{note}")
         print("\n── Labels ──" if post_labels else "\n── Labels (disabled) ──")
         for n, c in labels:
             print(f"  #{c}  {n}")

@@ -23,6 +23,47 @@ follow-up you have no idea which of your twelve open sessions to go ask.
   as a "workspace" label it is at best a duplicate and at worst a *different* tab's
   title, which reads like whence mislabelled the PR. Name a workspace to opt into
   the label; leave it unnamed and you get agent/host/tab only.
+### Keeping names you can\'t publish off a public PR
+
+cmux derives a tab\'s title from the agent\'s prompt, so a title like *"port the
+JUCE reverb"* would otherwise land verbatim as a label — and in the footer — on a
+public PR. Two facts make this need handling in whence: cmux offers **no way to
+rename a tab** (there is a `workspace.rename` RPC but no surface equivalent), and a
+label, once created, lingers in the repo\'s label picker even after it\'s pulled
+off a PR.
+
+Set a **denylist** in the config — case-insensitive substrings:
+
+```json
+"denylist": ["juce", "iplug", "steinberg", "projucer", "wdl"],
+"redact_placeholder": "(redacted)"
+```
+
+Any tab or workspace title containing one of these is scrubbed **before** it can
+become a label or appear in the footer. It fails closed (a title that merely
+embeds a denied token is redacted), and it only ever touches the free-form *name*
+fields — the session id, resume command, and jump/relaunch surface UUIDs are opaque
+handles, never names, so a redacted PR is still fully navigable. A denied tab keeps
+its name-free cmux ref (`surface:16`) as its label where one is available; a denied
+workspace drops to the placeholder.
+
+Redaction stops whence from *creating* a denied label. To remove ones that already
+leaked (created before you added the term, or by another tool), run:
+
+```bash
+whence --gc-labels owner/repo     # deletes every repo label that trips the denylist
+```
+
+It\'s explicit and per-repo on purpose — deleting a label removes it from every PR
+at once, so it never runs on a timer.
+
+**On renames after a PR is opened:** the label is **frozen at stamp time** — it
+records what the tab was called when it opened the PR, and does not chase later
+renames (a label that mutates as you work is noise, not signal). A re-stamp
+*replaces* the old label rather than stacking a second one, but nothing triggers it
+automatically; run `whence --resync` from that tab to refresh its open PRs to the
+current name. The denylist is the one thing that always wins, at every stamp.
+
 - **A visible "🔎 Provenance" footer** in the PR body with the **session id**,
   the exact **resume command** (`claude --resume …` / `codex resume …`), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command

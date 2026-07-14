@@ -111,6 +111,43 @@ def main() -> int:
             else:
                 print(f"ok    _cmd_cwd: {name}")
 
+    # Denylist redaction: a cmux tab/workspace title with a forbidden name must
+    # never reach a label OR the public footer. cmux gives us no way to rename a
+    # tab, so redaction at publish time is the only enforcement.
+    cfg = {"denylist": ["juce", "iplug", "steinberg", "projucer", "wdl"],
+           "redact_placeholder": "(redacted)", "hide": set(),
+           "colors": w.DEFAULT_COLORS, "label_maxlen": 24}
+    deny_cases = [
+        ("clean title is not denied", "Investigate denormal ODR", False),
+        ("VST3 is allowed (not on the list)", "VST3 bus arrangement", False),
+        ("JUCE anywhere in the title", "Port the JUCE reverb", True),
+        ("case-insensitive", "juce param mapping", True),
+        ("substring: Projucer contains juce", "regen Projucer project", True),
+        ("Steinberg", "Steinberg VST3 quirk", True),
+        ("iPlug2", "iPlug2 graphics port", True),
+    ]
+    for name, title, want_denied in deny_cases:
+        got = bool(w.denied(title, cfg))
+        if got != want_denied:
+            failed += 1
+            print(f"FAIL  denied: {name}: got={got} want={want_denied}")
+        else:
+            print(f"ok    denied: {name}")
+
+    # redact() must leave NO forbidden token in tab/workspace, and the labels and
+    # footer built from that dict must be clean too.
+    pr = {"tab": "Port the JUCE reverb", "workspace": "steinberg-quirks",
+          "agent": "claude", "host": "m5"}
+    hit = w.redact(pr, cfg, surface_id="")
+    blob = (pr["tab"] + " " + pr["workspace"]).lower()
+    leaked = [t for t in cfg["denylist"] if t in blob]
+    label_leaks = [n for n, _ in w.labels_for(pr, cfg) if w.denied(n, cfg)]
+    if leaked or label_leaks or set(hit) != {"tab", "workspace"}:
+        failed += 1
+        print(f"FAIL  redact: leaked={leaked} label_leaks={label_leaks} hit={hit}")
+    else:
+        print("ok    redact: tab+workspace scrubbed, labels clean")
+
     # A workspace cmux auto-titled is just some tab's name wearing a workspace
     # label — the bug that put two tab-looking labels on one PR. No id, no label.
     if w.cmux_workspace("") != "":
