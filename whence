@@ -278,21 +278,39 @@ def denied(value: str, cfg: dict) -> str:
     return ""
 
 
+def scrub_denied(value: str, cfg: dict) -> str:
+    """Cut the denied TERMS out of a name, keeping the rest: with `juce` denied,
+    "Improve JUCE import" -> "Improve import". Tidies the whitespace and dangling
+    separators the removal leaves behind. Returns "" if nothing meaningful is left
+    (e.g. the whole title WAS the denied word) so the caller can fall back to a
+    name-free handle."""
+    out = value or ""
+    for term in cfg.get("denylist", []):
+        if term:
+            out = re.sub(re.escape(term), " ", out, flags=re.IGNORECASE)
+    out = re.sub(r"\s*[-/:_|·]+\s*", " ", out)   # separators orphaned by the cut
+    out = re.sub(r"\s{2,}", " ", out).strip(" -/:_|·\t")
+    return out.strip()
+
+
 def redact(p: dict, cfg: dict, surface_id: str = "") -> list[str]:
-    """Replace any free-form NAME field (tab, workspace) that trips the denylist,
-    in place, before it can reach a label or the public footer. Returns the fields
-    that were redacted so the caller can note it. The opaque provenance — session
-    id, resume command, jump/relaunch surface UUIDs — is never a name and is left
-    intact, so a redacted PR is still fully navigable."""
+    """Scrub any free-form NAME field (tab, workspace) that trips the denylist, in
+    place, before it can reach a label or the public footer. Removes just the
+    forbidden term where a readable name survives; falls back to a name-free cmux
+    ref (tab) or the placeholder (workspace) only when nothing usable is left.
+    Returns the fields it touched. The opaque provenance — session id, resume
+    command, jump/relaunch UUIDs — is never a name and is left intact."""
     hit = []
     if not cfg.get("denylist"):
         return hit
     placeholder = cfg.get("redact_placeholder", "(redacted)")
     for f in ("tab", "workspace"):
         if denied(p.get(f, ""), cfg):
-            # A denied tab keeps its name-free cmux ref if we can get one — still
-            # useful in the queue; a denied workspace just drops to the placeholder.
-            p[f] = (_surface_ref(surface_id) or placeholder) if f == "tab" else placeholder
+            scrubbed = scrub_denied(p[f], cfg)
+            if scrubbed and len(scrubbed) >= 2 and not denied(scrubbed, cfg):
+                p[f] = scrubbed
+            else:
+                p[f] = (_surface_ref(surface_id) or placeholder) if f == "tab" else placeholder
             hit.append(f)
     return hit
 
@@ -309,7 +327,13 @@ def collect(cfg: dict | None = None) -> dict:
     p["host"] = host_label()
     p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""))
     tab, ref = cmux_tab_title(surface)
-    p["tab"] = f"{tab} ({ref})" if (tab and ref) else tab
+    if tab:
+        p["tab"] = f"{tab} ({ref})" if ref else tab
+    else:
+        # cmux shows only a status glyph (🏃/spinner) while the agent is busy, which
+        # cleans to empty exactly when a PR is opened. A name-free ref beats a blank
+        # label, and the sweep upgrades it to the real name once the title settles.
+        p["tab"] = _surface_ref(surface)
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     restore = ""
@@ -374,7 +398,12 @@ def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
 
 def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     hide = cfg["hide"]
-    tag = json.dumps({"labels": label_names}, ensure_ascii=False)
+    # Carry the agent + tab that were actually stamped, so the sweep can tell a
+    # good stamp from a degraded one (blank/ref tab, unknown agent) without
+    # re-deriving it from the labels.
+    tag = json.dumps({"labels": label_names,
+                      "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", "")}},
+                     ensure_ascii=False)
     line1 = "  ·  ".join(
         f"**{lbl}** {fmt}" for f, lbl, fmt in [
             ("agent", "Agent", f"`{p['agent']}`"),
@@ -803,12 +832,22 @@ def write_default_config(force: bool) -> None:
           f"  Scope repos with \"repos\": {{\"mode\":\"allow\"|\"deny\",\"list\":[\"owner/repo\"]}}.")
 
 
-def prior_labels(body: str) -> list:
-    m = re.search(r"<!-- whence (\{.*?\}) -->", body)
+def _prior_tag(body: str) -> dict:
+    # Greedy to the line's closing ` -->` so the nested "prov" object is captured
+    # whole; the tag lives on one line, so `.` (no DOTALL) can't overrun it.
+    m = re.search(r"<!-- whence (\{.*\}) -->", body or "")
     if m:
-        try: return json.loads(m.group(1)).get("labels", [])
+        try: return json.loads(m.group(1))
         except Exception: pass
-    return []
+    return {}
+
+
+def prior_labels(body: str) -> list:
+    return _prior_tag(body).get("labels", [])
+
+
+def prior_prov(body: str) -> dict:
+    return _prior_tag(body).get("prov", {})
 
 
 def _now_epoch() -> int:
@@ -963,16 +1002,73 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "") -> None:
     LEDGER.write_text(json.dumps(led))
 
 
-def sweep(cfg: dict) -> int:
-    """Stamp every PR whose head branch is in the ledger but isn't stamped yet,
-    using the LEDGER's provenance (the tab that made the branch) — never the
-    sweeping session's. Idempotent; prunes ledger entries older than 14 days.
+def _is_ref_tab(tab: str, cfg: dict) -> bool:
+    """A name-free tab: the cmux ref (`surface:16`) or the redaction placeholder.
+    These are placeholders the sweep should try to upgrade to the real name."""
+    t = (tab or "").strip()
+    return bool(re.fullmatch(r"surface:\d+", t)) or t == cfg.get("redact_placeholder", "(redacted)")
 
-    `--state all`, NOT just open: an orchestrator that merges on green closes the
-    PR within minutes, so an open-only sweep loses exactly the PRs that sailed
-    through — and a merged PR is the one you most want to trace back later. An
-    entry is marked done once stamped, so a steady-state sweep costs no API calls
-    and the timer can run often."""
+
+def _prov_good(prov: dict, cfg: dict) -> bool:
+    """A stamp worth freezing: a real (named, non-placeholder) tab AND a known
+    agent. Anything less is degraded and stays eligible for healing."""
+    tab = (prov.get("tab") or "").strip()
+    agent = (prov.get("agent") or "").strip()
+    return bool(tab) and not _is_ref_tab(tab, cfg) and agent not in ("", "unknown")
+
+
+def _prov_better(best: dict, cur: dict, cfg: dict) -> bool:
+    """`best` is worth re-stamping over `cur` only when it supplies something cur
+    lacks — a named tab where cur has none/a ref, or a known agent where cur has
+    `unknown`. Never fires for a mere rename (named -> different name), so a good
+    stamp is frozen, not chased."""
+    def tab_real(pr): 
+        t = (pr.get("tab") or "").strip()
+        return bool(t) and not _is_ref_tab(t, cfg)
+    def agent_real(pr): return (pr.get("agent") or "") not in ("", "unknown")
+    return (tab_real(best) and not tab_real(cur)) or (agent_real(best) and not agent_real(cur))
+
+
+_SURF_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _best_provenance(rec: dict, cfg: dict, body: str = "") -> tuple[dict, str]:
+    """The best provenance available NOW for a ledgered branch: the captured
+    ledger fields, but with the tab re-read LIVE from cmux when the ledger's tab
+    is missing or a bare ref (the title has usually settled to its real name by
+    the time the timer runs). Prefers the ledger's captured name when it has one,
+    so a later rename isn't chased. Returns (provenance, surface_id).
+
+    The surface id is taken from the ledger, falling back to the PR's own footer
+    (its jump line) — a PR first-stamped in a degraded context still carries the
+    surface UUID there even when the ledger entry never got it."""
+    p = {f: rec.get("p", {}).get(f, "") for f in FIELDS}
+    p["_redacted"] = []
+    m = (_SURF_UUID.search(p.get("jump", "") or p.get("relaunch", ""))
+         or _SURF_UUID.search(body or ""))
+    surf = m.group(0) if m else ""
+    if surf and (not p.get("tab") or _is_ref_tab(p.get("tab", ""), cfg)):
+        tab, ref = cmux_tab_title(surf)
+        if tab:
+            p["tab"] = f"{tab} ({ref})" if ref else tab
+        elif not p.get("tab"):
+            p["tab"] = _surface_ref(surf)
+    redact(p, cfg, surf)
+    return p, surf
+
+
+def sweep(cfg: dict) -> int:
+    """Stamp — and HEAL — every ledgered branch's PR. Prunes entries >14 days old.
+
+    Two jobs in one pass:
+    - unstamped PR  -> stamp it from the best provenance available now.
+    - stamped-but-degraded PR (blank/ref tab, or `unknown` agent) -> re-stamp when
+      the tab has since settled to a real name (re-read live) or the ledger holds
+      better data. A GOOD stamp is frozen — a rename is never chased.
+
+    `--state all` so a merged-on-green PR is covered, not just open ones. An entry
+    is marked done once its PR is good (or unrecoverable — the tab's surface is
+    gone), so a healed queue costs one `pr list` per branch and no re-stamps."""
     led = _load_ledger()
     if not led:
         return 0
@@ -990,13 +1086,27 @@ def sweep(cfg: dict) -> int:
         try: prs = json.loads(res.stdout or "[]")
         except Exception: prs = []
         for pr in prs:
-            if is_stamped(pr.get("body", "")):
+            num, body = str(pr["number"]), pr.get("body", "")
+            best, surf = _best_provenance(rec, cfg, body)
+            best_labels = [x for x, _ in labels_for(best, cfg)]
+            if not is_stamped(body):
+                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug)
+                n += 1
+                rec["done"] = _prov_good(best, cfg)
+                continue
+            if prior_labels(body) == best_labels:      # already matches best — nothing to gain
+                rec["done"] = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
+                continue
+            cur = prior_prov(body)
+            if _prov_good(cur, cfg):                   # good stamp — freeze, don't chase renames
                 rec["done"] = True
                 continue
-            p = {f: rec["p"].get(f, "") for f in FIELDS}
-            apply_stamp(str(pr["number"]), p, cfg, post_labels, post_footer, repo=slug)
-            rec["done"] = True
-            n += 1
+            if _prov_better(best, cur, cfg):           # degraded, and best is an upgrade — heal it
+                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug)
+                n += 1
+                rec["done"] = _prov_good(best, cfg)
+            else:                                      # can't improve yet; retry only while the tab lives
+                rec["done"] = not (surf and _surface_ref(surf))
     LEDGER.write_text(json.dumps(keep))
     return n
 

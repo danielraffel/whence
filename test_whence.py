@@ -134,19 +134,57 @@ def main() -> int:
         else:
             print(f"ok    denied: {name}")
 
-    # redact() must leave NO forbidden token in tab/workspace, and the labels and
-    # footer built from that dict must be clean too.
-    pr = {"tab": "Port the Acme reverb", "workspace": "widgetworks-quirks",
+    # redact() scrubs the denied TERM but keeps the readable rest of the name.
+    pr = {"tab": "Improve Acme import", "workspace": "widgetworks-quirks",
           "agent": "claude", "host": "m5"}
     hit = w.redact(pr, cfg, surface_id="")
     blob = (pr["tab"] + " " + pr["workspace"]).lower()
     leaked = [t for t in cfg["denylist"] if t in blob]
     label_leaks = [n for n, _ in w.labels_for(pr, cfg) if w.denied(n, cfg)]
-    if leaked or label_leaks or set(hit) != {"tab", "workspace"}:
+    kept_word = "improve" in pr["tab"].lower() and "import" in pr["tab"].lower()
+    if leaked or label_leaks or set(hit) != {"tab", "workspace"} or not kept_word:
         failed += 1
-        print(f"FAIL  redact: leaked={leaked} label_leaks={label_leaks} hit={hit}")
+        print(f"FAIL  redact: tab={pr['tab']!r} leaked={leaked} label_leaks={label_leaks} hit={hit}")
     else:
-        print("ok    redact: tab+workspace scrubbed, labels clean")
+        print(f"ok    redact: denied term cut, name kept -> tab={pr['tab']!r}")
+
+    # scrub_denied specifics: keep the surrounding words, tidy the gap.
+    for src, want in [("Improve JUCE import", "Improve import"),
+                      ("JUCE", ""), ("steinberg VST3 quirk", "VST3 quirk")]:
+        # use the real fleet-style terms for this sub-check
+        c2 = {"denylist": ["juce", "steinberg"], "redact_placeholder": "(redacted)"}
+        got = w.scrub_denied(src, c2)
+        if got != want:
+            failed += 1
+            print(f"FAIL  scrub_denied({src!r}) = {got!r} want {want!r}")
+        else:
+            print(f"ok    scrub_denied({src!r}) -> {got!r}")
+
+    # self-heal helpers: a ref/blank/unknown stamp is degraded; a named one is good.
+    healcfg = {"redact_placeholder": "(redacted)"}
+    checks = [
+        ("named+agent is good", {"tab": "Fix caret", "agent": "claude"}, True),
+        ("blank tab is degraded", {"tab": "", "agent": "claude"}, False),
+        ("ref tab is degraded", {"tab": "surface:26", "agent": "claude"}, False),
+        ("unknown agent is degraded", {"tab": "Fix caret", "agent": "unknown"}, False),
+    ]
+    for name, prov, good in checks:
+        if w._prov_good(prov, healcfg) != good:
+            failed += 1
+            print(f"FAIL  _prov_good: {name}")
+        else:
+            print(f"ok    _prov_good: {name}")
+
+    # _prov_better upgrades a degraded stamp but never chases a rename.
+    better = w._prov_better({"tab": "Real name", "agent": "codex"},
+                            {"tab": "surface:26", "agent": "unknown"}, healcfg)
+    rename = w._prov_better({"tab": "New name", "agent": "claude"},
+                            {"tab": "Old name", "agent": "claude"}, healcfg)
+    if not better or rename:
+        failed += 1
+        print(f"FAIL  _prov_better: upgrade={better} (want True)  rename={rename} (want False)")
+    else:
+        print("ok    _prov_better: heals degraded, ignores renames")
 
     # A workspace cmux auto-titled is just some tab's name wearing a workspace
     # label — the bug that put two tab-looking labels on one PR. No id, no label.
