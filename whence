@@ -123,6 +123,10 @@ DEFAULT_CONFIG = {
     # (who/source/when + before -> after). Off by default; a debug switch you flip
     # on to validate behavior, then off. `whence --log` reads it back.
     "audit_log": False,
+    # Prefix labels with 1·/2·/3·/4· so the PR-list view (which sorts chips
+    # alphabetically) renders them agent -> host -> workspace -> tab. The footer
+    # table already shows this order and stays clean; only the chips get the prefix.
+    "order_labels": False,
 }
 
 
@@ -140,7 +144,8 @@ def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
            "footer": True, "labels": True, "gh": "", "label_maxlen": 24,
-           "denylist": [], "redact_placeholder": "(redacted)", "audit_log": False}
+           "denylist": [], "redact_placeholder": "(redacted)", "audit_log": False,
+           "order_labels": False}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -167,6 +172,7 @@ def load_config(cli_hide: str) -> dict:
             "denylist", [str(x).lower() for x in v if str(x).strip()]))
         field("redact_placeholder", lambda v: cfg.__setitem__("redact_placeholder", str(v)))
         field("audit_log", lambda v: cfg.__setitem__("audit_log", bool(v)))
+        field("order_labels", lambda v: cfg.__setitem__("order_labels", bool(v)))
         # "fields": {"host": false, ...} — the easy per-field on/off switch.
         field("fields", lambda v: [cfg["hide"].add(n) for n, on in v.items() if not on])
     for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
@@ -413,10 +419,18 @@ def _clip(s: str, n: int) -> str:
 
 
 def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
+    # GitHub's PR-LIST view sorts label chips ALPHABETICALLY by name (verified in a
+    # browser — it ignores add-order AND creation-id there). So the only way to force
+    # agent -> host -> workspace -> tab in the queue is a numeric sort-prefix on the
+    # name. Opt-in via `order_labels`; the raw value still shows clean in the footer.
     out = []
-    for f in LABEL_FIELDS:
+    order = cfg.get("order_labels")
+    for i, f in enumerate(LABEL_FIELDS):
         if visible(f, p, cfg["hide"]):
-            out.append((_clip(p[f], cfg.get("label_maxlen", 24)), cfg["colors"].get(f, "ededed")))
+            name = _clip(p[f], cfg.get("label_maxlen", 24))
+            if order:
+                name = f"{i + 1}\u00b7{name}"          # 1·  2·  3·  4·
+            out.append((name, cfg["colors"].get(f, "ededed")))
     return out
 
 

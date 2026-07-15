@@ -405,7 +405,14 @@ repo labels are untouched) in role order — agents first (lowest ids), tabs las
 then re-applies them to the open PRs. Deleting a label also removes it from *closed*
 PRs; the provenance footer is never touched. New tab labels created afterward get
 the newest ids and naturally sort last, so you only re-run this if a new
-agent/host/workspace value appears. (The **footer** table always renders in this
+agent/host/workspace value appears. **Simpler + reliable: `order_labels`.** The PR-*list* (queue) view sorts chips
+*alphabetically by name* (browser-verified — it ignores both add-order and
+creation-id there). Set `"order_labels": true` in config and whence prefixes each
+chip `1·`/`2·`/`3·`/`4·` so the alphabetical sort renders agent → host → workspace
+→ tab on every PR. Only the chip gets the prefix; the footer table stays clean.
+This is the robust fix for the queue; `--reorder-labels` only affects the REST/detail order.
+
+(The **footer** table always renders in this
 order regardless — that part is ours to control.)
 
 ## Debugging — an audit log of every label change

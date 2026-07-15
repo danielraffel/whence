@@ -217,6 +217,15 @@ def main() -> int:
         failed+=1; print("FAIL  footer table/copy/directory not rendered")
     else: print("ok    footer: table + fenced copy blocks + directory")
 
+    # order_labels: prefixes force the queue's ALPHABETICAL sort into role order.
+    lp={f:"" for f in w.FIELDS}; lp.update({"agent":"claude","host":"m5","workspace":"w1","tab":"Fix caret"})
+    lbase={"hide":set(),"colors":w.DEFAULT_COLORS,"label_maxlen":24}
+    on=[n for n,_ in w.labels_for(lp,{**lbase,"order_labels":True})]
+    off=[n for n,_ in w.labels_for(lp,{**lbase,"order_labels":False})]
+    if off!=["claude","m5","w1","Fix caret"] or on!=["1\u00b7claude","2\u00b7m5","3\u00b7w1","4\u00b7Fix caret"] or sorted(on)!=on:
+        failed+=1; print(f"FAIL  order_labels: off={off} on={on} sorted={sorted(on)}")
+    else: print("ok    order_labels: prefixed names sort into agent/host/workspace/tab")
+
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0
 
