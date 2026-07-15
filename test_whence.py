@@ -114,17 +114,17 @@ def main() -> int:
     # Denylist redaction: a cmux tab/workspace title with a forbidden name must
     # never reach a label OR the public footer. cmux gives us no way to rename a
     # tab, so redaction at publish time is the only enforcement.
-    cfg = {"denylist": ["juce", "iplug", "steinberg", "projucer", "wdl"],
+    cfg = {"denylist": ["acme", "widgetworks", "codename-zephyr"],
            "redact_placeholder": "(redacted)", "hide": set(),
            "colors": w.DEFAULT_COLORS, "label_maxlen": 24}
     deny_cases = [
         ("clean title is not denied", "Investigate denormal ODR", False),
         ("VST3 is allowed (not on the list)", "VST3 bus arrangement", False),
-        ("JUCE anywhere in the title", "Port the JUCE reverb", True),
-        ("case-insensitive", "juce param mapping", True),
-        ("substring: Projucer contains juce", "regen Projucer project", True),
-        ("Steinberg", "Steinberg VST3 quirk", True),
-        ("iPlug2", "iPlug2 graphics port", True),
+        ("denied term anywhere in the title", "Port the Acme reverb", True),
+        ("case-insensitive", "acme param mapping", True),
+        ("substring: a longer word that contains a denied term", "regen Acmelab project", True),
+        ("multi-word denied term", "WidgetWorks VST3 quirk", True),
+        ("codename", "codename-Zephyr graphics port", True),
     ]
     for name, title, want_denied in deny_cases:
         got = bool(w.denied(title, cfg))
@@ -136,7 +136,7 @@ def main() -> int:
 
     # redact() must leave NO forbidden token in tab/workspace, and the labels and
     # footer built from that dict must be clean too.
-    pr = {"tab": "Port the JUCE reverb", "workspace": "steinberg-quirks",
+    pr = {"tab": "Port the Acme reverb", "workspace": "widgetworks-quirks",
           "agent": "claude", "host": "m5"}
     hit = w.redact(pr, cfg, surface_id="")
     blob = (pr["tab"] + " " + pr["workspace"]).lower()

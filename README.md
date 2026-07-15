@@ -26,7 +26,7 @@ follow-up you have no idea which of your twelve open sessions to go ask.
 ### Keeping names you can\'t publish off a public PR
 
 cmux derives a tab\'s title from the agent\'s prompt, so a title like *"port the
-JUCE reverb"* would otherwise land verbatim as a label — and in the footer — on a
+AcmeSynth reverb"* would otherwise land verbatim as a label — and in the footer — on a
 public PR. Two facts make this need handling in whence: cmux offers **no way to
 rename a tab** (there is a `workspace.rename` RPC but no surface equivalent), and a
 label, once created, lingers in the repo\'s label picker even after it\'s pulled
@@ -35,7 +35,7 @@ off a PR.
 Set a **denylist** in the config — case-insensitive substrings:
 
 ```json
-"denylist": ["juce", "iplug", "steinberg", "projucer", "wdl"],
+"denylist": ["acmesynth", "widgetworks", "unreleased-codename"],
 "redact_placeholder": "(redacted)"
 ```
 
@@ -283,6 +283,34 @@ repo is the source of truth; two mechanisms keep every machine current:
 The host list is **personal** — it lives only in `~/.config/whence/hosts`, never
 in the repo, because your fleet is yours. Most whence users run one machine and
 never touch any of this; it's here for the multi-machine case.
+
+#### Syncing your *config* across machines (denylist, colors, toggles)
+
+The code syncs via the repo above, but `~/.config/whence/config.json` is
+per-machine — so a denylist term you add on one machine wouldn't reach the others.
+Point whence at a **private** git repo to fix that (keep it private: your denylist
+names the very things you don't want public):
+
+```bash
+whence --init-config-repo git@github.com:you/whence-config.git
+```
+
+That clones the repo to `~/.config/whence/config-repo` and seeds it from this
+machine. From then on:
+
+- **Outbound** — `whence --push-config` writes your config to the repo and pushes.
+  `whence --install-config-watch` arms a launchd watcher so an *edit auto-pushes
+  the moment you save* — nothing to remember.
+- **Inbound** — every machine pulls the repo on its **sweep tick** (the 10-minute
+  timer it already runs). This is the offline catch-up: a machine that was asleep
+  when you edited converges within ten minutes of waking. Force it now with
+  `whence --pull-config`.
+
+Only the **shareable** fields travel — the machine-local `gh` (which GitHub CLI
+this box uses) is never overwritten, and identity lives in the separate
+`host-label` file. It's loop-safe: a push commits only when the config actually
+changed, and a pull writes only when it differs, so an edit propagates once and
+settles. The repo doubles as a versioned **backup** of your config.
 
 ## Configure anything — one file, every knob
 
