@@ -194,6 +194,29 @@ def main() -> int:
     else:
         print("ok    cmux_workspace('') is empty")
 
+    # sanitize_path: strip the private home prefix, keep the folder; scrub denied.
+    import os as _os
+    home=_os.path.expanduser("~")
+    pcases=[(home+"/Code/pulp","~/Code/pulp"),(home,"~"),("/tmp/x","/tmp/x")]
+    for src,want in pcases:
+        got=w.sanitize_path(src,{"denylist":[]})
+        if got!=want:
+            failed+=1; print(f"FAIL  sanitize_path({src!r})={got!r} want {want!r}")
+        else: print(f"ok    sanitize_path -> {got!r}")
+    if w.sanitize_path(home+"/Code/pulp-acme-port",{"denylist":["acme"]}).count("acme"):
+        failed+=1; print("FAIL  sanitize_path did not scrub denied term")
+    else: print("ok    sanitize_path scrubs denied term")
+
+    # footer: commands are fenced code blocks (GitHub copy button); table present.
+    fcfg={"hide":set(),"colors":w.DEFAULT_COLORS,"label_maxlen":24,"denylist":[],"redact_placeholder":"(redacted)"}
+    fp={f:"" for f in w.FIELDS}
+    fp.update({"agent":"claude","host":"m5","tab":"Fix caret","path":"~/Code/pulp",
+               "resume":"claude --resume abc","jump":"cmux surface focus X","stamped":"t"})
+    ft=w.footer(fp,fcfg,["claude","m5"])
+    if "| **Agent** |" not in ft or "```\nclaude --resume abc\n```" not in ft or "**Directory**" not in ft:
+        failed+=1; print("FAIL  footer table/copy/directory not rendered")
+    else: print("ok    footer: table + fenced copy blocks + directory")
+
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0
 
