@@ -119,6 +119,10 @@ DEFAULT_CONFIG = {
     # API), so redaction at publish time is the only enforcement.
     "denylist": [],
     "redact_placeholder": "(redacted)",
+    # Append a JSONL line to ~/.config/whence/audit.jsonl on every label CHANGE
+    # (who/source/when + before -> after). Off by default; a debug switch you flip
+    # on to validate behavior, then off. `whence --log` reads it back.
+    "audit_log": False,
 }
 
 
@@ -136,7 +140,7 @@ def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
            "footer": True, "labels": True, "gh": "", "label_maxlen": 24,
-           "denylist": [], "redact_placeholder": "(redacted)"}
+           "denylist": [], "redact_placeholder": "(redacted)", "audit_log": False}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -162,6 +166,7 @@ def load_config(cli_hide: str) -> dict:
         field("denylist", lambda v: cfg.__setitem__(
             "denylist", [str(x).lower() for x in v if str(x).strip()]))
         field("redact_placeholder", lambda v: cfg.__setitem__("redact_placeholder", str(v)))
+        field("audit_log", lambda v: cfg.__setitem__("audit_log", bool(v)))
         # "fields": {"host": false, ...} — the easy per-field on/off switch.
         field("fields", lambda v: [cfg["hide"].add(n) for n, on in v.items() if not on])
     for src in (os.environ.get("WHENCE_HIDE", ""), cli_hide or ""):
@@ -871,8 +876,26 @@ def is_stamped(body: str) -> bool:
     return bool(MARK_RE.search(body or ""))
 
 
+AUDIT_LOG = CFG_DIR / "audit.jsonl"
+
+
+def _audit(cfg: dict, record: dict) -> None:
+    """Append one line to the audit log if `audit_log` is on. Off by default; the
+    flag lives in the synced config, so flipping it on/off reaches the whole fleet.
+    Records who/what/when + before -> after so a wrong label is traceable to the
+    exact write that made it. Never raises — observability must not break a stamp."""
+    if not cfg.get("audit_log"):
+        return
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG.open("a") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
 def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool,
-                repo: str = "") -> list:
+                repo: str = "", source: str = "manual") -> list:
     """Write the labels + footer for provenance `p` onto PR #pr. Idempotent:
     replaces whence's own prior labels/footer, never stacks. Shared by the live
     hook path and the ledger sweep so both stamp identically.
@@ -886,6 +909,7 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     names = [n for n, _ in labels]
     ft = footer(p, cfg, names) if post_footer else ""
     body = sh(GH, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
+    before = {"labels": prior_labels(body), "prov": prior_prov(body)}
     keep = set(names)
     existing = sh(GH, "pr", "view", pr, *R, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
     stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
@@ -905,6 +929,13 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
         finally:
             try: os.unlink(tmpname)
             except OSError: pass
+    after = {"labels": names, "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", "")}}
+    if before != after:                       # only log a real change, not a no-op re-stamp
+        _audit(cfg, {"ts": datetime.datetime.now(datetime.timezone.utc)
+                            .strftime("%Y-%m-%d %H:%M:%S UTC"),
+                     "pr": pr, "repo": repo, "source": source,
+                     "by": f"{p.get('agent','?')}@{p.get('host','?')}",
+                     "before": before, "after": after})
     return names
 
 
@@ -1090,7 +1121,7 @@ def sweep(cfg: dict) -> int:
             best, surf = _best_provenance(rec, cfg, body)
             best_labels = [x for x, _ in labels_for(best, cfg)]
             if not is_stamped(body):
-                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug)
+                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug, source="sweep:new")
                 n += 1
                 rec["done"] = _prov_good(best, cfg)
                 continue
@@ -1102,13 +1133,49 @@ def sweep(cfg: dict) -> int:
                 rec["done"] = True
                 continue
             if _prov_better(best, cur, cfg):           # degraded, and best is an upgrade — heal it
-                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug)
+                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug, source="sweep:heal")
                 n += 1
                 rec["done"] = _prov_good(best, cfg)
             else:                                      # can't improve yet; retry only while the tab lives
                 rec["done"] = not (surf and _surface_ref(surf))
     LEDGER.write_text(json.dumps(keep))
     return n
+
+
+def show_log(n: int) -> int:
+    """Pretty-print the last n audit entries: when, which PR, what triggered it,
+    who, and the label transition. Reads ~/.config/whence/audit.jsonl."""
+    if not AUDIT_LOG.exists():
+        print(f"whence: no audit log yet ({AUDIT_LOG}).\n"
+              f"  turn it on with `whence --audit on` (syncs to the fleet), then wait for a stamp.")
+        return 0
+    lines = AUDIT_LOG.read_text().splitlines()[-n:]
+    if not lines:
+        print("whence: audit log is empty"); return 0
+    for ln in lines:
+        try: r = json.loads(ln)
+        except Exception: continue
+        b = ", ".join(r.get("before", {}).get("labels", [])) or "—"
+        a = ", ".join(r.get("after", {}).get("labels", [])) or "—"
+        print(f"  {r.get('ts','?')}  #{r.get('pr','?')} {r.get('repo','')}"
+              f"  [{r.get('source','?')}]  {r.get('by','?')}")
+        print(f"      [{b}]  ->  [{a}]")
+    print(f"\n  ({len(lines)} shown · {AUDIT_LOG})")
+    return 0
+
+
+def set_audit(on: bool) -> int:
+    """Flip the audit_log flag in config.json. Because config syncs via the private
+    repo, this reaches every machine — turn it on to validate, off when done."""
+    f = CFG_DIR / "config.json"
+    try: d = json.loads(f.read_text()) if f.exists() else {}
+    except Exception: d = {}
+    d["audit_log"] = on
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps(d, indent=2) + "\n")
+    print(f"whence: audit_log {'ON' if on else 'OFF'} (config.json)"
+          + ("  — the config watcher will sync it to the fleet" if _backup_ready() else ""))
+    return 0
 
 
 def gc_labels(cfg: dict, repo: str) -> int:
@@ -1318,6 +1385,10 @@ def main() -> int:
                     help="remove the config-push watcher")
     ap.add_argument("--gc-labels", metavar="OWNER/REPO",
                     help="delete repo-level labels that trip the denylist")
+    ap.add_argument("--log", nargs="?", type=int, const=20, metavar="N",
+                    help="show the last N audit entries (label changes; default 20)")
+    ap.add_argument("--audit", choices=("on", "off"),
+                    help="turn the audit log on/off (syncs to the fleet via config)")
     ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
     ap.add_argument("--show", action="store_true", help="print the effective config and where it lives")
     ap.add_argument("--setup", action="store_true",
@@ -1378,6 +1449,10 @@ def main() -> int:
         return uninstall_hook()
     if args.init:
         write_default_config(args.force); return 0
+    if args.log is not None:
+        return show_log(args.log)
+    if args.audit:
+        return set_audit(args.audit == "on")
     if args.gc_labels:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -1503,7 +1578,8 @@ def main() -> int:
             return 0
         print("whence: could not resolve a PR", file=sys.stderr); return 2
 
-    names = apply_stamp(pr, p, cfg, post_labels, post_footer, repo=repo)
+    names = apply_stamp(pr, p, cfg, post_labels, post_footer, repo=repo,
+                        source=("hook" if args.hook else "manual"))
     print(f"\n✓ PR #{pr}: " + (", ".join(names) if names else "labels off")
           + (" + footer" if post_footer else " · footer off"))
     return 0
