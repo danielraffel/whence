@@ -387,6 +387,34 @@ in `host-label`.
 **No cmux?** You still get the `agent` + `machine` labels and whatever session
 handle the agent exposes; cmux just adds the tab name and the universal resume.
 
+## Debugging — an audit log of every label change
+
+whence stamps silently, so if a label ever looks wrong there's normally nothing to
+inspect but the current footer (which shows the *end* state, never the change that
+produced it). Turn on a lightweight, default-off audit log to capture the
+transitions:
+
+```bash
+whence --audit on     # flip audit_log in config (syncs to the fleet); off by default
+whence --log          # show the last 20 changes
+whence --log 100      # ...or the last N
+whence --audit off    # when you're done validating
+```
+
+Every real label **change** appends one JSONL line to `~/.config/whence/audit.jsonl`
+with the timestamp, the PR, the **source** (`hook` = live stamp, `sweep:new`,
+`sweep:heal` = self-heal, `manual`), the `agent@host` that made it, and the
+**before → after** labels. A no-op re-stamp writes nothing. `whence --log` renders it:
+
+```
+2026-07-15 16:37:37 UTC  #6142 danielraffel/pulp  [hook]  codex@m5
+    [unknown, m5, w1, plugin hosting]  ->  [codex, m5, w1, plugin hosting]
+```
+
+It's a debug switch — flip it on to validate behavior for a while, then off. The log
+is per-machine (each machine records its own writes), and because the `audit_log`
+flag lives in the synced config, turning it on or off reaches the whole fleet.
+
 ## What it doesn't do
 
 There's no clickable `cmux://` deep-link — cmux only registers its URL scheme
