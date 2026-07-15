@@ -28,7 +28,7 @@ CFG_DIR = pathlib.Path.home() / ".config/whence"
 # Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
 # `workspace` = cmux workspace name; `tab` = the per-tab (surface) title you
 # navigate by — the one you need most to find your way back.
-FIELDS = ["agent", "host", "workspace", "tab", "session", "resume", "url", "jump", "relaunch", "stamped"]
+FIELDS = ["agent", "host", "workspace", "tab", "path", "session", "resume", "url", "jump", "relaunch", "stamped"]
 LABEL_FIELDS = ["agent", "host", "workspace", "tab"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df"}
 
@@ -317,7 +317,25 @@ def redact(p: dict, cfg: dict, surface_id: str = "") -> list[str]:
             else:
                 p[f] = (_surface_ref(surface_id) or placeholder) if f == "tab" else placeholder
             hit.append(f)
+    if denied(p.get("path", ""), cfg):          # a worktree named after a denied term
+        p["path"] = scrub_denied(p["path"], cfg) or "~"
+        hit.append("path")
     return hit
+
+
+def sanitize_path(path: str, cfg: dict) -> str:
+    """The working directory, safe to publish: the private home prefix collapses
+    to `~` (so no username leaks) and any denied term is scrubbed out — but the
+    folder itself is kept, because that's what you need to find the worktree again.
+    `/Users/me/Code/pulp-x` -> `~/Code/pulp-x`."""
+    pth = path or ""
+    home = os.path.expanduser("~")
+    if home and (pth == home or pth.startswith(home + "/")):
+        pth = "~" + pth[len(home):]
+    if denied(pth, cfg):
+        scrubbed = scrub_denied(pth, cfg)
+        pth = scrubbed if scrubbed else "~"
+    return pth
 
 
 def collect(cfg: dict | None = None) -> dict:
@@ -340,6 +358,7 @@ def collect(cfg: dict | None = None) -> dict:
         # label, and the sweep upgrades it to the real name once the title settles.
         p["tab"] = _surface_ref(surface)
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
 
     restore = ""
     if surface:
@@ -409,31 +428,30 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     tag = json.dumps({"labels": label_names,
                       "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", "")}},
                      ensure_ascii=False)
-    line1 = "  ·  ".join(
-        f"**{lbl}** {fmt}" for f, lbl, fmt in [
-            ("agent", "Agent", f"`{p['agent']}`"),
-            ("host", "Machine", f"`{p['host']}`"),
-        ] if visible(f, p, hide))
-    # navigation line: workspace then tab — the tab title is the "find my way back" key
-    nav = "  ·  ".join(
-        f"**{lbl}** {fmt}" for f, lbl, fmt in [
-            ("workspace", "Workspace", f"`{p['workspace']}`"),
-            ("tab", "Tab", f"`{p['tab']}`"),
-        ] if visible(f, p, hide))
-    rows = [r for r in (line1, nav) if r]
-    for f, lbl, val in [
-        ("session", "Session", f"`{p['session']}`"),
-        ("resume", "Resume", f"`{p['resume']}`"),
-        ("url", "Restore URL", p["url"]),
-        ("jump", "Jump to this tab", f"`{p['jump']}`"),
-        ("relaunch", "Relaunch (any agent)", f"`{p['relaunch']}`"),
-    ]:
+    def cell(v):                              # keep a value from breaking the table
+        return (v or "").replace("|", "\\|").replace("\n", " ")
+    # identity, as a two-column table in agent -> host -> workspace -> tab order
+    # (the one place we CAN control order; GitHub sorts the label chips itself).
+    trows = []
+    for f, lbl, code in [("agent", "Agent", True), ("host", "Machine", True),
+                         ("workspace", "Workspace", True), ("tab", "Tab", False),
+                         ("path", "Directory", True), ("session", "Session", True)]:
         if visible(f, p, hide):
-            rows.append(f"**{lbl}** {val}")
-    if visible("stamped", p, hide):
-        rows.append(f"<sub>stamped {p['stamped']}</sub>")
-    body = "  \n".join(r for r in rows if r)
-    return f"<!-- whence {tag} -->\n\n---\n### 🔎 Provenance\n{body}\n<!-- /whence -->"
+            val = f"`{cell(p[f])}`" if code else cell(p[f])
+            trows.append(f"| **{lbl}** | {val} |")
+    table = ("|  |  |\n|:--|:--|\n" + "\n".join(trows)) if trows else ""
+    # the commands you actually copy: fenced blocks so GitHub renders a copy button
+    # on each (inline code has none). One tap instead of a fiddly text selection.
+    blocks = []
+    for f, lbl in [("resume", "Resume"), ("jump", "Jump to this tab"),
+                   ("relaunch", "Relaunch (any agent)")]:
+        if visible(f, p, hide):
+            blocks.append(f"**{lbl}**\n```\n{p[f]}\n```")
+    if visible("url", p, hide):
+        blocks.append(f"**Restore URL** — {p['url']}")
+    tail = f"\n\n<sub>stamped {p['stamped']}</sub>" if visible("stamped", p, hide) else ""
+    body = "\n\n".join(x for x in (table, "\n".join(blocks)) if x) + tail
+    return f"<!-- whence {tag} -->\n\n---\n### 🔎 Provenance\n\n{body}\n<!-- /whence -->"
 
 
 def resolve_pr(args) -> str:
@@ -1475,7 +1493,7 @@ def main() -> int:
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
-    hook_agent = hook_sid = hook_cmd = ""
+    hook_agent = hook_sid = hook_cmd = hook_cwd = ""
     hook_slug = hook_br = hook_pr = ""
     hook_is_pr = hook_is_push = False
     if args.hook:
@@ -1495,6 +1513,7 @@ def main() -> int:
             hook_agent = ("codex" if "/.codex" in tp else
                           "claude" if "/.claude" in tp else "")
             hook_slug, hook_br, hook_pr = parse_outcome(d)
+            hook_cwd = d.get("cwd") or ""
         except Exception:
             hook_cmd = ""
         # The output outranks the command name: anything that printed a PR URL
@@ -1528,6 +1547,7 @@ def main() -> int:
 
     p = collect(cfg)
     if args.hook:
+        p["path"] = sanitize_path(_cmd_cwd(hook_cmd) or hook_cwd or os.getcwd(), cfg)
         # Prefer the hook payload's identity over env (which can leak across
         # sessions): the session id is authoritative; use the transcript's agent
         # only when env couldn't name one. Keep resume consistent with both.
