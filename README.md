@@ -387,6 +387,27 @@ in `host-label`.
 **No cmux?** You still get the `agent` + `machine` labels and whatever session
 handle the agent exposes; cmux just adds the tab name and the universal resume.
 
+### Label order — agent, host, workspace, tab
+
+GitHub renders issue/PR label chips in **label-creation-id order**, globally —
+there's no per-PR way to reorder them (adding in a different order does nothing;
+only delete+recreate, which changes the id, moves a label). whence adds labels in
+agent→host→workspace→tab order, but GitHub overrides that.
+
+To force the chips into that order:
+
+```bash
+whence --reorder-labels owner/repo
+```
+
+It deletes and recreates each whence label (classified by its color, so unrelated
+repo labels are untouched) in role order — agents first (lowest ids), tabs last —
+then re-applies them to the open PRs. Deleting a label also removes it from *closed*
+PRs; the provenance footer is never touched. New tab labels created afterward get
+the newest ids and naturally sort last, so you only re-run this if a new
+agent/host/workspace value appears. (The **footer** table always renders in this
+order regardless — that part is ours to control.)
+
 ## Debugging — an audit log of every label change
 
 whence stamps silently, so if a label ever looks wrong there's normally nothing to

@@ -1196,6 +1196,52 @@ def set_audit(on: bool) -> int:
     return 0
 
 
+def reorder_labels(cfg: dict, repo: str) -> int:
+    """Force the label chips on OPEN PRs into agent -> host -> workspace -> tab order.
+
+    GitHub renders issue/PR labels in label-CREATION-id order, globally — there is
+    no per-PR order control (proven: re-adding in a different order does nothing;
+    delete+recreate moves a label to the end). So this deletes and recreates each
+    whence label in role order, giving ascending ids, then re-applies them to the
+    open PRs. Labels are classified by their whence COLOR, so it never touches
+    unrelated repo labels (bug/enhancement/…). Deleting a label also strips it from
+    CLOSED PRs — acceptable, since the chips there don't matter — the provenance
+    footer is untouched either way. New tab labels created later get the newest ids
+    and naturally sort last; re-run this only if a new agent/host/workspace appears."""
+    color2role = {cfg["colors"].get(r, ""): r for r in LABEL_FIELDS}
+    order = {r: i for i, r in enumerate(LABEL_FIELDS)}
+    res = sh(GH, "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+             "--json", "number,labels")
+    try: prs = json.loads(res.stdout or "[]")
+    except Exception: prs = []
+    buckets, per_pr = {}, {}                       # name -> (role, color) ; pr -> [names]
+    for pr in prs:
+        keep = []
+        for l in pr.get("labels", []):
+            role = color2role.get(l.get("color", ""))
+            if role is None:
+                continue                           # not whence-colored — leave it alone
+            buckets[l["name"]] = (role, l["color"])
+            keep.append(l["name"])
+        if keep:
+            per_pr[pr["number"]] = keep
+    if not buckets:
+        print(f"whence: no whence labels on open PRs in {repo} — nothing to reorder")
+        return 0
+    ordered = sorted(buckets.items(), key=lambda kv: (order[kv[1][0]], kv[0].lower()))
+    print(f"whence: reordering {len(ordered)} label(s) across {len(per_pr)} open PR(s):")
+    print("  " + "  ->  ".join(n for n, _ in ordered))
+    for name, _ in ordered:
+        sh(GH, "label", "delete", name, "--repo", repo, "--yes")
+    for name, (_, color) in ordered:              # recreate in role order == chip order
+        sh(GH, "label", "create", name, "--repo", repo, "--color", color, "--force")
+    for num, labels in per_pr.items():
+        sh(GH, "pr", "edit", str(num), "--repo", repo,
+           *sum([["--add-label", l] for l in labels], []))
+    print(f"whence: reapplied labels to {len(per_pr)} open PR(s)")
+    return 0
+
+
 def gc_labels(cfg: dict, repo: str) -> int:
     """Delete every repo-level label whose name trips the denylist.
 
@@ -1403,6 +1449,8 @@ def main() -> int:
                     help="remove the config-push watcher")
     ap.add_argument("--gc-labels", metavar="OWNER/REPO",
                     help="delete repo-level labels that trip the denylist")
+    ap.add_argument("--reorder-labels", metavar="OWNER/REPO",
+                    help="force open-PR label chips into agent/host/workspace/tab order")
     ap.add_argument("--log", nargs="?", type=int, const=20, metavar="N",
                     help="show the last N audit entries (label changes; default 20)")
     ap.add_argument("--audit", choices=("on", "off"),
@@ -1475,6 +1523,10 @@ def main() -> int:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         return gc_labels(cfg, args.gc_labels)
+    if args.reorder_labels:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        return reorder_labels(cfg, args.reorder_labels)
     if args.install_sweep:
         return install_sweep()
     if args.uninstall_sweep:
