@@ -312,6 +312,23 @@ this box uses) is never overwritten, and identity lives in the separate
 changed, and a pull writes only when it differs, so an edit propagates once and
 settles. The repo doubles as a versioned **backup** of your config.
 
+#### Set up a new machine (full recipe)
+
+`whence --setup` covers a **solo** machine. To join a fleet that shares one config
++ backup, it's four commands, in order:
+
+```bash
+git clone https://github.com/danielraffel/whence               # put `whence` on PATH
+whence --setup --host <name>                                   # config + PR hook + agent hooks + sweep timer
+whence --init-config-repo git@github.com:you/whence-config.git # clone the shared config, pull the denylist
+whence --install-config-watch                                  # auto-push config edits from this machine
+```
+
+The first two lines are all a standalone machine needs. The last two opt it into
+the shared, backed-up config: after them, this machine **pulls** fleet config on
+its sweep tick and **pushes** any edit you make here. Nothing else to wire — the
+`gh`/`ghapp` CLI, `python3`, and `cmux` are the only prerequisites.
+
 ## Configure anything — one file, every knob
 
 Everything is on by default; turn off whatever you want. Run **`whence --init`**
