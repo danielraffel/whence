@@ -114,7 +114,7 @@ DEFAULT_CONFIG = {
     # these (case-insensitive substring) is replaced before it can become a PR
     # label or appear in the footer. Seed it with whatever your repo can't carry:
     # vendor/framework names, code names, an unreleased product. cmux derives tab
-    # titles from the agent's prompt, so a title like "port the JUCE reverb" would
+    # titles from the agent's prompt, so a title like "port the AcmeSynth reverb" would
     # otherwise land verbatim on a public PR. We can't rename a cmux tab (no such
     # API), so redaction at publish time is the only enforcement.
     "denylist": [],
@@ -616,6 +616,59 @@ SWEEP_PLIST = pathlib.Path(os.path.expanduser(
 SWEEP_EVERY = 600
 
 
+CONFIG_WATCH_PLIST = pathlib.Path(os.path.expanduser(
+    "~/Library/LaunchAgents/com.whence.config-push.plist"))
+
+
+def install_config_watch(uninstall: bool = False) -> int:
+    """Push your config edit to the private repo the instant you save it — a launchd
+    WatchPaths agent on config.json runs `whence --push-config`. Other machines pull
+    it on their sweep tick. Loop-safe: push commits only when the shareable config
+    changed, so a pull-driven write that fires this agent finds nothing to commit
+    and stops. macOS only (elsewhere: run `whence --push-config` after editing)."""
+    label = "com.whence.config-push"
+    if sys.platform != "darwin":
+        print("whence: not macOS — run `whence --push-config` after editing config")
+        return 0
+    if uninstall:
+        sh("launchctl", "bootout", f"gui/{os.getuid()}/{label}")
+        if CONFIG_WATCH_PLIST.exists():
+            CONFIG_WATCH_PLIST.unlink()
+        print("whence: removed the config-push watcher")
+        return 0
+    if not _backup_ready():
+        print(f"whence: no config repo — run `whence --init-config-repo <git-url>` first",
+              file=sys.stderr)
+        return 1
+    whence_bin = os.path.realpath(sys.argv[0])
+    path = ":".join([os.path.expanduser("~/.local/bin"), "/opt/homebrew/bin",
+                     "/usr/local/bin", "/usr/bin", "/bin"])
+    CONFIG_WATCH_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_WATCH_PLIST.write_text(f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array><string>{sys.executable}</string><string>{whence_bin}</string><string>--push-config</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>{path}</string></dict>
+  <key>WatchPaths</key><array><string>{CONFIG_FILE}</string></array>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+""")
+    sh("launchctl", "bootout", f"gui/{os.getuid()}/{label}")
+    r = sh("launchctl", "bootstrap", f"gui/{os.getuid()}", str(CONFIG_WATCH_PLIST))
+    if r.returncode != 0:
+        print(f"whence: could not load the config-push watcher: {r.stderr.strip()}",
+              file=sys.stderr)
+        return 1
+    print(f"whence: config-push watcher armed ({CONFIG_WATCH_PLIST})")
+    print("  edits to config.json now push to the private repo automatically")
+    return 0
+
+
 def install_sweep(uninstall: bool = False) -> int:
     """Run the sweep on a timer instead of only when an agent happens to fire the
     hook again.
@@ -982,6 +1035,103 @@ def gc_labels(cfg: dict, repo: str) -> int:
 # host list lives only in ~/.config/whence/hosts, never in the repo, because it's
 # specific to your fleet — other whence users don't need it.
 HOSTS = CFG_DIR / "hosts"
+CONFIG_FILE = CFG_DIR / "config.json"
+BACKUP_DIR = CFG_DIR / "config-repo"          # a clone of your private config repo
+# `gh` (which GitHub CLI this box uses) is the one field allowed to differ per
+# machine, so a pull never overwrites it. Identity lives in the separate host-label
+# file, so the rest of config.json is fleet policy every machine should share.
+CONFIG_LOCAL_KEYS = {"gh"}
+
+
+def _read_json(path: pathlib.Path) -> dict:
+    try: return json.loads(path.read_text()) if path.exists() else {}
+    except Exception: return {}
+
+
+def _shareable(cfg: dict) -> dict:
+    return {k: v for k, v in cfg.items() if k not in CONFIG_LOCAL_KEYS}
+
+
+def _backup_ready() -> bool:
+    return (BACKUP_DIR / ".git").exists()
+
+
+def pull_config() -> bool:
+    """Inbound sync: fast-forward the config repo and merge fleet policy into this
+    machine's config.json, preserving its machine-local keys. Writes ONLY if the
+    result differs — so a no-op pull never churns the file (or trips the push
+    watcher). This is the offline catch-up: it runs on the sweep timer, so a
+    machine that was asleep when you edited converges on its next tick after waking.
+    Returns True if the local config changed."""
+    if not _backup_ready():
+        return False
+    _git(str(BACKUP_DIR), "pull", "--ff-only", "--quiet")
+    repo_cfg = _read_json(BACKUP_DIR / "config.json")
+    if not repo_cfg:
+        return False
+    cur = _read_json(CONFIG_FILE)
+    merged = dict(cur)
+    for k, v in _shareable(repo_cfg).items():
+        merged[k] = v
+    new = json.dumps(merged, indent=2) + "\n"
+    if new == (CONFIG_FILE.read_text() if CONFIG_FILE.exists() else ""):
+        return False
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(new)
+    return True
+
+
+def push_config() -> int:
+    """Outbound sync: write this machine's fleet policy into the config repo and
+    push. Commits only if the shareable config actually changed, so a pull-then-push
+    (or a re-run) is a clean no-op — that is what keeps the edit→push→pull loop from
+    ping-ponging. Every other machine picks it up on its next timer pull."""
+    if not _backup_ready():
+        print(f"whence: no config repo at {BACKUP_DIR} — run `whence --init-config-repo <git-url>`",
+              file=sys.stderr)
+        return 2
+    _git(str(BACKUP_DIR), "pull", "--ff-only", "--quiet")
+    share = _shareable(_read_json(CONFIG_FILE))
+    dest = BACKUP_DIR / "config.json"
+    new = json.dumps(share, indent=2) + "\n"
+    if new == (dest.read_text() if dest.exists() else ""):
+        print("config repo already up to date"); return 0
+    dest.write_text(new)
+    host = host_label()
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _git(str(BACKUP_DIR), "add", "config.json")
+    _git(str(BACKUP_DIR), "commit", "--quiet", "-m", f"config: sync from {host} ({stamp})")
+    r = _git(str(BACKUP_DIR), "push", "--quiet")
+    print("pushed config to the private repo" if r.returncode == 0
+          else f"config push FAILED: {r.stderr.strip()}")
+    return 0 if r.returncode == 0 else 1
+
+
+def init_config_repo(url: str) -> int:
+    """Clone your PRIVATE config repo into place so pull/push work. Seeds it from
+    this machine's current config if the repo is empty. The repo holds only the
+    shareable subset (never the machine-local `gh`)."""
+    if _backup_ready():
+        print(f"whence: config repo already present at {BACKUP_DIR}")
+        return 0
+    BACKUP_DIR.parent.mkdir(parents=True, exist_ok=True)
+    r = sh("git", "clone", "--quiet", url, str(BACKUP_DIR))
+    if r.returncode != 0:
+        print(f"whence: clone failed: {r.stderr.strip()}", file=sys.stderr); return 1
+    dest = BACKUP_DIR / "config.json"
+    if not dest.exists():                         # empty repo — seed it from this box
+        dest.write_text(json.dumps(_shareable(_read_json(CONFIG_FILE)), indent=2) + "\n")
+        _git(str(BACKUP_DIR), "add", "config.json")
+        _git(str(BACKUP_DIR), "commit", "--quiet", "-m", f"config: seed from {host_label()}")
+        _git(str(BACKUP_DIR), "push", "--quiet")
+        print("seeded the config repo from this machine")
+    else:
+        pull_config()
+        print("pulled fleet config from the repo")
+    print(f"whence: config repo ready at {BACKUP_DIR}")
+    return 0
+
+
 
 
 def _self_clone() -> pathlib.Path:
@@ -1046,6 +1196,16 @@ def main() -> int:
     ap.add_argument("--install-sweep", action="store_true",
                     help="run the ledger sweep on a timer (launchd, every 10m)")
     ap.add_argument("--uninstall-sweep", action="store_true", help="remove the sweep timer")
+    ap.add_argument("--init-config-repo", metavar="GIT_URL",
+                    help="clone your private config repo for fleet sync + backup")
+    ap.add_argument("--pull-config", action="store_true",
+                    help="merge fleet config from the private repo into this machine")
+    ap.add_argument("--push-config", action="store_true",
+                    help="push this machine's config to the private repo")
+    ap.add_argument("--install-config-watch", action="store_true",
+                    help="auto-push config edits to the private repo (launchd WatchPaths)")
+    ap.add_argument("--uninstall-config-watch", action="store_true",
+                    help="remove the config-push watcher")
     ap.add_argument("--gc-labels", metavar="OWNER/REPO",
                     help="delete repo-level labels that trip the denylist")
     ap.add_argument("--force", action="store_true", help="with --init, overwrite an existing config")
@@ -1089,6 +1249,13 @@ def main() -> int:
     if args.sweep:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        # Inbound config catch-up on the same 10-min tick every host already runs.
+        # A machine that was offline when you edited converges here after it wakes.
+        try:
+            if pull_config():
+                print("whence: pulled updated fleet config")
+        except Exception:
+            pass
         print(f"whence: swept {sweep(cfg)} PR(s)")
         return 0
     if args.setup:
@@ -1109,6 +1276,16 @@ def main() -> int:
         return install_sweep()
     if args.uninstall_sweep:
         return install_sweep(uninstall=True)
+    if args.init_config_repo:
+        return init_config_repo(args.init_config_repo)
+    if args.pull_config:
+        print("config updated" if pull_config() else "config already current"); return 0
+    if args.push_config:
+        return push_config()
+    if args.install_config_watch:
+        return install_config_watch()
+    if args.uninstall_config_watch:
+        return install_config_watch(uninstall=True)
 
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
