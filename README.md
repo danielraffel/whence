@@ -389,31 +389,32 @@ handle the agent exposes; cmux just adds the tab name and the universal resume.
 
 ### Label order — agent, host, workspace, tab
 
-GitHub renders issue/PR label chips in **label-creation-id order**, globally —
-there's no per-PR way to reorder them (adding in a different order does nothing;
-only delete+recreate, which changes the id, moves a label). whence adds labels in
-agent→host→workspace→tab order, but GitHub overrides that.
+whence adds labels in agent→host→workspace→tab order, but **GitHub decides how the
+chips display**, and — confirmed by reading the rendered DOM — it uses *two
+different* sort orders depending on where you look:
 
-To force the chips into that order:
+| Surface | GitHub sorts by | How to control it |
+|---|---|---|
+| PR **list / queue** (what you scan) | label **name**, alphabetically | `order_labels` (below) |
+| PR **detail** page / REST API | label **creation id** | `--reorder-labels` |
 
-```bash
-whence --reorder-labels owner/repo
-```
+Neither honors the order whence adds them in, so ordering takes a deliberate step.
 
-It deletes and recreates each whence label (classified by its color, so unrelated
-repo labels are untouched) in role order — agents first (lowest ids), tabs last —
-then re-applies them to the open PRs. Deleting a label also removes it from *closed*
-PRs; the provenance footer is never touched. New tab labels created afterward get
-the newest ids and naturally sort last, so you only re-run this if a new
-agent/host/workspace value appears. **Simpler + reliable: `order_labels`.** The PR-*list* (queue) view sorts chips
-*alphabetically by name* (browser-verified — it ignores both add-order and
-creation-id there). Set `"order_labels": true` in config and whence prefixes each
-chip `1·`/`2·`/`3·`/`4·` so the alphabetical sort renders agent → host → workspace
-→ tab on every PR. Only the chip gets the prefix; the footer table stays clean.
-This is the robust fix for the queue; `--reorder-labels` only affects the REST/detail order.
+**For the queue — `order_labels` (recommended).** Set `"order_labels": true` in
+config and whence prefixes each chip `1·`/`2·`/`3·`/`4·` by role, so the
+alphabetical sort renders agent → host → workspace → tab on every PR. Only the chip
+carries the prefix; the provenance footer shows the clean value. Off by default.
 
-(The **footer** table always renders in this
-order regardless — that part is ours to control.)
+**For the detail page / API — `whence --reorder-labels owner/repo`.** GitHub sorts
+those surfaces by label creation id, so this deletes and recreates each whence
+label (classified by its color, so unrelated repo labels are untouched) in role
+order — agents first (lowest ids), tabs last — then re-applies them to the open
+PRs. Deleting a label also removes it from *closed* PRs; the footer is never
+touched. New tab labels get the newest ids and sort last on their own, so re-run it
+only if a new agent/host/workspace value appears.
+
+The **footer table** always renders in agent/host/workspace/tab order regardless —
+that layout is ours to control, not GitHub's.
 
 ## Debugging — an audit log of every label change
 
