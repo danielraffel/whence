@@ -87,7 +87,10 @@ def cwd_cases(tmp):
         ("${BRACED} variable", f'WT={tmp}\ncd "${{WT}}" && shipyard pr', tmp),
         ("quoted path", f"cd '{tmp}' && shipyard pr", tmp),
         ("git -C, no cd at all", f"git -C {tmp} push origin HEAD", tmp),
-        ("the LAST cd wins", f"cd /tmp && echo hi\ncd {tmp} && shipyard pr", tmp),
+        ("the action's preceding cd wins", f"cd /tmp && echo hi\ncd {tmp} && shipyard pr", tmp),
+        ("a later diagnostic cd is ignored", f"cd {tmp} && shipyard pr; cd /tmp && git status", tmp),
+        ("a quoted diagnostic is skipped before the action",
+         f'cd /tmp && rg "shipyard pr" whence; cd {tmp} && shipyard pr; cd /tmp', tmp),
         ("env prefix before the tool", f"cd {tmp} && PULP_SKIP_DIFF_COVER=1 shipyard pr", tmp),
         ("no cd — caller falls back to its own cwd", "shipyard pr --help", None),
         ("a path that doesn't exist tells us nothing",
@@ -125,6 +128,30 @@ def main() -> int:
                 print(f"FAIL  _cmd_cwd: {name}\n      got={got!r}\n      want={want!r}")
             else:
                 print(f"ok    _cmd_cwd: {name}")
+
+        action_cases = [
+            ("shipyard", f"cd {tmp} && shipyard pr --base main; cd /tmp", (True, True, tmp)),
+            ("pulp", f"env PULP_X=1 pulp pr", (True, True, None)),
+            ("gh", "command gh pr create --fill", (True, False, None)),
+            ("git -C", f"git -C {tmp} push origin HEAD", (False, True, tmp)),
+            ("quoted search", 'rg "shipyard pr|git push" whence', (False, False, None)),
+            ("unquoted echo", "echo shipyard pr", (False, False, None)),
+            ("git diagnostic", "git log -S 'git push' -- whence", (False, False, None)),
+            ("quoted multiline", 'printf "shipyard pr\\ngit push\\n"', (False, False, None)),
+            ("heredoc diagnostic",
+             "python3 - <<'PY'\nprint('shipyard pr')\nprint('git push')\nPY\n",
+             (False, False, None)),
+            ("shell comment", "echo done # shipyard pr; git push\n", (False, False, None)),
+            ("orchestrator help", "shipyard pr --help", (False, False, None)),
+            ("PR dry-run", "gh pr create --dry-run", (False, False, None)),
+        ]
+        for name, cmd, want in action_cases:
+            got = w._command_action(cmd)
+            if got != want:
+                failed += 1
+                print(f"FAIL  command action: {name}: got={got!r} want={want!r}")
+            else:
+                print(f"ok    command action: {name}")
 
     # Denylist redaction: a cmux tab/workspace title with a forbidden name must
     # never reach a label OR the public footer. cmux gives us no way to rename a
@@ -339,6 +366,119 @@ def main() -> int:
         print(f"FAIL  detached retry process: spawned={spawned} args={popen_args} kwargs={popen_kwargs}")
     else:
         print("ok    detached retry process: worker receives the ledger key + privacy policy")
+
+    # Pre-exec capture happens before a long-running orchestrator starts. It
+    # records the exact current HEAD and forwards effective publication/privacy
+    # policy to the detached worker without waiting for GitHub.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-b", "fix/preexec", str(repo)], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Whence Test"], check=True)
+        (repo / "tracked").write_text("exact head\n")
+        subprocess.run(["git", "-C", str(repo), "add", "tracked"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "test"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "git@github.com:danielraffel/preexec-test.git"], check=True)
+        ledger_path = pathlib.Path(tmp) / "ledger.json"
+        pp = {f: "" for f in w.FIELDS}
+        pp.update({"agent": "codex", "host": "m5", "tab": "Long PR"})
+        pcfg = {"hide": {"session", "url"}, "labels": False, "footer": True,
+                "repos": {"mode": "all", "list": []}, "denylist": []}
+        with mock.patch.object(w, "LEDGER", ledger_path), \
+             mock.patch.object(w, "collect", return_value=pp), \
+             mock.patch.object(w, "_spawn_retry", return_value=True) as pre_spawn, \
+             mock.patch.object(w, "_now_epoch", return_value=1784317000):
+            pre_key = w.preexec_capture(str(repo), pcfg, False, True)
+        pre_rec = json.loads(ledger_path.read_text()).get(pre_key, {}) if pre_key else {}
+        current_head = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+            capture_output=True, text=True
+        ).stdout.strip()
+        pre_ok = (pre_key == "danielraffel/preexec-test#fix/preexec"
+                  and pre_rec.get("head") == current_head
+                  and pre_rec.get("p", {}).get("path", "").endswith("/repo")
+                  and pre_spawn.call_args_list == [mock.call(pre_key, pcfg, False, True)])
+        if not pre_ok:
+            failed += 1
+            print(f"FAIL  pre-exec capture: key={pre_key!r} rec={pre_rec} calls={pre_spawn.call_args_list}")
+        else:
+            print("ok    pre-exec capture: exact HEAD + privacy policy recorded before launch")
+
+        (repo / ".whence-off").write_text("")
+        with mock.patch.object(w, "LEDGER", ledger_path), \
+             mock.patch.object(w, "collect", return_value=pp), \
+             mock.patch.object(w, "_spawn_retry") as disabled_spawn:
+            disabled_key = w.preexec_capture(str(repo), pcfg, False, True)
+        if disabled_key or disabled_spawn.called:
+            failed += 1
+            print(f"FAIL  pre-exec repo opt-out: key={disabled_key!r} calls={disabled_spawn.call_args_list}")
+        else:
+            print("ok    pre-exec capture: .whence-off remains authoritative")
+
+    # Drive the generated shell wrapper with fake commands. The fake PR appears
+    # only after shipyard starts, and shipyard refuses to exit until the worker
+    # launched by --pre-exec has stamped it. A post-exit-only hook deadlocks/fails.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        bindir, state = root / "bin", root / "state"
+        bindir.mkdir(); state.mkdir()
+        fake_whence = bindir / "whence"
+        fake_shipyard = bindir / "shipyard"
+        fake_whence.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = --pre-exec ]; then\n"
+            "  touch \"$WHENCE_FAKE_STATE/preexec\"\n"
+            "  (while [ ! -f \"$WHENCE_FAKE_STATE/pr-created\" ]; do sleep 0.01; done; "
+            "touch \"$WHENCE_FAKE_STATE/stamped\") >/dev/null 2>&1 &\n"
+            "fi\n"
+            "exit 0\n"
+        )
+        fake_shipyard.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$2\" = --help ]; then touch \"$WHENCE_FAKE_STATE/help\"; exit 0; fi\n"
+            "touch \"$WHENCE_FAKE_STATE/started\"\n"
+            "sleep 0.05\n"
+            "touch \"$WHENCE_FAKE_STATE/pr-created\"\n"
+            "i=0; while [ ! -f \"$WHENCE_FAKE_STATE/stamped\" ] && [ $i -lt 100 ]; do "
+            "sleep 0.01; i=$((i+1)); done\n"
+            "test -f \"$WHENCE_FAKE_STATE/stamped\"\n"
+        )
+        fake_whence.chmod(0o755); fake_shipyard.chmod(0o755)
+        with mock.patch("shutil.which", side_effect=lambda name: str(bindir / name)):
+            hook_text, _ = w._hook_file_text()
+        hook_file = root / "hook.sh"
+        hook_file.write_text(hook_text)
+        env = dict(**__import__("os").environ)
+        env.update({"PATH": f"{bindir}:{env.get('PATH', '')}", "WHENCE_FAKE_STATE": str(state)})
+        driven = subprocess.run(
+            ["zsh", "-fc", f'source "{hook_file}"; shipyard pr'],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        lifecycle_ok = (driven.returncode == 0 and (state / "preexec").exists()
+                        and (state / "started").exists() and (state / "stamped").exists())
+        if not lifecycle_ok:
+            failed += 1
+            print(f"FAIL  long-running wrapper: rc={driven.returncode} out={driven.stdout!r} err={driven.stderr!r}")
+        else:
+            print("ok    long-running wrapper: PR stamped before fake command exits")
+        for name in ("preexec", "stamped", "pr-created", "started"):
+            try: (state / name).unlink()
+            except FileNotFoundError: pass
+        help_run = subprocess.run(
+            ["zsh", "-fc", f'source "{hook_file}"; shipyard pr --help'],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        help_ok = (help_run.returncode == 0 and (state / "help").exists()
+                   and not (state / "preexec").exists() and not (state / "stamped").exists())
+        if not help_ok:
+            failed += 1
+            print(f"FAIL  wrapper diagnostic: rc={help_run.returncode} state={[p.name for p in state.iterdir()]}")
+        else:
+            print("ok    shell wrapper: help diagnostic does not capture or stamp")
 
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0
