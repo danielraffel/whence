@@ -471,10 +471,10 @@ def main() -> int:
         # of our fake binaries, turning this hermetic lifecycle test into a real
         # network sweep (and a timeout). ZDOTDIR keeps the production hook out;
         # the generated hook under test is sourced explicitly below.
-        env.update({"PATH": f"{bindir}:{env.get('PATH', '')}",
-                    "WHENCE_FAKE_STATE": str(state), "ZDOTDIR": str(root)})
+        env.update({"WHENCE_FAKE_STATE": str(state), "ZDOTDIR": str(root)})
+        late_path = f'PATH="{bindir}:$PATH"'
         driven = subprocess.run(
-            ["zsh", "-fc", f'source "{hook_file}"; shipyard pr'],
+            ["zsh", "-fc", f'source "{hook_file}"; {late_path}; shipyard pr'],
             env=env, capture_output=True, text=True, timeout=5,
         )
         lifecycle_ok = (driven.returncode == 0 and (state / "preexec").exists()
@@ -490,7 +490,7 @@ def main() -> int:
             try: (state / name).unlink()
             except FileNotFoundError: pass
         help_run = subprocess.run(
-            ["zsh", "-fc", f'source "{hook_file}"; shipyard pr --help'],
+            ["zsh", "-fc", f'source "{hook_file}"; {late_path}; shipyard pr --help'],
             env=env, capture_output=True, text=True, timeout=5,
         )
         help_ok = (help_run.returncode == 0 and (state / "help").exists()
@@ -505,7 +505,8 @@ def main() -> int:
             try: (state / name).unlink()
             except FileNotFoundError: pass
         bash_run = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-c", f'source "{hook_file}"; shipyard pr'],
+            ["bash", "--noprofile", "--norc", "-c",
+             f'source "{hook_file}"; {late_path}; shipyard pr'],
             env=env, capture_output=True, text=True, timeout=5,
         )
         bash_ok = (bash_run.returncode == 0 and (state / "preexec").exists()
