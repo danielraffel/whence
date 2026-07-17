@@ -10,8 +10,12 @@ real-world output shapes are pinned here.
 Run: python3 test_whence.py
 """
 import importlib.util
+import json
 import pathlib
+import subprocess
 import sys
+import tempfile
+from unittest import mock
 
 _src = (pathlib.Path(__file__).parent / "whence").read_text().split("def main(")[0]
 w = importlib.util.module_from_spec(importlib.util.spec_from_loader("whence", loader=None))
@@ -101,7 +105,18 @@ def main() -> int:
         else:
             print(f"ok    {name}")
 
-    import tempfile
+    ref_payload = {
+        "tool_response": {
+            "stderr": "To github.com:danielraffel/pulp.git\n"
+                      "   111aaaa..222bbbb  other-local -> fix/deferred\n"
+        }
+    }
+    if w.pushed_source_ref(ref_payload) != "other-local":
+        failed += 1
+        print("FAIL  pushed_source_ref did not preserve the local source ref")
+    else:
+        print("ok    pushed_source_ref preserves local source != remote branch")
+
     with tempfile.TemporaryDirectory() as tmp:
         for name, cmd, want in cwd_cases(tmp):
             got = w._cmd_cwd(cmd)
@@ -225,6 +240,105 @@ def main() -> int:
     if off!=["claude","m5","w1","Fix caret"] or on!=["1\u00b7claude","2\u00b7m5","3\u00b7w1","4\u00b7Fix caret"] or sorted(on)!=on:
         failed+=1; print(f"FAIL  order_labels: off={off} on={on} sorted={sorted(on)}")
     else: print("ok    order_labels: prefixed names sort into agent/host/workspace/tab")
+
+    # A backgrounded orchestrator can return before its PR exists. The live hook
+    # must launch a targeted retry instead of leaving the PR to the 10-minute
+    # global sweep. PR #6195 was ledgered 29 seconds before GitHub created it.
+    key = "danielraffel/pulp#fix/deferred"
+    rec = {"p": {f: "" for f in w.FIELDS}, "ts": 1784270822, "head": "new-head"}
+    rec["p"].update({"agent": "claude", "host": "m3", "tab": "Deferred PR"})
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger_path = pathlib.Path(tmp) / "ledger.json"
+        with mock.patch.object(w, "LEDGER", ledger_path), \
+             mock.patch.object(w, "_now_epoch", return_value=1):
+            recorded_key = w.ledger_record(
+                "", rec["p"], "danielraffel/pulp", "fix/deferred",
+                "origin/main", str(pathlib.Path.cwd()),
+            )
+            recorded_head = json.loads(ledger_path.read_text())[key]["head"]
+    expected_head = subprocess.run(
+        ["git", "rev-parse", "origin/main"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    if recorded_key != key or recorded_head != expected_head:
+        failed += 1
+        print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r}")
+    else:
+        print("ok    ledger capture: deferred retry receives branch + HEAD identity")
+
+    responses = iter([
+        subprocess.CompletedProcess(
+            [], 0,
+            '[{"number":14,"body":"","createdAt":"2026-07-17T06:46:30Z",'
+            '"headRefOid":"old-head"},'
+            '{"number":15,"body":"","createdAt":"2026-07-17T06:46:55Z",'
+            '"headRefOid":"new-head"},'
+            '{"number":16,"body":"","createdAt":"2026-07-17T06:47:20Z",'
+            '"headRefOid":"fork-head"}]',
+            "",
+        ),
+        subprocess.CompletedProcess(
+            [], 0,
+            '[{"number":6195,"body":"","createdAt":"2026-07-17T06:47:31Z",'
+            '"headRefOid":"new-head"}]',
+            "",
+        ),
+    ])
+    applied = []
+    queries = []
+    def fake_pr_list(*args, **kwargs):
+        queries.append((args, kwargs))
+        return next(responses)
+    publication_cfg = {"labels": False, "footer": True}
+    with mock.patch.object(w, "_load_ledger", return_value={key: rec}), \
+         mock.patch.object(w, "sh", side_effect=fake_pr_list), \
+         mock.patch.object(w, "apply_stamp", side_effect=lambda *a, **k: applied.append((a, k))), \
+         mock.patch.object(w.time, "sleep") as sleep:
+        rc = w.retry_pending_pr(key, publication_cfg, attempts=2, delay=0.01)
+    policy_kept = (len(applied) == 1 and applied[0][0][0] == "6195"
+                   and applied[0][0][3:5] == (False, True))
+    timeouts_bounded = all(0 < q[1].get("timeout", 0) <= 5 for q in queries)
+    if rc != 0 or not policy_kept or not timeouts_bounded or applied[0][1].get("repo") != "danielraffel/pulp" or sleep.call_count != 1:
+        failed += 1
+        print(f"FAIL  deferred retry: rc={rc} applied={applied} sleeps={sleep.call_count}")
+    else:
+        print("ok    deferred retry: exact HEAD appears later; old/fork PRs ignored")
+
+    empty = subprocess.CompletedProcess([], 0, "[]", "")
+    with mock.patch.object(w, "_load_ledger", return_value={key: rec}), \
+         mock.patch.object(w, "sh", return_value=empty) as deadline_sh, \
+         mock.patch.object(w.time, "monotonic", side_effect=[0, 0, 119, 121]), \
+         mock.patch.object(w.time, "sleep") as deadline_sleep:
+        w.retry_pending_pr(key, publication_cfg, attempts=24, delay=5, max_wait=120)
+    if deadline_sh.call_count != 1 or deadline_sleep.call_args_list != [mock.call(1)]:
+        failed += 1
+        print(f"FAIL  retry deadline: queries={deadline_sh.call_count} sleeps={deadline_sleep.call_args_list}")
+    else:
+        print("ok    retry deadline: request + sleep cannot exceed two-minute budget")
+
+    retry_cfg = {"hide": {"session", "url"}}
+    with mock.patch.object(w, "_spawn_retry") as spawn:
+        scheduled = w.maybe_retry_deferred_pr(True, "", key, retry_cfg, False, True)
+        skipped_named = w.maybe_retry_deferred_pr(True, "6195", key, retry_cfg, False, True)
+        skipped_push = w.maybe_retry_deferred_pr(False, "", key, retry_cfg, False, True)
+    expected_spawn = [mock.call(key, retry_cfg, False, True)]
+    if not scheduled or skipped_named or skipped_push or spawn.call_args_list != expected_spawn:
+        failed += 1
+        print(f"FAIL  deferred retry scheduling: scheduled={scheduled} named={skipped_named} push={skipped_push} calls={spawn.call_args_list}")
+    else:
+        print("ok    deferred retry scheduling: only unnamed PR-producing hooks spawn it")
+
+    with mock.patch.object(w.subprocess, "Popen") as popen:
+        spawned = w._spawn_retry(key, retry_cfg, False, True)
+    popen_kwargs = popen.call_args.kwargs if popen.call_args else {}
+    popen_args = popen.call_args.args[0] if popen.call_args else []
+    forwards_policy = (popen_args[:4][-2:] == ["--retry-key", key]
+                       and popen_args[popen_args.index("--hide") + 1] == "session,url"
+                       and "--no-labels" in popen_args and "--no-footer" not in popen_args)
+    if not spawned or not forwards_policy or not popen_kwargs.get("start_new_session"):
+        failed += 1
+        print(f"FAIL  detached retry process: spawned={spawned} args={popen_args} kwargs={popen_kwargs}")
+    else:
+        print("ok    detached retry process: worker receives the ledger key + privacy policy")
 
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0
