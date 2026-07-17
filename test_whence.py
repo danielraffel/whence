@@ -448,8 +448,17 @@ def main() -> int:
             "test -f \"$WHENCE_FAKE_STATE/stamped\"\n"
         )
         fake_whence.chmod(0o755); fake_shipyard.chmod(0o755)
-        with mock.patch("shutil.which", side_effect=lambda name: str(bindir / name)):
-            hook_text, _ = w._hook_file_text()
+        # Generation must not depend on this non-interactive process's PATH:
+        # deploy over SSH often cannot see user-installed shipyard/pulp yet the
+        # resulting hook is sourced later from an interactive shell that can.
+        with mock.patch("shutil.which", return_value=None):
+            hook_text, wrapped_tools = w._hook_file_text()
+        if wrapped_tools != list(w.PR_TOOLS) or not all(
+                f"{tool}()" in hook_text for tool in w.PR_TOOLS):
+            failed += 1
+            print(f"FAIL  deterministic wrappers: tools={wrapped_tools}")
+        else:
+            print("ok    shell wrapper generation: reduced deploy PATH cannot drop tools")
         hook_file = root / "hook.sh"
         hook_file.write_text(hook_text)
         env = dict(**__import__("os").environ)

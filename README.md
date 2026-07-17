@@ -295,7 +295,9 @@ repo is the source of truth; two mechanisms keep every machine current:
 - **Instant (deploy fan-out).** Right after you push a change, `whence --deploy`
   pushes your local commits, then SSHes each host in `~/.config/whence/hosts`
   (one hostname per line) to pull + reinstall immediately. Unreachable hosts are
-  skipped — they'll self-update on their next stamp.
+  skipped — they'll self-update on their next stamp. Shell-wrapper generation is
+  deterministic: a reduced non-interactive SSH `PATH` cannot drop wrappers for
+  tools that are available in the later interactive shell.
 
 The host list is **personal** — it lives only in `~/.config/whence/hosts`, never
 in the repo, because your fleet is yours. Most whence users run one machine and
