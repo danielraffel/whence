@@ -434,6 +434,10 @@ def main() -> int:
             "  touch \"$WHENCE_FAKE_STATE/preexec\"\n"
             "  (while [ ! -f \"$WHENCE_FAKE_STATE/pr-created\" ]; do sleep 0.01; done; "
             "touch \"$WHENCE_FAKE_STATE/stamped\") >/dev/null 2>&1 &\n"
+            "elif [ \"$1\" = --sweep ]; then\n"
+            "  touch \"$WHENCE_FAKE_STATE/swept\"\n"
+            "elif [ \"$1\" = --auto ]; then\n"
+            "  touch \"$WHENCE_FAKE_STATE/recollected\"\n"
             "fi\n"
             "exit 0\n"
         )
@@ -468,13 +472,15 @@ def main() -> int:
             env=env, capture_output=True, text=True, timeout=5,
         )
         lifecycle_ok = (driven.returncode == 0 and (state / "preexec").exists()
-                        and (state / "started").exists() and (state / "stamped").exists())
+                        and (state / "started").exists() and (state / "stamped").exists()
+                        and (state / "swept").exists()
+                        and not (state / "recollected").exists())
         if not lifecycle_ok:
             failed += 1
             print(f"FAIL  long-running wrapper: rc={driven.returncode} out={driven.stdout!r} err={driven.stderr!r}")
         else:
-            print("ok    long-running wrapper: PR stamped before fake command exits")
-        for name in ("preexec", "stamped", "pr-created", "started"):
+            print("ok    long-running wrapper: pre-exec stamp kept; post path sweeps ledger")
+        for name in ("preexec", "stamped", "pr-created", "started", "swept", "recollected"):
             try: (state / name).unlink()
             except FileNotFoundError: pass
         help_run = subprocess.run(
@@ -482,7 +488,8 @@ def main() -> int:
             env=env, capture_output=True, text=True, timeout=5,
         )
         help_ok = (help_run.returncode == 0 and (state / "help").exists()
-                   and not (state / "preexec").exists() and not (state / "stamped").exists())
+                   and not any((state / name).exists()
+                               for name in ("preexec", "stamped", "swept", "recollected")))
         if not help_ok:
             failed += 1
             print(f"FAIL  wrapper diagnostic: rc={help_run.returncode} state={[p.name for p in state.iterdir()]}")
