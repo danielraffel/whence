@@ -170,6 +170,10 @@ actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). Both ar
 it asks you to trust the whence hook once on its next run. (cmux also wires
 Claude's hooks automatically.) See
 [`examples/claude-code-hook.md`](examples/claude-code-hook.md) for the manual form.
+The parser follows real command wrappers too: `timeout`/`setsid`/`nohup`/`exec`, command
+variables such as `$GHAPP`, and nested `bash|zsh|sh -c '…'` payloads. A detached
+`nohup bash -lc 'cd /worktree && shipyard pr'` therefore still records the exact
+worktree before the background command can open its PR.
 
 **Best-effort, zero per-agent config — the shell hook.**
 
@@ -266,6 +270,9 @@ of your own: none of them can push code without saying where it went.
    it uses the cwd in force at the actual PR/push invocation, not a later `cd`
    used for cleanup or diagnostics. Quoted/search/print mentions of `shipyard pr`,
    `pulp pr`, or `git push` are data and do not create ledger entries.
+   If an agent hook retains `CMUX_SURFACE_ID` but loses `CMUX_WORKSPACE_ID`, whence
+   asks cmux which workspace owns that surface and restores the workspace label
+   only when that workspace has an explicit custom name.
 2. **Targeted retry.** If a PR-producing command returns before it can print a PR
    URL, whence starts a detached retry for that exact repo/branch. It polls for up
    to two minutes and stamps as soon as GitHub exposes the PR, without blocking
