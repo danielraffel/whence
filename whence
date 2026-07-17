@@ -528,9 +528,15 @@ def _hook_file_text() -> tuple[str, list]:
     EVERY shell mode (interactive or not), so — unlike a PATH-dir shim — it can't
     be shadowed by a later .zshrc reordering PATH. Each function runs the REAL
     tool via `command` (which skips functions → no recursion, and no double-stamp
-    when one tool internally spawns another), then stamps best-effort."""
-    from shutil import which
-    tools = [(t, trig) for t, trig in PR_TOOLS.items() if which(t)]
+    when one tool internally spawns another), then stamps best-effort.
+
+    Generate every supported wrapper deterministically. Deployment runs over a
+    non-interactive SSH shell whose PATH may omit user-installed tools even
+    though later interactive shells contain them; filtering here would silently
+    delete live shipyard/pulp wrappers during an otherwise successful deploy.
+    An unused function is inert, and calling it preserves the underlying
+    command-not-found result from ``command <tool>``."""
+    tools = list(PR_TOOLS.items())
     lines = [
         "# whence hook — sourced by your shell init. Thin wrappers around the",
         "# PR-opening commands that stamp the branch's PR right after it opens.",
@@ -559,14 +565,10 @@ def install_hook(print_only: bool) -> int:
     block = _hook_source_block()
     if print_only:
         print(f"# hook file: {HOOK_FILE}")
-        print(f"# wraps: {', '.join(tools) or '(no PR tool found on PATH)'}")
+        print(f"# wraps: {', '.join(tools)}")
         print("\n# ---- hook.sh ----\n" + text)
         print("# add to ~/.zshenv (and ~/.bashrc if you use bash):\n" + block)
         return 0
-    if not tools:
-        print("whence: found no PR tool (shipyard/pulp/gh/ghapp) on PATH — nothing to wrap.\n"
-              "  Install one, or wire an agent hook instead (see the README).", file=sys.stderr)
-        return 1
     CFG_DIR.mkdir(parents=True, exist_ok=True)
     HOOK_FILE.write_text(text)
     targets = [pathlib.Path(os.path.expanduser("~/.zshenv"))]  # always: universal zsh init
