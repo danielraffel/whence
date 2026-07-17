@@ -185,6 +185,12 @@ branch's PR right after. It covers **every common way a PR gets opened** —
 (so a `.zshrc` PATH reorder can't shadow it) and calls the real tool via
 `command` (no recursion, no double-stamp).
 
+For the long-running orchestrators (`shipyard pr` and `pulp pr`), the wrapper
+also captures the repo, branch, exact HEAD, and live provenance **before** the
+real command starts, then launches the bounded targeted retry in parallel. The
+PR can therefore be stamped as soon as GitHub exposes it while the orchestrator
+is still building or waiting to merge. The command's exit status is unchanged.
+
 Its limit, honestly: it only fires in shells that load your init file, so it
 catches PRs you open in a normal terminal and in agents whose command shell
 sources `~/.zshenv` — but an agent that runs commands in a bare shell
@@ -252,13 +258,18 @@ of your own: none of them can push code without saying where it went.
    hands the agent a task handle and opens the PR minutes later — whence falls back
    to the `cd` in the command text, which is the only thing left that names the
    worktree. It reads `cd X && …`, a `cd` on its own line, `cd "$WT"` against a
-   variable the same command set, and `git -C X`.
+   variable the same command set, and `git -C X`. The fallback is command-local:
+   it uses the cwd in force at the actual PR/push invocation, not a later `cd`
+   used for cleanup or diagnostics. Quoted/search/print mentions of `shipyard pr`,
+   `pulp pr`, or `git push` are data and do not create ledger entries.
 2. **Targeted retry.** If a PR-producing command returns before it can print a PR
    URL, whence starts a detached retry for that exact repo/branch. It polls for up
    to two minutes and stamps as soon as GitHub exposes the PR, without blocking
    the agent hook or scanning unrelated ledger entries. This closes the common
    20–60 second Shipyard creation gap instead of leaving the PR unlabeled until
-   the global timer fires.
+   the global timer fires. The shell wrapper starts this retry before a
+   long-running `shipyard pr`/`pulp pr`; PostToolUse remains a second path for
+   commands that return promptly or run in shells without the wrapper.
 3. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
    but isn't stamped yet, using the *ledger's* provenance (the tab that made the
    branch) — never the sweeping machine's. It covers **merged and closed** PRs,

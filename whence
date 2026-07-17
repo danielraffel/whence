@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, json, os, re, shlex, socket, subprocess, sys, datetime, pathlib, tempfile, time
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
@@ -40,13 +40,6 @@ KNOWN_URL = {"claude": "https://claude.ai/code/{bridge}"}
 
 MARK_RE = re.compile(r"<!-- whence( .*?)? -->.*?<!-- /whence -->\n?", re.S)
 OLD_PREFIXES = ("agent:", "host:", "ws:")
-
-# What counts as "a PR was just opened", matched against an agent hook's command.
-PR_CMD_RE = re.compile(r"(?:gh|ghapp) pr create|shipyard pr|pulp pr")
-# A push may create a PR later (a daemon opens it, or `shipyard pr` pushes then
-# opens asynchronously). We can't stamp a PR that doesn't exist yet, but we CAN
-# record the branch's provenance now so the sweep stamps the PR when it appears.
-PUSH_RE = re.compile(r"\bgit\s+push\b|\bshipyard\s+pr\b|\bpulp\s+pr\b")
 
 # The command's OUTPUT names its own outcome — the PR URL that `gh`/`shipyard`
 # print, or the `To github.com:owner/repo.git` + refspec that `git push` prints.
@@ -510,18 +503,16 @@ def repo_allowed(cfg: dict, slug: str = "") -> bool:
 
 
 # The one cross-agent trigger: wrap the command that opens the PR. Every agent
-# shells out to one of these, so a PATH shim catches them all — no per-agent hook,
-# no Shipyard requirement. Key = tool name, value = the sh test that means "a PR
-# was just opened" (so the shim only stamps on PR-creating invocations). We cover
-# every common way a PR gets opened: the GitHub CLIs (`gh`/`ghapp pr create`) and
-# the orchestrators (`shipyard pr`, `pulp pr`). Over-firing is harmless — whence
-# no-ops when the branch has no PR — so it's fine to err toward catching more.
+# shells out to one of these, so a shell function catches them all — no per-agent
+# hook or Shipyard integration required. The long-running orchestrators capture
+# before launch; every tool still runs the idempotent post-command stamp.
 PR_TOOLS = {
     "shipyard": '[ "$1" = pr ]',
     "pulp":     '[ "$1" = pr ]',
     "gh":       '[ "$1" = pr ] && [ "$2" = create ]',
     "ghapp":    '[ "$1" = pr ] && [ "$2" = create ]',
 }
+PREEXEC_TOOLS = {"shipyard", "pulp"}
 HOOK_MARK_RE = re.compile(r"\n*# >>> whence hook >>>.*?# <<< whence hook <<<\n", re.S)
 HOOK_FILE = CFG_DIR / "hook.sh"
 
@@ -548,11 +539,16 @@ def _hook_file_text() -> tuple[str, list]:
         "# NB: `command whence` — plain `whence` is a zsh BUILTIN (like `which`), so",
         "# `command` is required to reach this script rather than the builtin.",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
+        "__whence_preexec() { command whence --pre-exec \"$PWD\" >/dev/null 2>&1 || true; }",
+        "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
+        "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
     for tool, trig in tools:
+        active = f"{trig} && __whence_will_act \"$@\""
+        before = f"if {active}; then __whence_preexec; fi; " if tool in PREEXEC_TOOLS else ""
         lines.append(
-            f'{tool}() {{ command {tool} "$@"; __whence_rc=$?; '
-            f"if {trig}; then __whence_stamp; fi; return $__whence_rc; }}")
+            f'{tool}() {{ {before}command {tool} "$@"; __whence_rc=$?; '
+            f"if {active}; then __whence_stamp; fi; return $__whence_rc; }}")
     return "\n".join(lines) + "\n", [t for t, _ in tools]
 
 
@@ -999,9 +995,186 @@ def _git(cwd, *a):
     return sh("git", "-C", cwd, *a) if cwd else sh("git", *a)
 
 
-_CD_RE = re.compile(r"""(?:^|&&|\|\||;|\n)\s*cd\s+('[^']*'|"[^"]*"|[^\s;&|]+)""")
-_GIT_C_RE = re.compile(r"""\bgit\s+-C\s+('[^']*'|"[^"]*"|[^\s;&|]+)""")
-_ASSIGN_RE = re.compile(r"""(?:^|&&|;|\n)\s*(\w+)=('[^']*'|"[^"]*"|[^\s;&|]+)""")
+_ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.S)
+
+
+def _without_heredoc_bodies(cmd: str) -> str:
+    """Remove heredoc data, where action-looking text is never shell syntax."""
+    pending: list[tuple[str, bool]] = []
+    out = []
+    for line in cmd.splitlines(keepends=True):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            value = line.rstrip("\r\n")
+            if strip_tabs:
+                value = value.lstrip("\t")
+            if value == delimiter:
+                pending.pop(0)
+            out.append("\n" if line.endswith(("\n", "\r")) else "")
+            continue
+        out.append(line)
+        quote, escaped, i = "", False, 0
+        while i < len(line):
+            ch = line[i]
+            if escaped:
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\" and quote != "'":
+                escaped = True
+                i += 1
+                continue
+            if quote:
+                if ch == quote:
+                    quote = ""
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if line.startswith("<<", i) and not line.startswith("<<<", i):
+                j, strip_tabs = i + 2, False
+                if j < len(line) and line[j] == "-":
+                    strip_tabs, j = True, j + 1
+                while j < len(line) and line[j] in " \t":
+                    j += 1
+                delim_quote = line[j] if j < len(line) and line[j] in ("'", '"') else ""
+                if delim_quote:
+                    j += 1
+                start = j
+                while j < len(line) and (line[j] != delim_quote if delim_quote
+                                         else line[j] not in " \t\r\n;&|<>()"):
+                    j += 1
+                delimiter = line[start:j]
+                if delimiter:
+                    pending.append((delimiter, strip_tabs))
+                i = j + (1 if delim_quote and j < len(line) else 0)
+                continue
+            i += 1
+    return "".join(out)
+
+
+def _simple_shell_commands(cmd: str) -> list[list[str]]:
+    """Tokenize top-level shell commands without executing or expanding them.
+
+    Splitting only on unquoted control operators keeps diagnostic literals such
+    as ``rg "shipyard pr"`` inside the ``rg`` argv. This is intentionally a
+    small shell recognizer, not an evaluator: malformed input yields whatever
+    complete commands preceded it and never runs user text.
+    """
+    if not cmd:
+        return []
+    segments, buf, quote, escaped, comment = [], [], "", False, False
+
+    def flush():
+        text = "".join(buf).strip()
+        buf.clear()
+        if text:
+            segments.append(text)
+
+    for ch in _without_heredoc_bodies(cmd):
+        if comment:
+            if ch == "\n":
+                comment = False
+                flush()
+            continue
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\" and quote != "'":
+            buf.append(ch)
+            escaped = True
+            continue
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = ""
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+        elif ch == "#" and (not buf or buf[-1].isspace()):
+            comment = True
+        elif ch in ";\n&|()":
+            flush()
+        else:
+            buf.append(ch)
+    flush()
+    out = []
+    for segment in segments:
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        if tokens:
+            out.append(tokens)
+    return out
+
+
+def _resolve_cmd_path(raw: str, vars_: dict[str, str], cwd: str | None = None):
+    value = raw.strip().strip("'\"")
+    value = re.sub(r"\$\{?(\w+)\}?", lambda m: vars_.get(m.group(1), ""), value)
+    value = os.path.expanduser(os.path.expandvars(value))
+    if value and not os.path.isabs(value):
+        value = os.path.join(cwd or os.getcwd(), value)
+    value = os.path.abspath(value) if value else ""
+    return value if value and os.path.isdir(value) else None
+
+
+def _command_action(cmd: str) -> tuple[bool, bool, str | None]:
+    """Return (creates_pr, pushes, cwd) for the first real action command.
+
+    The executable position matters: words passed to ``rg``, ``echo``, ``git
+    log -S``, or another diagnostic are data, not actions. The cwd is the shell's
+    effective directory at the action itself, before any later diagnostic ``cd``.
+    """
+    vars_: dict[str, str] = {}
+    cwd = None
+    for tokens in _simple_shell_commands(cmd):
+        i = 0
+        while i < len(tokens):
+            assignment = _ASSIGN_TOKEN_RE.match(tokens[i])
+            if not assignment:
+                break
+            vars_[assignment.group(1)] = assignment.group(2).strip("'\"")
+            i += 1
+        if i >= len(tokens):
+            continue
+        argv = tokens[i:]
+        if argv[0] == "cd" and len(argv) > 1:
+            got = _resolve_cmd_path(argv[1], vars_, cwd)
+            if got:
+                cwd = got
+            continue
+        while argv and argv[0] in ("command", "builtin", "nohup"):
+            argv = argv[1:]
+        if argv and argv[0] == "env":
+            argv = argv[1:]
+            while argv and (_ASSIGN_TOKEN_RE.match(argv[0]) or argv[0].startswith("-")):
+                argv = argv[1:]
+        if not argv:
+            continue
+        exe = os.path.basename(argv[0])
+        if any(arg in ("-h", "--help", "--version", "--dry-run") for arg in argv[1:]):
+            continue
+        if exe in ("shipyard", "pulp") and len(argv) > 1 and argv[1] == "pr":
+            return True, True, cwd
+        if exe in ("gh", "ghapp") and argv[1:3] == ["pr", "create"]:
+            return True, False, cwd
+        if exe == "git":
+            git_cwd, j = cwd, 1
+            while j < len(argv) and argv[j].startswith("-"):
+                if argv[j] in ("-C", "-c", "--git-dir", "--work-tree") and j + 1 < len(argv):
+                    if argv[j] == "-C":
+                        git_cwd = _resolve_cmd_path(argv[j + 1], vars_, cwd)
+                    j += 2
+                else:
+                    j += 1
+            if j < len(argv) and argv[j] == "push":
+                return False, True, git_cwd
+    return False, False, None
 
 
 def _cmd_cwd(cmd: str):
@@ -1018,25 +1191,11 @@ def _cmd_cwd(cmd: str):
         cd "$WT"                       quoted, and referencing that variable
         git -C /wt push                no cd at all
 
-    Takes the LAST cd (a command may cd twice), and only accepts a real directory
-    — a path that doesn't resolve means we learned nothing, not that we're in it."""
-    if not cmd:
-        return None
-    vars_ = {k: v.strip("'\"") for k, v in _ASSIGN_RE.findall(cmd)}
-
-    def resolve(raw: str):
-        v = raw.strip().strip("'\"")
-        # $VAR / ${VAR} — only ones this same command assigned; no shell, no eval.
-        v = re.sub(r"\$\{?(\w+)\}?", lambda m: vars_.get(m.group(1), ""), v)
-        v = os.path.expanduser(os.path.expandvars(v))
-        return v if v and os.path.isdir(v) else None
-
-    for rx in (_CD_RE, _GIT_C_RE):
-        for m in reversed(list(rx.finditer(cmd))):
-            got = resolve(m.group(1))
-            if got:
-                return got
-    return None
+    Associates the action with the cwd in force at that point. A later ``cd``
+    used for diagnostics or cleanup cannot redirect the capture to another repo.
+    Only real directories are accepted; an unresolved path means we learned
+    nothing, not that the action ran there."""
+    return _command_action(cmd)[2]
 
 
 def _repo_branch(cwd):
@@ -1290,6 +1449,29 @@ def maybe_retry_deferred_pr(hook_is_pr: bool, hook_pr: str, ledger_key: str,
     return _spawn_retry(ledger_key, cfg, post_labels, post_footer)
 
 
+def preexec_capture(cwd: str, cfg: dict, post_labels: bool, post_footer: bool) -> str:
+    """Capture a long-running orchestrator before it starts and retry in parallel.
+
+    The shell wrapper calls this synchronously while its cwd and cmux/session
+    environment are still exact. Only the tiny local ledger write is synchronous;
+    GitHub polling happens in the existing detached, bounded retry worker while
+    ``shipyard pr`` or ``pulp pr`` continues running.
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    slug, br = _repo_branch(cwd)
+    top = _git(cwd, "rev-parse", "--show-toplevel").stdout.strip()
+    if ((top and (pathlib.Path(top) / ".whence-off").exists())
+            or not slug or not br or not repo_allowed(cfg, slug)):
+        return ""
+    p = collect(cfg)
+    p["path"] = sanitize_path(cwd, cfg)
+    key = ledger_record("", p, slug, br, "HEAD", cwd)
+    if key:
+        _spawn_retry(key, cfg, post_labels, post_footer)
+    return key
+
+
 def show_log(n: int) -> int:
     """Pretty-print the last n audit entries: when, which PR, what triggered it,
     who, and the label transition. Reads ~/.config/whence/audit.jsonl."""
@@ -1524,6 +1706,10 @@ def self_update(force: bool = False) -> bool:
     after = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
     if before and after and before != after:
         install_agent_hook("all")
+        # hook.sh contains generated wrapper code, not a symlink to this script.
+        # Refresh it only for users who already opted into the shell hook.
+        if HOOK_FILE.exists():
+            install_hook(print_only=False)
         return True
     return False
 
@@ -1545,7 +1731,9 @@ def deploy() -> int:
     rc = 0
     for h in hosts:
         remote = ("cd ~/.local/share/whence && git pull --ff-only --quiet && "
-                  "./whence --install-agent-hook all >/dev/null 2>&1 && echo whence-ok")
+                  "./whence --install-agent-hook all >/dev/null 2>&1 && "
+                  "{ [ ! -f ~/.config/whence/hook.sh ] || "
+                  "./whence --install-hook >/dev/null 2>&1; } && echo whence-ok")
         r = sh("ssh", "-o", "ConnectTimeout=8", h, remote)
         ok = r.returncode == 0 and "whence-ok" in r.stdout
         print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on next stamp'}")
@@ -1610,6 +1798,7 @@ def main() -> int:
                     help="wire the reliable in-process agent hook (Claude global, Codex per-repo)")
     ap.add_argument("--hook", action="store_true",
                     help="internal: read an agent's tool JSON from stdin and stamp if it opened a PR")
+    ap.add_argument("--pre-exec", metavar="CWD", help=argparse.SUPPRESS)
     ap.add_argument("--retry-key", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
@@ -1630,6 +1819,13 @@ def main() -> int:
         cfg["labels"] = cfg["labels"] and not args.no_labels
         cfg["footer"] = cfg["footer"] and not args.no_footer
         return retry_pending_pr(args.retry_key, cfg)
+    if args.pre_exec:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        post_labels = cfg["labels"] and not args.no_labels
+        post_footer = cfg["footer"] and not args.no_footer
+        preexec_capture(args.pre_exec, cfg, post_labels, post_footer)
+        return 0
     if args.sweep:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -1709,8 +1905,9 @@ def main() -> int:
             hook_cmd = ""
         # The output outranks the command name: anything that printed a PR URL
         # opened a PR, no matter which wrapper it was spelled with.
-        hook_is_pr = bool(hook_pr) or bool(PR_CMD_RE.search(hook_cmd or ""))
-        hook_is_push = bool(PUSH_RE.search(hook_cmd or "")) or bool(hook_slug and hook_br)
+        cmd_is_pr, cmd_is_push, _action_cwd = _command_action(hook_cmd)
+        hook_is_pr = bool(hook_pr) or cmd_is_pr
+        hook_is_push = cmd_is_push or bool(hook_slug and hook_br)
         if not (hook_is_pr or hook_is_push):
             return 0
         args.auto = True   # quiet mode for both; a push returns before stamping
