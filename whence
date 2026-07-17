@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib, tempfile
+import argparse, json, os, re, socket, subprocess, sys, datetime, pathlib, tempfile, time
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
@@ -63,7 +63,15 @@ PUSH_TO_RE = re.compile(r"^To (?:(?:\w+://)?(?:[\w.-]+@)?github\.com[:/])"
 # `   abc1234..def5678  fix/x -> fix/x`, ` * [new branch]  fix/x -> fix/x`,
 # ` + 999f...888e  fix/x -> fix/x (forced update)` — the trailing note is optional.
 REFSPEC_RE = re.compile(r"^[\s+*-]*(?:\[new branch\]|\[new tag\]|[0-9a-f]{4,}\.{2,3}[0-9a-f]{4,})"
-                        r"\s+\S+\s+->\s+(\S+?)(?:\s+\(.*\))?\s*$", re.M)
+                        r"\s+(\S+)\s+->\s+(\S+?)(?:\s+\(.*\))?\s*$", re.M)
+
+
+def _tool_response_text(payload: dict) -> str:
+    tr = payload.get("tool_response") or payload.get("toolResponse") or ""
+    if isinstance(tr, dict):
+        return "\n".join(str(tr.get(k) or "")
+                         for k in ("stdout", "stderr", "output", "content"))
+    return tr if isinstance(tr, str) else str(tr)
 
 
 def parse_outcome(payload: dict) -> tuple[str, str, str]:
@@ -72,11 +80,7 @@ def parse_outcome(payload: dict) -> tuple[str, str, str]:
     Any field may be "" — a `git push` names a repo+branch but no PR (the PR may
     not exist yet); a `gh pr create` names a repo+PR directly. Reads stdout AND
     stderr: git writes its refspec summary to stderr."""
-    tr = payload.get("tool_response") or payload.get("toolResponse") or ""
-    if isinstance(tr, dict):
-        tr = "\n".join(str(tr.get(k) or "") for k in ("stdout", "stderr", "output", "content"))
-    elif not isinstance(tr, str):
-        tr = str(tr)
+    tr = _tool_response_text(payload)
     slug = branch = pr = ""
     m = PR_URL_RE.search(tr)
     if m:
@@ -92,11 +96,17 @@ def parse_outcome(payload: dict) -> tuple[str, str, str]:
         # OTHER remote, and pairing that branch with a cwd-derived GitHub slug
         # would file the entry under a repo the push never touched.
         m = REFSPEC_RE.search(tr)
-        if m and m.group(1) != "HEAD":
-            branch = m.group(1)
+        if m and m.group(2) != "HEAD":
+            branch = m.group(2)
             if branch.startswith("refs/heads/"):
                 branch = branch[len("refs/heads/"):]
     return slug, branch, pr
+
+
+def pushed_source_ref(payload: dict) -> str:
+    """The local source ref named by a successful push summary, if present."""
+    m = REFSPEC_RE.search(_tool_response_text(payload))
+    return m.group(1) if m else ""
 
 
 # The whole config, every knob shown at its default. `whence --init` writes this.
@@ -1042,27 +1052,62 @@ def _load_ledger() -> dict:
     except Exception: return {}
 
 
-def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "") -> None:
+def _recent_prs(raw: str, rec: dict) -> list[dict]:
+    """Return PRs created for this ledger capture, not older branch-name reuse.
+
+    The captured HEAD is the identity boundary: branch names alone can collide
+    with old PRs or forks. The creation time only bounds that exact commit to the
+    current hook invocation, allowing five seconds of clock/order skew.
+    """
+    try:
+        prs = json.loads(raw or "[]")
+    except Exception:
+        return []
+    not_before = int(rec.get("ts", 0))
+    captured_head = rec.get("head", "")
+    if not captured_head:
+        return []
+    recent = []
+    for pr in prs:
+        value = pr.get("createdAt", "")
+        try:
+            created = int(datetime.datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            ).timestamp())
+        except (TypeError, ValueError):
+            continue
+        if created >= not_before - 5 and pr.get("headRefOid") == captured_head:
+            recent.append(pr)
+    return recent
+
+
+def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
+                  source_ref: str = "", hook_cwd: str = "") -> str:
     """Remember which tab/session/machine owns this branch, keyed owner/repo#branch.
 
     `slug`/`br` come from the command's own output when it named them — always
     correct. Only when it named neither do we fall back to reading git in the
     hook's cwd, which is right just when the command ran in the session's root
     checkout (and wrong, silently, for every worktree)."""
+    cmd_cwd = _cmd_cwd(cmd) or (hook_cwd if os.path.isdir(hook_cwd) else None)
     if not slug or not br:
-        c_slug, c_br = _repo_branch(_cmd_cwd(cmd))
+        c_slug, c_br = _repo_branch(cmd_cwd)
         slug, br = slug or c_slug, br or c_br
     if not slug or not br or br in ("HEAD", ""):
-        return
+        return ""
     if br in DEFAULT_BRANCHES:
         # A push to main is not a PR branch. Recording it would leave the sweep
         # asking "any PR with head=main?" — and stamp whatever unrelated PR that
         # matched, with this session's provenance.
-        return
+        return ""
     led = _load_ledger()
-    led[f"{slug}#{br}"] = {"p": {k: p.get(k, "") for k in FIELDS}, "ts": _now_epoch()}
+    key = f"{slug}#{br}"
+    head = _git(cmd_cwd, "rev-parse", source_ref or br or "HEAD").stdout.strip()
+    led[key] = {"p": {k: p.get(k, "") for k in FIELDS},
+                "ts": _now_epoch(), "head": head}
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     LEDGER.write_text(json.dumps(led))
+    return key
 
 
 def _is_ref_tab(tab: str, cfg: dict) -> bool:
@@ -1172,6 +1217,77 @@ def sweep(cfg: dict) -> int:
                 rec["done"] = not (surf and _surface_ref(surf))
     LEDGER.write_text(json.dumps(keep))
     return n
+
+
+def retry_pending_pr(key: str, cfg: dict, attempts: int = 24, delay: float = 5.0,
+                     max_wait: float = 120.0) -> int:
+    """Promptly stamp one ledgered PR that an orchestrator creates asynchronously.
+
+    A backgrounded ``shipyard pr`` can return a task handle before GitHub has a
+    PR to name. The normal hook records the branch correctly, but its immediate
+    sweep is then too early; without this targeted retry the PR waits for the
+    10-minute global timer. Poll only the exact repo/branch, for at most two
+    minutes, and leave ledger completion to the normal sweep so this worker never
+    races a concurrent hook while rewriting the whole ledger.
+    """
+    rec = _load_ledger().get(key)
+    slug, sep, br = key.partition("#")
+    if not rec or not sep or not slug or not br:
+        return 0
+    deadline = time.monotonic() + max_wait
+    for attempt in range(max(1, attempts)):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        res = sh(GH, "pr", "list", "--repo", slug, "--head", br,
+                 "--state", "all", "--json", "number,body,createdAt,headRefOid",
+                 timeout=max(0.1, min(5.0, remaining)))
+        prs = _recent_prs(res.stdout, rec)
+        if prs:
+            for pr in prs:
+                body = pr.get("body", "")
+                if is_stamped(body):
+                    continue
+                best, _surf = _best_provenance(rec, cfg, body)
+                apply_stamp(str(pr["number"]), best, cfg, cfg["labels"], cfg["footer"],
+                            repo=slug, source="retry")
+            return 0
+        remaining = deadline - time.monotonic()
+        if attempt + 1 < max(1, attempts) and remaining > 0:
+            time.sleep(min(delay, remaining))
+    return 0
+
+
+def _spawn_retry(key: str, cfg: dict, post_labels: bool, post_footer: bool) -> bool:
+    """Start the targeted retry out of process so an agent hook never blocks."""
+    argv = [sys.executable, os.path.realpath(sys.argv[0]), "--retry-key", key]
+    hidden = sorted(cfg.get("hide", set()))
+    if hidden:
+        argv.extend(["--hide", ",".join(hidden)])
+    if not post_labels:
+        argv.append("--no-labels")
+    if not post_footer:
+        argv.append("--no-footer")
+    try:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except OSError:
+        return False
+
+
+def maybe_retry_deferred_pr(hook_is_pr: bool, hook_pr: str, ledger_key: str,
+                            cfg: dict, post_labels: bool, post_footer: bool) -> bool:
+    """Schedule a retry only when a PR command returned before naming its PR."""
+    if not hook_is_pr or hook_pr or not ledger_key:
+        return False
+    return _spawn_retry(ledger_key, cfg, post_labels, post_footer)
 
 
 def show_log(n: int) -> int:
@@ -1494,6 +1610,7 @@ def main() -> int:
                     help="wire the reliable in-process agent hook (Claude global, Codex per-repo)")
     ap.add_argument("--hook", action="store_true",
                     help="internal: read an agent's tool JSON from stdin and stamp if it opened a PR")
+    ap.add_argument("--retry-key", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.install_agent_hook:
@@ -1507,6 +1624,12 @@ def main() -> int:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         return resync()
+    if args.retry_key:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        cfg["labels"] = cfg["labels"] and not args.no_labels
+        cfg["footer"] = cfg["footer"] and not args.no_footer
+        return retry_pending_pr(args.retry_key, cfg)
     if args.sweep:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -1560,7 +1683,8 @@ def main() -> int:
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
     hook_agent = hook_sid = hook_cmd = hook_cwd = ""
-    hook_slug = hook_br = hook_pr = ""
+    hook_slug = hook_br = hook_pr = hook_source_ref = ""
+    ledger_key = ""
     hook_is_pr = hook_is_push = False
     if args.hook:
         # Agent PostToolUse: read the tool JSON. A PR-create command stamps now;
@@ -1579,6 +1703,7 @@ def main() -> int:
             hook_agent = ("codex" if "/.codex" in tp else
                           "claude" if "/.claude" in tp else "")
             hook_slug, hook_br, hook_pr = parse_outcome(d)
+            hook_source_ref = pushed_source_ref(d)
             hook_cwd = d.get("cwd") or ""
         except Exception:
             hook_cmd = ""
@@ -1629,12 +1754,15 @@ def main() -> int:
         # cheap throttled maintenance: converge to the repo + backfill any PR the
         # live stamp couldn't reach (worktree / daemon / push-only / timed-out).
         if hook_is_pr or hook_is_push:
-            ledger_record(hook_cmd, p, hook_slug, hook_br)
+            ledger_key = ledger_record(hook_cmd, p, hook_slug, hook_br,
+                                       hook_source_ref, hook_cwd)
         try: self_update()                       # throttled once/day internally
         except Exception: pass
         try:
             if _throttled("sweep", 120): sweep(cfg)
         except Exception: pass
+        maybe_retry_deferred_pr(hook_is_pr, hook_pr, ledger_key,
+                                cfg, post_labels, post_footer)
         if not hook_is_pr:                        # a push only records + sweeps
             return 0
     labels = labels_for(p, cfg) if post_labels else []

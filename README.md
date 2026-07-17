@@ -253,7 +253,13 @@ of your own: none of them can push code without saying where it went.
    to the `cd` in the command text, which is the only thing left that names the
    worktree. It reads `cd X && …`, a `cd` on its own line, `cd "$WT"` against a
    variable the same command set, and `git -C X`.
-2. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
+2. **Targeted retry.** If a PR-producing command returns before it can print a PR
+   URL, whence starts a detached retry for that exact repo/branch. It polls for up
+   to two minutes and stamps as soon as GitHub exposes the PR, without blocking
+   the agent hook or scanning unrelated ledger entries. This closes the common
+   20–60 second Shipyard creation gap instead of leaving the PR unlabeled until
+   the global timer fires.
+3. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
    but isn't stamped yet, using the *ledger's* provenance (the tab that made the
    branch) — never the sweeping machine's. It covers **merged and closed** PRs,
    not just open ones: an orchestrator that merges on green closes the PR within
@@ -431,8 +437,8 @@ whence --audit off    # when you're done validating
 ```
 
 Every real label **change** appends one JSONL line to `~/.config/whence/audit.jsonl`
-with the timestamp, the PR, the **source** (`hook` = live stamp, `sweep:new`,
-`sweep:heal` = self-heal, `manual`), the `agent@host` that made it, and the
+with the timestamp, the PR, the **source** (`hook` = live stamp, `retry` = delayed
+PR appeared, `sweep:new`, `sweep:heal` = self-heal, `manual`), the `agent@host` that made it, and the
 **before → after** labels. A no-op re-stamp writes nothing. `whence --log` renders it:
 
 ```
