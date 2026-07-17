@@ -214,7 +214,7 @@ def clean_title(t: str) -> str:
     return t[i:].strip()
 
 
-def cmux_workspace(ws_id: str) -> str:
+def cmux_workspace(ws_id: str, surface_id: str = "") -> str:
     """The workspace name — ONLY when you gave it a custom title.
 
     cmux auto-titles an unnamed workspace from one of the agent tabs inside it, so
@@ -222,12 +222,32 @@ def cmux_workspace(ws_id: str) -> str:
     worst a DIFFERENT tab's name sitting under a "workspace" label. Unnamed means
     no workspace label; naming a workspace is what opts you into one, and its
     presence then tells you the workspace was named deliberately."""
-    if not ws_id:
+    if not ws_id and not surface_id:
         return ""
     r = sh("cmux", "rpc", "workspace.list")
     if r.returncode == 0:
         try:
-            for w in json.loads(r.stdout).get("workspaces", []):
+            workspaces = json.loads(r.stdout).get("workspaces", [])
+            # Nested shells and agent hooks do not always inherit
+            # CMUX_WORKSPACE_ID, but they do retain CMUX_SURFACE_ID. Recover the
+            # owning workspace from cmux itself instead of silently dropping a
+            # named workspace label. pane.list is scoped by workspace and is the
+            # API that carries the surface membership.
+            if not ws_id and surface_id:
+                for w in workspaces:
+                    panes = sh("cmux", "rpc", "pane.list",
+                               json.dumps({"workspace_id": w.get("id", "")}))
+                    if panes.returncode != 0:
+                        continue
+                    try:
+                        found = any(surface_id in (p.get("surface_ids") or [])
+                                    for p in json.loads(panes.stdout).get("panes", []))
+                    except Exception:
+                        found = False
+                    if found:
+                        ws_id = w.get("id", "")
+                        break
+            for w in workspaces:
                 if w.get("id") == ws_id:
                     if w.get("has_custom_title") and w.get("custom_title"):
                         return clean_title(w["custom_title"])
@@ -357,7 +377,7 @@ def collect(cfg: dict | None = None) -> dict:
     p["_redacted"] = []
     p["agent"] = agent
     p["host"] = host_label()
-    p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""))
+    p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""), surface)
     tab, ref = cmux_tab_title(surface)
     if tab:
         p["tab"] = f"{tab} ({ref})" if ref else tab
@@ -1135,7 +1155,7 @@ def _resolve_cmd_path(raw: str, vars_: dict[str, str], cwd: str | None = None):
     return value if value and os.path.isdir(value) else None
 
 
-def _command_action(cmd: str) -> tuple[bool, bool, str | None]:
+def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, bool, str | None]:
     """Return (creates_pr, pushes, cwd) for the first real action command.
 
     The executable position matters: words passed to ``rg``, ``echo``, ``git
@@ -1143,7 +1163,7 @@ def _command_action(cmd: str) -> tuple[bool, bool, str | None]:
     effective directory at the action itself, before any later diagnostic ``cd``.
     """
     vars_: dict[str, str] = {}
-    cwd = None
+    cwd = initial_cwd
     for tokens in _simple_shell_commands(cmd):
         i = 0
         while i < len(tokens):
@@ -1160,15 +1180,45 @@ def _command_action(cmd: str) -> tuple[bool, bool, str | None]:
             if got:
                 cwd = got
             continue
-        while argv and argv[0] in ("command", "builtin", "nohup"):
-            argv = argv[1:]
-        if argv and argv[0] == "env":
-            argv = argv[1:]
-            while argv and (_ASSIGN_TOKEN_RE.match(argv[0]) or argv[0].startswith("-")):
+        # Peel the wrappers agents actually use around long-running PR commands.
+        # In particular, `nohup bash -lc '... shipyard pr ...'` bypasses the live
+        # shell function, so the PostToolUse parser is the only capture path.
+        while argv:
+            exe = os.path.basename(argv[0])
+            if exe in ("command", "builtin", "nohup", "exec", "setsid", "time"):
                 argv = argv[1:]
+                continue
+            if exe == "env":
+                argv = argv[1:]
+                while argv and (_ASSIGN_TOKEN_RE.match(argv[0]) or argv[0].startswith("-")):
+                    argv = argv[1:]
+                continue
+            if exe == "timeout":
+                argv = argv[1:]
+                while argv and argv[0].startswith("-"):
+                    option = argv.pop(0)
+                    if option in ("-k", "--kill-after", "-s", "--signal") and argv:
+                        argv.pop(0)
+                if argv:                         # duration (e.g. 900 or 2m)
+                    argv = argv[1:]
+                continue
+            break
         if not argv:
             continue
-        exe = os.path.basename(argv[0])
+        raw_exe = argv[0]
+        var = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", raw_exe)
+        if var:
+            raw_exe = vars_.get(var.group(1), raw_exe)
+        exe = os.path.basename(os.path.expanduser(raw_exe))
+        if exe in ("bash", "zsh", "sh", "dash", "ksh"):
+            for j, arg in enumerate(argv[1:], 1):
+                if arg == "-c" or (arg.startswith("-") and "c" in arg[1:]):
+                    if j + 1 < len(argv):
+                        nested = _command_action(argv[j + 1], cwd)
+                        if nested[0] or nested[1]:
+                            return nested
+                    break
+            continue
         if any(arg in ("-h", "--help", "--version", "--dry-run") for arg in argv[1:]):
             continue
         if exe in ("shipyard", "pulp") and len(argv) > 1 and argv[1] == "pr":
@@ -1332,6 +1382,8 @@ def _best_provenance(rec: dict, cfg: dict, body: str = "") -> tuple[dict, str]:
             p["tab"] = f"{tab} ({ref})" if ref else tab
         elif not p.get("tab"):
             p["tab"] = _surface_ref(surf)
+    if surf and not p.get("workspace"):
+        p["workspace"] = cmux_workspace("", surf)
     redact(p, cfg, surf)
     return p, surf
 

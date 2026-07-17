@@ -133,8 +133,25 @@ def main() -> int:
             ("shipyard", f"cd {tmp} && shipyard pr --base main; cd /tmp", (True, True, tmp)),
             ("pulp", f"env PULP_X=1 pulp pr", (True, True, None)),
             ("gh", "command gh pr create --fill", (True, False, None)),
+            ("nested background shell",
+             f"nohup bash -lc 'cd {tmp} && exec shipyard pr --base main' >/tmp/ship.log 2>&1 &",
+             (True, True, tmp)),
+            ("detached nested background shell",
+             f"setsid nohup bash -lc 'cd {tmp} && exec shipyard pr --base main' >/tmp/ship.log 2>&1 &",
+             (True, True, tmp)),
+            ("command in a variable",
+             f"GHAPP=~/.local/bin/ghapp; cd {tmp}; $GHAPP pr create --fill",
+             (True, False, tmp)),
+            ("timeout wrapper",
+             f"cd {tmp}; PULP_SKIP_DIFF_COVER=1 timeout 420 shipyard pr --base main",
+             (True, True, tmp)),
+            ("timeout wrapper with valued options",
+             f"cd {tmp}; timeout --signal TERM --kill-after=5 420 shipyard pr --base main",
+             (True, True, tmp)),
             ("git -C", f"git -C {tmp} push origin HEAD", (False, True, tmp)),
             ("quoted search", 'rg "shipyard pr|git push" whence', (False, False, None)),
+            ("quoted search in nested shell",
+             'bash -lc \'rg "shipyard pr" whence\'', (False, False, None)),
             ("unquoted echo", "echo shipyard pr", (False, False, None)),
             ("git diagnostic", "git log -S 'git push' -- whence", (False, False, None)),
             ("quoted multiline", 'printf "shipyard pr\\ngit push\\n"', (False, False, None)),
@@ -235,6 +252,33 @@ def main() -> int:
         print("FAIL  cmux_workspace('') must be empty")
     else:
         print("ok    cmux_workspace('') is empty")
+
+    # Agent hooks can lose CMUX_WORKSPACE_ID while retaining the stable surface
+    # UUID. Recover a deliberately named workspace from pane membership; do not
+    # invent a label for an auto-titled workspace.
+    ws_list = subprocess.CompletedProcess([], 0, json.dumps({"workspaces": [
+        {"id": "named", "has_custom_title": True, "custom_title": "w1"},
+        {"id": "auto", "has_custom_title": False, "custom_title": None},
+    ]}), "")
+    named_panes = subprocess.CompletedProcess([], 0, json.dumps({"panes": [
+        {"surface_ids": ["SURFACE-NAMED"]}
+    ]}), "")
+    auto_panes = subprocess.CompletedProcess([], 0, json.dumps({"panes": [
+        {"surface_ids": ["SURFACE-AUTO"]}
+    ]}), "")
+    def fake_cmux_workspace(*args, **kwargs):
+        if args[2] == "workspace.list":
+            return ws_list
+        params = json.loads(args[3])
+        return named_panes if params["workspace_id"] == "named" else auto_panes
+    with mock.patch.object(w, "sh", side_effect=fake_cmux_workspace):
+        recovered_named = w.cmux_workspace("", "SURFACE-NAMED")
+        recovered_auto = w.cmux_workspace("", "SURFACE-AUTO")
+    if recovered_named != "w1" or recovered_auto != "":
+        failed += 1
+        print(f"FAIL  workspace recovery: named={recovered_named!r} auto={recovered_auto!r}")
+    else:
+        print("ok    workspace recovery: surface membership restores named workspace only")
 
     # sanitize_path: strip the private home prefix, keep the folder; scrub denied.
     import os as _os
