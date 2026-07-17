@@ -189,7 +189,10 @@ For the long-running orchestrators (`shipyard pr` and `pulp pr`), the wrapper
 also captures the repo, branch, exact HEAD, and live provenance **before** the
 real command starts, then launches the bounded targeted retry in parallel. The
 PR can therefore be stamped as soon as GitHub exposes it while the orchestrator
-is still building or waiting to merge. The command's exit status is unchanged.
+is still building or waiting to merge. When the command finally returns, the
+wrapper sweeps from that captured ledger record instead of recollecting weaker
+shell provenance (for example `agent=unknown`). The command's exit status is
+unchanged.
 
 Its limit, honestly: it only fires in shells that load your init file, so it
 catches PRs you open in a normal terminal and in agents whose command shell

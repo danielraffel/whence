@@ -546,15 +546,17 @@ def _hook_file_text() -> tuple[str, list]:
         "# `command` is required to reach this script rather than the builtin.",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
         "__whence_preexec() { command whence --pre-exec \"$PWD\" >/dev/null 2>&1 || true; }",
+        "__whence_sweep() { command whence --sweep >/dev/null 2>&1 || true; }",
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
     for tool, trig in tools:
         active = f"{trig} && __whence_will_act \"$@\""
         before = f"if {active}; then __whence_preexec; fi; " if tool in PREEXEC_TOOLS else ""
+        after = "__whence_sweep" if tool in PREEXEC_TOOLS else "__whence_stamp"
         lines.append(
             f'{tool}() {{ {before}command {tool} "$@"; __whence_rc=$?; '
-            f"if {active}; then __whence_stamp; fi; return $__whence_rc; }}")
+            f"if {active}; then {after}; fi; return $__whence_rc; }}")
     return "\n".join(lines) + "\n", [t for t, _ in tools]
 
 
