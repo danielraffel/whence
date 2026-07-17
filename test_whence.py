@@ -466,7 +466,13 @@ def main() -> int:
         hook_file = root / "hook.sh"
         hook_file.write_text(hook_text)
         env = dict(**__import__("os").environ)
-        env.update({"PATH": f"{bindir}:{env.get('PATH', '')}", "WHENCE_FAKE_STATE": str(state)})
+        # Isolate zsh startup from the machine's real ~/.zshenv. Once Whence is
+        # installed, that file sources the live hook and may rewrite PATH ahead
+        # of our fake binaries, turning this hermetic lifecycle test into a real
+        # network sweep (and a timeout). ZDOTDIR keeps the production hook out;
+        # the generated hook under test is sourced explicitly below.
+        env.update({"PATH": f"{bindir}:{env.get('PATH', '')}",
+                    "WHENCE_FAKE_STATE": str(state), "ZDOTDIR": str(root)})
         driven = subprocess.run(
             ["zsh", "-fc", f'source "{hook_file}"; shipyard pr'],
             env=env, capture_output=True, text=True, timeout=5,
@@ -495,6 +501,21 @@ def main() -> int:
             print(f"FAIL  wrapper diagnostic: rc={help_run.returncode} state={[p.name for p in state.iterdir()]}")
         else:
             print("ok    shell wrapper: help diagnostic does not capture or stamp")
+        for name in ("help", "preexec", "stamped", "pr-created", "started", "swept", "recollected"):
+            try: (state / name).unlink()
+            except FileNotFoundError: pass
+        bash_run = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-c", f'source "{hook_file}"; shipyard pr'],
+            env=env, capture_output=True, text=True, timeout=5,
+        )
+        bash_ok = (bash_run.returncode == 0 and (state / "preexec").exists()
+                   and (state / "stamped").exists() and (state / "swept").exists()
+                   and not (state / "recollected").exists())
+        if not bash_ok:
+            failed += 1
+            print(f"FAIL  bash wrapper: rc={bash_run.returncode} state={[p.name for p in state.iterdir()]}")
+        else:
+            print("ok    shell wrapper: absolute-path bypass works in zsh and bash")
 
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0

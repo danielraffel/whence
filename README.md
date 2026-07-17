@@ -182,8 +182,9 @@ This wraps the *command that opens the PR* with a small **shell function**
 branch's PR right after. It covers **every common way a PR gets opened** —
 `gh pr create`, `ghapp pr create`, `shipyard pr`, `pulp pr` (whichever you have)
 — with no per-agent config and no Shipyard dependency. A function beats `PATH`
-(so a `.zshrc` PATH reorder can't shadow it) and calls the real tool via
-`command` (no recursion, no double-stamp).
+(so a `.zshrc` PATH reorder can't shadow it). The hook resolves each real
+executable before defining its same-named function, then calls that absolute
+path (no zsh recursion, no double-stamp).
 
 For the long-running orchestrators (`shipyard pr` and `pulp pr`), the wrapper
 also captures the repo, branch, exact HEAD, and live provenance **before** the

@@ -526,9 +526,10 @@ def _hook_source_block() -> str:
 def _hook_file_text() -> tuple[str, list]:
     """Build the sourced functions file. A shell FUNCTION beats PATH lookup in
     EVERY shell mode (interactive or not), so — unlike a PATH-dir shim — it can't
-    be shadowed by a later .zshrc reordering PATH. Each function runs the REAL
-    tool via `command` (which skips functions → no recursion, and no double-stamp
-    when one tool internally spawns another), then stamps best-effort.
+    be shadowed by a later .zshrc reordering PATH. Resolve each REAL executable
+    before defining the same-named function, then invoke that absolute path. This
+    is required on zsh: ``command shipyard`` inside ``shipyard()`` recurses rather
+    than bypassing the function as POSIX-shell intuition suggests.
 
     Generate every supported wrapper deterministically. Deployment runs over a
     non-interactive SSH shell whose PATH may omit user-installed tools even
@@ -540,22 +541,28 @@ def _hook_file_text() -> tuple[str, list]:
     lines = [
         "# whence hook — sourced by your shell init. Thin wrappers around the",
         "# PR-opening commands that stamp the branch's PR right after it opens.",
-        "# A function beats PATH, so this fires regardless of PATH order; `command`",
-        "# runs the real tool (no recursion); the stamp never changes the exit code.",
+        "# A function beats PATH, so this fires regardless of PATH order; each real",
+        "# executable is resolved before its same-named function exists (no recursion).",
         "# NB: `command whence` — plain `whence` is a zsh BUILTIN (like `which`), so",
         "# `command` is required to reach this script rather than the builtin.",
+        "__whence_real() { if [ -n \"${ZSH_VERSION:-}\" ]; then whence -p \"$1\"; "
+        "else type -P \"$1\"; fi 2>/dev/null; }",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
         "__whence_preexec() { command whence --pre-exec \"$PWD\" >/dev/null 2>&1 || true; }",
         "__whence_sweep() { command whence --sweep >/dev/null 2>&1 || true; }",
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
+    for tool, _trig in tools:
+        lines.append(f'__whence_{tool}_bin="$(__whence_real {tool})"')
     for tool, trig in tools:
-        active = f"{trig} && __whence_will_act \"$@\""
+        binary = f"$__whence_{tool}_bin"
+        active = f'[ -n "{binary}" ] && {trig} && __whence_will_act "$@"'
         before = f"if {active}; then __whence_preexec; fi; " if tool in PREEXEC_TOOLS else ""
         after = "__whence_sweep" if tool in PREEXEC_TOOLS else "__whence_stamp"
         lines.append(
-            f'{tool}() {{ {before}command {tool} "$@"; __whence_rc=$?; '
+            f'{tool}() {{ if [ -z "{binary}" ]; then echo "{tool}: command not found" >&2; return 127; fi; '
+            f'{before}"{binary}" "$@"; __whence_rc=$?; '
             f"if {active}; then {after}; fi; return $__whence_rc; }}")
     return "\n".join(lines) + "\n", [t for t, _ in tools]
 
