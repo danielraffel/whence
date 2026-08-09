@@ -21,6 +21,7 @@ Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
 import argparse, json, os, re, shlex, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
@@ -28,7 +29,7 @@ CFG_DIR = pathlib.Path.home() / ".config/whence"
 # Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
 # `workspace` = cmux workspace name; `tab` = the per-tab (surface) title you
 # navigate by — the one you need most to find your way back.
-FIELDS = ["agent", "host", "workspace", "tab", "path", "session", "resume", "url", "jump", "relaunch", "stamped"]
+FIELDS = ["agent", "host", "workspace", "tab", "path", "session", "resume", "url", "goals", "jump", "relaunch", "stamped"]
 LABEL_FIELDS = ["agent", "host", "workspace", "tab"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df"}
 
@@ -367,6 +368,30 @@ def sanitize_path(path: str, cfg: dict) -> str:
     return pth
 
 
+def normalize_goals(values) -> str:
+    """Return unique, publishable HTTP(S) goal-document URLs, one per line.
+
+    A newline-delimited string keeps the provenance/ledger schema simple while
+    still supporting several planning documents. Invalid or whitespace-bearing
+    values are ignored rather than published into a PR body.
+    """
+    if isinstance(values, str):
+        values = values.splitlines()
+    out = []
+    for raw in values or []:
+        value = str(raw or "").strip()
+        try:
+            parsed = urllib.parse.urlsplit(value)
+        except ValueError:
+            continue
+        if (not value or any(ch.isspace() or ch in "<>" for ch in value)
+                or parsed.scheme not in ("http", "https") or not parsed.netloc
+                or value in out):
+            continue
+        out.append(value)
+    return "\n".join(out)
+
+
 def collect(cfg: dict | None = None) -> dict:
     agent = os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
@@ -388,6 +413,7 @@ def collect(cfg: dict | None = None) -> dict:
         p["tab"] = _surface_ref(surface)
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
+    p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
 
     restore = ""
     if surface:
@@ -459,11 +485,12 @@ def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
 
 def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     hide = cfg["hide"]
-    # Carry the agent + tab that were actually stamped, so the sweep can tell a
-    # good stamp from a degraded one (blank/ref tab, unknown agent) without
-    # re-deriving it from the labels.
+    # Carry identity plus durable goal links that were actually stamped, so the
+    # sweep can heal degraded identity or a missing goal without re-deriving
+    # either from GitHub's labels.
     tag = json.dumps({"labels": label_names,
-                      "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", "")}},
+                      "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", ""),
+                               "goals": p.get("goals", "")}},
                      ensure_ascii=False)
     def cell(v):                              # keep a value from breaking the table
         return (v or "").replace("|", "\\|").replace("\n", " ")
@@ -472,9 +499,13 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     trows = []
     for f, lbl, code in [("agent", "Agent", True), ("host", "Machine", True),
                          ("workspace", "Workspace", True), ("tab", "Tab", False),
-                         ("path", "Directory", True), ("session", "Session", True)]:
+                         ("path", "Directory", True), ("session", "Session", True),
+                         ("goals", "Goal docs", False)]:
         if visible(f, p, hide):
-            val = f"`{cell(p[f])}`" if code else cell(p[f])
+            if f == "goals":
+                val = "<br>".join(f"<{cell(url)}>" for url in p[f].splitlines())
+            else:
+                val = f"`{cell(p[f])}`" if code else cell(p[f])
             trows.append(f"| **{lbl}** | {val} |")
     table = ("|  |  |\n|:--|:--|\n" + "\n".join(trows)) if trows else ""
     # the commands you actually copy: fenced blocks so GitHub renders a copy button
@@ -999,7 +1030,9 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
         finally:
             try: os.unlink(tmpname)
             except OSError: pass
-    after = {"labels": names, "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", "")}}
+    after = {"labels": names,
+             "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", ""),
+                      "goals": p.get("goals", "")}}
     if before != after:                       # only log a real change, not a no-op re-stamp
         _audit(cfg, {"ts": datetime.datetime.now(datetime.timezone.utc)
                             .strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1348,14 +1381,18 @@ def _prov_good(prov: dict, cfg: dict) -> bool:
 
 def _prov_better(best: dict, cur: dict, cfg: dict) -> bool:
     """`best` is worth re-stamping over `cur` only when it supplies something cur
-    lacks — a named tab where cur has none/a ref, or a known agent where cur has
-    `unknown`. Never fires for a mere rename (named -> different name), so a good
-    stamp is frozen, not chased."""
+    lacks — a named tab where cur has none/a ref, a known agent where cur has
+    `unknown`, or a goal URL absent from the existing stamp. Never fires for a
+    mere rename (named -> different name), so a good stamp is frozen, not chased."""
     def tab_real(pr): 
         t = (pr.get("tab") or "").strip()
         return bool(t) and not _is_ref_tab(t, cfg)
     def agent_real(pr): return (pr.get("agent") or "") not in ("", "unknown")
-    return (tab_real(best) and not tab_real(cur)) or (agent_real(best) and not agent_real(cur))
+    best_goals = set(normalize_goals(best.get("goals", "")).splitlines())
+    cur_goals = set(normalize_goals(cur.get("goals", "")).splitlines())
+    return ((tab_real(best) and not tab_real(cur))
+            or (agent_real(best) and not agent_real(cur))
+            or bool(best_goals - cur_goals))
 
 
 _SURF_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -1425,14 +1462,16 @@ def sweep(cfg: dict) -> int:
                 n += 1
                 rec["done"] = _prov_good(best, cfg)
                 continue
-            if prior_labels(body) == best_labels:      # already matches best — nothing to gain
+            cur = prior_prov(body)
+            better = _prov_better(best, cur, cfg)
+            if prior_labels(body) == best_labels and not better:
+                # Labels and durable provenance already match — nothing to gain.
                 rec["done"] = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
                 continue
-            cur = prior_prov(body)
-            if _prov_good(cur, cfg):                   # good stamp — freeze, don't chase renames
+            if _prov_good(cur, cfg) and not better:    # good stamp — freeze, don't chase renames
                 rec["done"] = True
                 continue
-            if _prov_better(best, cur, cfg):           # degraded, and best is an upgrade — heal it
+            if better:                                 # missing identity or goal provenance — heal it
                 apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug, source="sweep:heal")
                 n += 1
                 rec["done"] = _prov_good(best, cfg)
@@ -1810,6 +1849,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Stamp a PR with agent/session/machine/tab provenance.")
     ap.add_argument("--pr"); ap.add_argument("--branch")
     ap.add_argument("--hide", help="comma list of fields to omit this run: " + ",".join(FIELDS))
+    ap.add_argument("--goal", action="append", default=[], metavar="URL",
+                    help="durable goal/planning document URL (repeatable; also WHENCE_GOALS, one per line)")
     ap.add_argument("--no-footer", action="store_true", help="don't post the PR-description footer")
     ap.add_argument("--no-labels", action="store_true", help="don't post the queue labels")
     ap.add_argument("--apply", action="store_true", help="mutate the PR (default: dry-run)")
@@ -1998,6 +2039,8 @@ def main() -> int:
         return 0
 
     p = collect(cfg)
+    if args.goal:
+        p["goals"] = normalize_goals([*p.get("goals", "").splitlines(), *args.goal])
     if args.hook:
         p["path"] = sanitize_path(_cmd_cwd(hook_cmd) or hook_cwd or os.getcwd(), cfg)
         # Prefer the hook payload's identity over env (which can leak across
