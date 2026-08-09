@@ -67,7 +67,8 @@ current name. The denylist is the one thing that always wins, at every stamp.
 - **A visible "🔎 Provenance" footer** in the PR body with the **session id**,
   the exact **resume command** (`claude --resume …` / `codex resume …`), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
-  (`cmux surface focus …`).
+  (`cmux surface focus …`). It can also link one or more committed **goal or
+  planning documents**, so the implementation remains traceable to its intent.
 
 ![What whence adds: color-coded queue labels and a provenance footer that links back to the session](docs/hero.png)
 
@@ -397,6 +398,23 @@ it shorter or longer to taste.
 A field set false disappears from **both** the labels and the footer. Prefer a
 one-off? `--hide host,agent`, `--no-footer`, `--no-labels`, or
 `WHENCE_HIDE=url,session` do the same without editing the file.
+
+Attach durable goal documents with a repeatable flag when stamping manually:
+
+```bash
+whence --pr 1234 --goal https://github.com/acme/planning/blob/main/goal.md --apply
+```
+
+For `shipyard pr`, `pulp pr`, or another command captured by the automatic hook,
+set `WHENCE_GOALS` to one URL per line. The value is captured with the branch and
+survives the targeted retry/ledger sweep:
+
+```bash
+WHENCE_GOALS=https://github.com/acme/planning/blob/main/goal.md shipyard pr
+```
+
+Only absolute HTTP(S) URLs are published. Prefer a committed default-branch URL
+over a local path or mutable draft.
 
 **Colors:** any GitHub label hex, per category. **Machine label:**
 `WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:** set

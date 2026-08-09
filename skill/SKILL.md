@@ -30,6 +30,16 @@ python3 /path/to/whence --apply
 python3 /path/to/whence --pr <number> --apply
 ```
 
+If the work has a committed goal or planning document, include its durable URL:
+
+```bash
+python3 /path/to/whence --pr <number> \
+  --goal https://github.com/owner/planning/blob/main/path/to/goal.md --apply
+```
+
+Repeat `--goal` for multiple documents. Prefer a committed default-branch URL;
+never publish a local filesystem path.
+
 It reads the environment (cmux + agent session vars) and the host label file, so
 there is nothing to pass — just run it in the same shell/session that opened the
 PR. It is idempotent; re-running replaces the prior stamp.

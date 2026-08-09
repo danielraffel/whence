@@ -234,16 +234,19 @@ def main() -> int:
         else:
             print(f"ok    _prov_good: {name}")
 
-    # _prov_better upgrades a degraded stamp but never chases a rename.
+    # _prov_better upgrades degraded/missing provenance but never chases a rename.
     better = w._prov_better({"tab": "Real name", "agent": "codex"},
                             {"tab": "surface:26", "agent": "unknown"}, healcfg)
     rename = w._prov_better({"tab": "New name", "agent": "claude"},
                             {"tab": "Old name", "agent": "claude"}, healcfg)
-    if not better or rename:
+    goal_upgrade = w._prov_better(
+        {"tab": "Old name", "agent": "claude", "goals": "https://example.com/goal"},
+        {"tab": "Old name", "agent": "claude", "goals": ""}, healcfg)
+    if not better or rename or not goal_upgrade:
         failed += 1
-        print(f"FAIL  _prov_better: upgrade={better} (want True)  rename={rename} (want False)")
+        print(f"FAIL  _prov_better: upgrade={better} rename={rename} goal={goal_upgrade}")
     else:
-        print("ok    _prov_better: heals degraded, ignores renames")
+        print("ok    _prov_better: heals degraded/goals, ignores renames")
 
     # A workspace cmux auto-titled is just some tab's name wearing a workspace
     # label — the bug that put two tab-looking labels on one PR. No id, no label.
@@ -303,6 +306,27 @@ def main() -> int:
         failed+=1; print("FAIL  footer table/copy/directory not rendered")
     else: print("ok    footer: table + fenced copy blocks + directory")
 
+    # Goal documents are durable provenance, not transient PR-body prose. Keep
+    # only safe HTTP(S) URLs, deduplicate them, and render each as a link.
+    goals = w.normalize_goals([
+        "https://github.com/acme/planning/blob/main/goal.md",
+        "https://github.com/acme/planning/blob/main/goal.md",
+        "javascript:alert(1)",
+        "https://example.com/second goal",
+        "https://example.com/second",
+    ])
+    gp = {f: "" for f in w.FIELDS}
+    gp.update({"agent": "codex", "goals": goals, "stamped": "t"})
+    gft = w.footer(gp, {"hide": set()}, ["codex"])
+    if (goals.splitlines() != ["https://github.com/acme/planning/blob/main/goal.md",
+                               "https://example.com/second"]
+            or "| **Goal docs** | <https://github.com/acme/planning/blob/main/goal.md><br><https://example.com/second> |" not in gft
+            or "javascript:" in gft):
+        failed += 1
+        print(f"FAIL  goals: normalized={goals!r} footer={gft!r}")
+    else:
+        print("ok    goals: safe durable URLs normalized + linked in provenance")
+
     # order_labels: prefixes force the queue's ALPHABETICAL sort into role order.
     lp={f:"" for f in w.FIELDS}; lp.update({"agent":"claude","host":"m5","workspace":"w1","tab":"Fix caret"})
     lbase={"hide":set(),"colors":w.DEFAULT_COLORS,"label_maxlen":24}
@@ -317,7 +341,8 @@ def main() -> int:
     # global sweep. PR #6195 was ledgered 29 seconds before GitHub created it.
     key = "danielraffel/pulp#fix/deferred"
     rec = {"p": {f: "" for f in w.FIELDS}, "ts": 1784270822, "head": "new-head"}
-    rec["p"].update({"agent": "claude", "host": "m3", "tab": "Deferred PR"})
+    rec["p"].update({"agent": "claude", "host": "m3", "tab": "Deferred PR",
+                     "goals": "https://github.com/acme/planning/blob/main/goal.md"})
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
         with mock.patch.object(w, "LEDGER", ledger_path), \
@@ -326,13 +351,16 @@ def main() -> int:
                 "", rec["p"], "danielraffel/pulp", "fix/deferred",
                 "origin/main", str(pathlib.Path.cwd()),
             )
-            recorded_head = json.loads(ledger_path.read_text())[key]["head"]
+            recorded = json.loads(ledger_path.read_text())[key]
+            recorded_head = recorded["head"]
+            recorded_goal = recorded["p"].get("goals")
     expected_head = subprocess.run(
         ["git", "rev-parse", "origin/main"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    if recorded_key != key or recorded_head != expected_head:
+    if (recorded_key != key or recorded_head != expected_head
+            or recorded_goal != rec["p"]["goals"]):
         failed += 1
-        print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r}")
+        print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
         print("ok    ledger capture: deferred retry receives branch + HEAD identity")
 
