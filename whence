@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """whence — stamp a PR with the provenance of the agent that made it.
 
-Attaches, at PR-open time: prefix-free color-coded labels (agent, machine, cmux
-tab) and a visible footer (session id, resume/relaunch commands, restore URL,
+Attaches, at PR-open time: color-coded labels (agent, machine, cmux tab, route)
+and a visible footer (session id, resume/relaunch commands, restore URL,
 jump-to-tab). Works for ANY agent cmux launches — the resume/relaunch handles
 come from cmux's own per-tab session-restore, so no agent-specific config is
 needed. Every field is toggleable via config.
@@ -15,7 +15,7 @@ Usage:
 Config (all optional, ~/.config/whence/config.json):
   {
     "hide":   ["url"],                 # fields to omit (labels + footer rows)
-    "colors": {"agent":"1f6feb", "host":"1a7f37", "tab":"8250df"}
+    "colors": {"agent":"1f6feb", "host":"1a7f37", "tab":"8250df", "route":"d4a72c"}
   }
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
@@ -26,12 +26,16 @@ import urllib.parse
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
 CFG_DIR = pathlib.Path.home() / ".config/whence"
 
-# Fields, in footer order. `agent`/`host`/`tab` are also the queue labels.
+# Fields, in footer order. `agent`/`host`/`tab`/`route` are also queue labels.
 # `workspace` = cmux workspace name; `tab` = the per-tab (surface) title you
 # navigate by — the one you need most to find your way back.
-FIELDS = ["agent", "host", "workspace", "tab", "path", "session", "resume", "url", "goals", "jump", "relaunch", "stamped"]
-LABEL_FIELDS = ["agent", "host", "workspace", "tab"]
-DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df"}
+FIELDS = ["agent", "host", "workspace", "tab", "workstream", "launcher", "route",
+          "router", "origin_state", "path", "session", "resume", "url", "goals",
+          "jump", "relaunch", "stamped"]
+LABEL_FIELDS = ["agent", "host", "workspace", "tab", "route"]
+DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700",
+                  "tab": "8250df", "route": "d4a72c"}
+NUMBERED_LABEL_RE = re.compile(r"^([1-5])·")
 
 # Friendly resume syntax for agents whose CLI we've verified. ANY other agent
 # still works via the cmux-sourced `relaunch` command below — this is just for a
@@ -127,8 +131,8 @@ DEFAULT_CONFIG = {
     # (who/source/when + before -> after). Off by default; a debug switch you flip
     # on to validate behavior, then off. `whence --log` reads it back.
     "audit_log": False,
-    # Prefix labels with 1·/2·/3·/4· so the PR-list view (which sorts chips
-    # alphabetically) renders them agent -> host -> workspace -> tab. The footer
+    # Prefix labels with 1·/2·/3·/4·/5· so the PR-list view (which sorts chips
+    # alphabetically) renders agent -> host -> workspace -> tab -> route. The footer
     # table already shows this order and stays clean; only the chips get the prefix.
     "order_labels": False,
 }
@@ -392,11 +396,30 @@ def normalize_goals(values) -> str:
     return "\n".join(out)
 
 
+def stable_identifier(value: str, default: str = "", maxlen: int = 80) -> str:
+    """Return a publishable opaque identifier, never a URL/path/account string.
+
+    Workstream, launcher, route, and router values cross a public PR boundary.
+    Accept only compact machine identifiers so a misconfigured environment cannot
+    leak a credential, email address, private path, query string, or endpoint.
+    """
+    value = str(value or "").strip()
+    if (len(value) > maxlen
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", value)):
+        return default
+    return value
+
+
 def collect(cfg: dict | None = None) -> dict:
-    agent = os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
+    explicit_agent = stable_identifier(os.environ.get("WHENCE_AGENT", ""))
+    agent = explicit_agent or os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
         "codex" if os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") else
-        "unknown")
+        "unresolved")
+    origin_kind = stable_identifier(os.environ.get("WHENCE_ORIGIN_KIND", ""))
+    if origin_kind in ("automation", "external", "unresolved"):
+        agent = origin_kind
+    agent = stable_identifier(agent, "unresolved")
     surface = os.environ.get("CMUX_SURFACE_ID", "")
     p = {f: "" for f in FIELDS}
     p["_redacted"] = []
@@ -406,14 +429,24 @@ def collect(cfg: dict | None = None) -> dict:
     tab, ref = cmux_tab_title(surface)
     if tab:
         p["tab"] = f"{tab} ({ref})" if ref else tab
+        p["origin_state"] = (origin_kind if origin_kind in ("automation", "external")
+                             else "known")
     else:
         # cmux shows only a status glyph (🏃/spinner) while the agent is busy, which
         # cleans to empty exactly when a PR is opened. A name-free ref beats a blank
         # label, and the sweep upgrades it to the real name once the title settles.
         p["tab"] = _surface_ref(surface)
+        p["origin_state"] = (origin_kind if origin_kind in ("automation", "external")
+                             else "lookup_failed" if surface else "unnamed")
+    if agent == "unresolved":
+        p["origin_state"] = "unresolved"
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
     p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
+    p["workstream"] = stable_identifier(os.environ.get("WHENCE_WORKSTREAM_ID", ""))
+    p["launcher"] = stable_identifier(os.environ.get("WHENCE_LAUNCHER", ""), "unresolved")
+    p["route"] = stable_identifier(os.environ.get("WHENCE_ROUTE", ""), "unresolved")
+    p["router"] = stable_identifier(os.environ.get("WHENCE_ROUTER", ""))
 
     restore = ""
     if surface:
@@ -478,7 +511,7 @@ def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
         if visible(f, p, cfg["hide"]):
             name = _clip(p[f], cfg.get("label_maxlen", 24))
             if order:
-                name = f"{i + 1}\u00b7{name}"          # 1·  2·  3·  4·
+                name = f"{i + 1}\u00b7{name}"          # 1·  2·  3·  4·  5·
             out.append((name, cfg["colors"].get(f, "ededed")))
     return out
 
@@ -489,8 +522,9 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     # sweep can heal degraded identity or a missing goal without re-deriving
     # either from GitHub's labels.
     tag = json.dumps({"labels": label_names,
-                      "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", ""),
-                               "goals": p.get("goals", "")}},
+                      "prov": {f: p.get(f, "") for f in
+                               ("agent", "tab", "workstream", "launcher", "route",
+                                "router", "origin_state", "goals")}},
                      ensure_ascii=False)
     def cell(v):                              # keep a value from breaking the table
         return (v or "").replace("|", "\\|").replace("\n", " ")
@@ -499,6 +533,9 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     trows = []
     for f, lbl, code in [("agent", "Agent", True), ("host", "Machine", True),
                          ("workspace", "Workspace", True), ("tab", "Tab", False),
+                         ("workstream", "Workstream", True),
+                         ("launcher", "Launcher", True), ("route", "Route", True),
+                         ("router", "Router", True), ("origin_state", "Origin state", True),
                          ("path", "Directory", True), ("session", "Session", True),
                          ("goals", "Goal docs", False)]:
         if visible(f, p, hide):
@@ -956,6 +993,23 @@ def prior_prov(body: str) -> dict:
     return _prior_tag(body).get("prov", {})
 
 
+def stale_labels(existing: list[str], prior: list[str], keep: set[str], cfg: dict) -> set[str]:
+    """Whence-owned labels that must be removed before desired labels are added."""
+    numbered = {label for label in existing
+                if cfg.get("order_labels") and NUMBERED_LABEL_RE.match(label)}
+    legacy = {label for label in existing if label and label.startswith(OLD_PREFIXES)}
+    return (set(prior) | numbered | legacy) - keep
+
+
+def numbered_labels_converged(existing: list[str], desired: set[str], cfg: dict) -> bool:
+    """Whether every Whence-owned numbered class has exactly its desired value."""
+    if not cfg.get("order_labels"):
+        return True
+    actual = {label for label in existing if NUMBERED_LABEL_RE.match(label)}
+    expected = {label for label in desired if NUMBERED_LABEL_RE.match(label)}
+    return actual == expected
+
+
 def _now_epoch() -> int:
     return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
@@ -1013,13 +1067,34 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     before = {"labels": prior_labels(body), "prov": prior_prov(body)}
     keep = set(names)
     existing = sh(GH, "pr", "view", pr, *R, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
-    stale = (set(prior_labels(body)) | {l for l in existing if l and l.startswith(OLD_PREFIXES)}) - keep
+    # In canonical numbered mode each prefix is a Whence-owned class. Remove
+    # every old member of all five classes before adding the desired member, so
+    # stale/duplicate values converge even if an older footer forgot to list one.
+    stale = stale_labels(existing, prior_labels(body), keep, cfg)
     for s in sorted(x for x in stale if x):
         sh(GH, "pr", "edit", pr, *R, "--remove-label", s)
     for n, c in labels:
         sh(GH, "label", "create", n, *R, "--color", c, "--force")
     if names:
         sh(GH, "pr", "edit", pr, *R, *sum([["--add-label", n] for n in names], []))
+    # A successful-looking mutation is not proof. Re-read the numbered classes,
+    # correct once, and fail visibly if GitHub still has a duplicate/stale value.
+    # The hook wrapper absorbs this failure, while the ledger keeps the PR
+    # retryable; manual/controller calls receive a non-successful run.
+    if cfg.get("order_labels"):
+        current = sh(GH, "pr", "view", pr, *R, "--json", "labels",
+                     "-q", ".labels[].name").stdout.splitlines()
+        if not numbered_labels_converged(current, keep, cfg):
+            for old in sorted(stale_labels(current, [], keep, cfg)):
+                sh(GH, "pr", "edit", pr, *R, "--remove-label", old)
+            if names:
+                sh(GH, "pr", "edit", pr, *R,
+                   *sum([["--add-label", n] for n in names], []))
+            current = sh(GH, "pr", "view", pr, *R, "--json", "labels",
+                         "-q", ".labels[].name").stdout.splitlines()
+            if not numbered_labels_converged(current, keep, cfg):
+                raise RuntimeError(
+                    f"whence: PR #{pr} numbered labels did not converge: {current!r}")
     stripped = MARK_RE.sub("", body).rstrip()
     newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
     if newbody != body:
@@ -1031,8 +1106,9 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
             try: os.unlink(tmpname)
             except OSError: pass
     after = {"labels": names,
-             "prov": {"agent": p.get("agent", ""), "tab": p.get("tab", ""),
-                      "goals": p.get("goals", "")}}
+             "prov": {f: p.get(f, "") for f in
+                      ("agent", "tab", "workstream", "launcher", "route", "router",
+                       "origin_state", "goals")}}
     if before != after:                       # only log a real change, not a no-op re-stamp
         _audit(cfg, {"ts": datetime.datetime.now(datetime.timezone.utc)
                             .strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1376,23 +1452,35 @@ def _prov_good(prov: dict, cfg: dict) -> bool:
     agent. Anything less is degraded and stays eligible for healing."""
     tab = (prov.get("tab") or "").strip()
     agent = (prov.get("agent") or "").strip()
-    return bool(tab) and not _is_ref_tab(tab, cfg) and agent not in ("", "unknown")
+    state = (prov.get("origin_state") or "").strip()
+    if state in ("automation", "external"):
+        return agent == state
+    return (bool(tab) and not _is_ref_tab(tab, cfg)
+            and agent not in ("", "unknown", "unresolved") and state == "known")
 
 
 def _prov_better(best: dict, cur: dict, cfg: dict) -> bool:
     """`best` is worth re-stamping over `cur` only when it supplies something cur
     lacks — a named tab where cur has none/a ref, a known agent where cur has
-    `unknown`, or a goal URL absent from the existing stamp. Never fires for a
+    `unknown`/`unresolved`, explicit route context changed, or a goal URL absent
+    from the existing stamp. Never fires for a
     mere rename (named -> different name), so a good stamp is frozen, not chased."""
     def tab_real(pr): 
         t = (pr.get("tab") or "").strip()
         return bool(t) and not _is_ref_tab(t, cfg)
-    def agent_real(pr): return (pr.get("agent") or "") not in ("", "unknown")
+    def agent_real(pr): return (pr.get("agent") or "") not in ("", "unknown", "unresolved")
     best_goals = set(normalize_goals(best.get("goals", "")).splitlines())
     cur_goals = set(normalize_goals(cur.get("goals", "")).splitlines())
+    def missing(value): return (value or "") in ("", "unknown", "unresolved")
+    explicit = ("workstream", "launcher", "route", "router")
+    state_rank = {"": 0, "unresolved": 0, "unnamed": 1, "lookup_failed": 1,
+                  "known": 2, "automation": 2, "external": 2}
     return ((tab_real(best) and not tab_real(cur))
             or (agent_real(best) and not agent_real(cur))
-            or bool(best_goals - cur_goals))
+            or bool(best_goals - cur_goals)
+            or any(not missing(best.get(f)) and missing(cur.get(f)) for f in explicit)
+            or state_rank.get(best.get("origin_state", ""), 0)
+               > state_rank.get(cur.get("origin_state", ""), 0))
 
 
 _SURF_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -1430,7 +1518,7 @@ def sweep(cfg: dict) -> int:
 
     Two jobs in one pass:
     - unstamped PR  -> stamp it from the best provenance available now.
-    - stamped-but-degraded PR (blank/ref tab, or `unknown` agent) -> re-stamp when
+    - stamped-but-degraded PR (blank/ref tab, or unresolved agent) -> re-stamp when
       the tab has since settled to a real name (re-read live) or the ledger holds
       better data. A GOOD stamp is frozen — a rename is never chased.
 
@@ -1873,7 +1961,7 @@ def main() -> int:
     ap.add_argument("--gc-labels", metavar="OWNER/REPO",
                     help="delete repo-level labels that trip the denylist")
     ap.add_argument("--reorder-labels", metavar="OWNER/REPO",
-                    help="force open-PR label chips into agent/host/workspace/tab order")
+                    help="force open-PR label chips into agent/host/workspace/tab/route order")
     ap.add_argument("--log", nargs="?", type=int, const=20, metavar="N",
                     help="show the last N audit entries (label changes; default 20)")
     ap.add_argument("--audit", choices=("on", "off"),
@@ -2046,8 +2134,10 @@ def main() -> int:
         # Prefer the hook payload's identity over env (which can leak across
         # sessions): the session id is authoritative; use the transcript's agent
         # only when env couldn't name one. Keep resume consistent with both.
-        if hook_agent and p["agent"] in ("", "unknown"):
+        if hook_agent and p["agent"] in ("", "unknown", "unresolved"):
             p["agent"] = hook_agent
+            if p.get("origin_state") == "unresolved":
+                p["origin_state"] = "known" if p.get("tab") else "unnamed"
         if hook_sid:
             p["session"] = hook_sid
         if p["agent"] in KNOWN_RESUME and p["session"]:

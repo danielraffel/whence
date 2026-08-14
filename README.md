@@ -69,6 +69,9 @@ current name. The denylist is the one thing that always wins, at every stamp.
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
   (`cmux surface focus …`). It can also link one or more committed **goal or
   planning documents**, so the implementation remains traceable to its intent.
+  Launchers can also stamp a stable **workstream**, **launcher**, **route**, and
+  **router**. Agent identity stays separate from transport, so `codex` through
+  `subrouter` on `m3` is not confused with a different kind of agent.
 
 ![What whence adds: color-coded queue labels and a provenance footer that links back to the session](docs/hero.png)
 
@@ -82,10 +85,12 @@ attached to the PR:
 
 | Fact | Where it comes from |
 |------|---------------------|
-| Which agent | cmux `CMUX_AGENT_LAUNCH_KIND` (or `CLAUDECODE` / `CODEX_*`) |
+| Which agent | `WHENCE_AGENT`, then cmux `CMUX_AGENT_LAUNCH_KIND` (or provider fallback) |
 | Which machine | a one-token `~/.config/whence/host-label` you set per machine |
 | Which tab | `cmux rpc surface.list` → the tab's human name |
 | How to resume it | `cmux surface resume get` → the exact relaunch command, for **any** agent |
+| Which durable workstream | `WHENCE_WORKSTREAM_ID` from the launcher/work ledger |
+| How it was launched/routed | `WHENCE_LAUNCHER`, `WHENCE_ROUTE`, and `WHENCE_ROUTER` |
 
 The clever bit: cmux already stores the exact restore command per tab, so Codex
 and Claude are handled by the *same* code path — no agent-specific guessing.
@@ -416,6 +421,22 @@ WHENCE_GOALS=https://github.com/acme/planning/blob/main/goal.md shipyard pr
 Only absolute HTTP(S) URLs are published. Prefer a committed default-branch URL
 over a local path or mutable draft.
 
+Session launchers should provide routing provenance explicitly:
+
+```bash
+WHENCE_WORKSTREAM_ID=agent-workstream-continuity-20260813 \
+WHENCE_LAUNCHER=cmux-continue-session \
+WHENCE_ROUTE=subrouter \
+WHENCE_ROUTER=m3 \
+codex
+```
+
+These values are public metadata, so Whence accepts only compact identifiers.
+URLs, paths, email/account names, query strings, and credentials fail closed.
+`WHENCE_ORIGIN_KIND=automation`, `external`, or `unresolved` gives non-agent PRs
+an explicit provenance label instead of leaving them blank. Missing launcher or
+route data is recorded as `unresolved`; Whence does not guess an account.
+
 **Colors:** any GitHub label hex, per category. **Machine label:**
 `WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:** set
 `"gh": "ghapp"` in config (or `WHENCE_GH=ghapp`) to authenticate as a GitHub
@@ -435,9 +456,9 @@ in `host-label`.
 **No cmux?** You still get the `agent` + `machine` labels and whatever session
 handle the agent exposes; cmux just adds the tab name and the universal resume.
 
-### Label order — agent, host, workspace, tab
+### Label order — agent, host, workspace, tab, route
 
-whence adds labels in agent→host→workspace→tab order, but **GitHub decides how the
+whence adds labels in agent→host→workspace→tab→route order, but **GitHub decides how the
 chips display**, and — confirmed by reading the rendered DOM — it uses *two
 different* sort orders depending on where you look:
 
@@ -449,9 +470,11 @@ different* sort orders depending on where you look:
 Neither honors the order whence adds them in, so ordering takes a deliberate step.
 
 **For the queue — `order_labels` (recommended).** Set `"order_labels": true` in
-config and whence prefixes each chip `1·`/`2·`/`3·`/`4·` by role, so the
-alphabetical sort renders agent → host → workspace → tab on every PR. Only the chip
+config and whence prefixes each chip `1·`/`2·`/`3·`/`4·`/`5·` by role, so the
+alphabetical sort renders agent → host → workspace → tab → route on every PR. Only the chip
 carries the prefix; the provenance footer shows the clean value. Off by default.
+On every stamp Whence removes every other value in each numbered class before
+adding the desired values, so duplicate/stale route or identity chips converge.
 
 **For the detail page / API — `whence --reorder-labels owner/repo`.** GitHub sorts
 those surfaces by label creation id, so this deletes and recreates each whence
@@ -459,9 +482,10 @@ label (classified by its color, so unrelated repo labels are untouched) in role
 order — agents first (lowest ids), tabs last — then re-applies them to the open
 PRs. Deleting a label also removes it from *closed* PRs; the footer is never
 touched. New tab labels get the newest ids and sort last on their own, so re-run it
-only if a new agent/host/workspace value appears.
+only if a new agent/host/workspace/route value appears.
 
-The **footer table** always renders in agent/host/workspace/tab order regardless —
+The **footer table** always renders identity, workstream, and route fields in a
+stable order regardless —
 that layout is ours to control, not GitHub's.
 
 ## Debugging — an audit log of every label change
