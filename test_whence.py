@@ -222,10 +222,12 @@ def main() -> int:
     # self-heal helpers: a ref/blank/unknown stamp is degraded; a named one is good.
     healcfg = {"redact_placeholder": "(redacted)"}
     checks = [
-        ("named+agent is good", {"tab": "Fix caret", "agent": "claude"}, True),
-        ("blank tab is degraded", {"tab": "", "agent": "claude"}, False),
-        ("ref tab is degraded", {"tab": "surface:26", "agent": "claude"}, False),
-        ("unknown agent is degraded", {"tab": "Fix caret", "agent": "unknown"}, False),
+        ("named+agent is good", {"tab": "Fix caret", "agent": "claude", "origin_state": "known"}, True),
+        ("blank tab is degraded", {"tab": "", "agent": "claude", "origin_state": "unnamed"}, False),
+        ("ref tab is degraded", {"tab": "surface:26", "agent": "claude", "origin_state": "lookup_failed"}, False),
+        ("unknown agent is degraded", {"tab": "Fix caret", "agent": "unknown", "origin_state": "unresolved"}, False),
+        ("automation needs no tab", {"tab": "", "agent": "automation", "origin_state": "automation"}, True),
+        ("external needs no tab", {"tab": "", "agent": "external", "origin_state": "external"}, True),
     ]
     for name, prov, good in checks:
         if w._prov_good(prov, healcfg) != good:
@@ -235,10 +237,10 @@ def main() -> int:
             print(f"ok    _prov_good: {name}")
 
     # _prov_better upgrades degraded/missing provenance but never chases a rename.
-    better = w._prov_better({"tab": "Real name", "agent": "codex"},
-                            {"tab": "surface:26", "agent": "unknown"}, healcfg)
-    rename = w._prov_better({"tab": "New name", "agent": "claude"},
-                            {"tab": "Old name", "agent": "claude"}, healcfg)
+    better = w._prov_better({"tab": "Real name", "agent": "codex", "origin_state": "known"},
+                            {"tab": "surface:26", "agent": "unknown", "origin_state": "lookup_failed"}, healcfg)
+    rename = w._prov_better({"tab": "New name", "agent": "claude", "origin_state": "known"},
+                            {"tab": "Old name", "agent": "claude", "origin_state": "known"}, healcfg)
     goal_upgrade = w._prov_better(
         {"tab": "Old name", "agent": "claude", "goals": "https://example.com/goal"},
         {"tab": "Old name", "agent": "claude", "goals": ""}, healcfg)
@@ -328,13 +330,82 @@ def main() -> int:
         print("ok    goals: safe durable URLs normalized + linked in provenance")
 
     # order_labels: prefixes force the queue's ALPHABETICAL sort into role order.
-    lp={f:"" for f in w.FIELDS}; lp.update({"agent":"claude","host":"m5","workspace":"w1","tab":"Fix caret"})
+    lp={f:"" for f in w.FIELDS}; lp.update({"agent":"claude","host":"m5","workspace":"w1","tab":"Fix caret","route":"subrouter"})
     lbase={"hide":set(),"colors":w.DEFAULT_COLORS,"label_maxlen":24}
     on=[n for n,_ in w.labels_for(lp,{**lbase,"order_labels":True})]
     off=[n for n,_ in w.labels_for(lp,{**lbase,"order_labels":False})]
-    if off!=["claude","m5","w1","Fix caret"] or on!=["1\u00b7claude","2\u00b7m5","3\u00b7w1","4\u00b7Fix caret"] or sorted(on)!=on:
+    if off!=["claude","m5","w1","Fix caret","subrouter"] or on!=["1\u00b7claude","2\u00b7m5","3\u00b7w1","4\u00b7Fix caret","5\u00b7subrouter"] or sorted(on)!=on:
         failed+=1; print(f"FAIL  order_labels: off={off} on={on} sorted={sorted(on)}")
-    else: print("ok    order_labels: prefixed names sort into agent/host/workspace/tab")
+    else: print("ok    order_labels: prefixed names sort into agent/host/workspace/tab/route")
+
+    # Route/workstream identifiers cross a public boundary. Credentials, URLs,
+    # emails, paths, and query strings must fail closed instead of being stamped.
+    safe_ids = {
+        "agent-workstream-continuity-20260813": "agent-workstream-continuity-20260813",
+        "subrouter-cli": "subrouter-cli", "m3": "m3", "direct": "direct",
+        "https://m3:31415": "", "person@example.com": "", "/Users/me/key": "",
+        "subrouter?token=secret": "",
+    }
+    for src, want in safe_ids.items():
+        got = w.stable_identifier(src)
+        if got != want:
+            failed += 1; print(f"FAIL  stable_identifier({src!r})={got!r} want={want!r}")
+        else: print(f"ok    stable_identifier({src!r}) -> {got!r}")
+
+    # A launcher supplies identity and route independently. The exact values
+    # survive collection and appear in the machine-readable tag plus footer.
+    env = {
+        "WHENCE_AGENT": "codex", "WHENCE_HOST_LABEL": "m5",
+        "WHENCE_WORKSTREAM_ID": "agent-workstream-continuity-20260813",
+        "WHENCE_LAUNCHER": "cmux-continue-session", "WHENCE_ROUTE": "subrouter",
+        "WHENCE_ROUTER": "m3", "CMUX_SURFACE_ID": "SURFACE",
+    }
+    with mock.patch.dict(_os.environ, env, clear=True), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("Linear work #3", "")), \
+         mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+        routed = w.collect({"denylist": [], "hide": set()})
+    routed_ft = w.footer(routed, {"hide": set()}, [])
+    required = {
+        "agent": "codex", "workstream": "agent-workstream-continuity-20260813",
+        "launcher": "cmux-continue-session", "route": "subrouter", "router": "m3",
+        "origin_state": "known",
+    }
+    if (any(routed.get(k) != v for k, v in required.items())
+            or "| **Route** | `subrouter` |" not in routed_ft
+            or '"workstream": "agent-workstream-continuity-20260813"' not in routed_ft):
+        failed += 1; print(f"FAIL  explicit routed provenance: {routed!r} footer={routed_ft!r}")
+    else: print("ok    explicit routed provenance keeps agent separate from route/router")
+
+    # Canonical numbered classes converge even when the old footer omitted a
+    # duplicate. Unrelated labels are never touched.
+    stale = w.stale_labels(
+        ["1·claude", "1·codex", "2·m5", "5·direct", "bug"],
+        ["1·claude"], {"1·codex", "2·m5", "5·subrouter"},
+        {"order_labels": True})
+    if stale != {"1·claude", "5·direct"}:
+        failed += 1; print(f"FAIL  canonical label convergence: {stale}")
+    else: print("ok    canonical label convergence removes duplicate/stale classes only")
+    converged = w.numbered_labels_converged(
+        ["1·codex", "2·m5", "5·subrouter", "bug"],
+        {"1·codex", "2·m5", "5·subrouter"}, {"order_labels": True})
+    duplicated = w.numbered_labels_converged(
+        ["1·claude", "1·codex", "2·m5", "5·subrouter"],
+        {"1·codex", "2·m5", "5·subrouter"}, {"order_labels": True})
+    if not converged or duplicated:
+        failed += 1; print(f"FAIL  numbered convergence verification: good={converged} duplicate={duplicated}")
+    else: print("ok    numbered convergence verification rejects duplicate class members")
+
+    # A retry may fill missing routing data, but a degraded later environment
+    # must not overwrite already-known metadata from the originating launcher.
+    known_route = {"tab": "Fix", "agent": "codex", "origin_state": "known",
+                   "route": "subrouter", "router": "m3", "launcher": "cmux"}
+    degraded_route = {"tab": "Fix", "agent": "codex", "origin_state": "lookup_failed",
+                      "route": "unresolved", "router": "", "launcher": "unresolved"}
+    missing_route = {**known_route, "route": "unresolved", "router": "", "launcher": "unresolved"}
+    if w._prov_better(degraded_route, known_route, healcfg) or not w._prov_better(known_route, missing_route, healcfg):
+        failed += 1; print("FAIL  route provenance upgrade ordering")
+    else: print("ok    route provenance fills missing data but never degrades known data")
 
     # A backgrounded orchestrator can return before its PR exists. The live hook
     # must launch a targeted retry instead of leaving the PR to the 10-minute

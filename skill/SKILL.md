@@ -44,6 +44,11 @@ It reads the environment (cmux + agent session vars) and the host label file, so
 there is nothing to pass — just run it in the same shell/session that opened the
 PR. It is idempotent; re-running replaces the prior stamp.
 
+When a durable workstream or router is in use, preserve these launcher-provided
+environment variables through the PR command: `WHENCE_WORKSTREAM_ID`,
+`WHENCE_LAUNCHER`, `WHENCE_ROUTE`, and `WHENCE_ROUTER`. Never put an account
+identity, credential, URL, private path, or transcript in those fields.
+
 ## Notes
 
 - Works for Claude Code and Codex — the resume command is sourced from cmux's
