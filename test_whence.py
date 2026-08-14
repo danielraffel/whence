@@ -100,6 +100,101 @@ def cwd_cases(tmp):
 
 def main() -> int:
     failed = 0
+
+    # A configured GitHub App remains the preferred client. It may fall back to
+    # ambient user auth only when GitHub says the App cannot access this exact
+    # repository and ambient gh proves that it can. Never turn a transient or
+    # unrelated auth failure into a surprising identity switch.
+    app = "/Users/test/.local/bin/ghapp"
+    ambient = "/opt/homebrew/bin/gh"
+
+    def client_case(name, responses, want, *, explicit=False, fallback=ambient):
+        nonlocal failed
+        calls = []
+
+        def fake_sh(*args, **kwargs):
+            calls.append(args)
+            return responses[len(calls) - 1]
+
+        w._GH_CLIENT_CACHE.clear()
+        with mock.patch.object(w, "sh", side_effect=fake_sh), \
+             mock.patch.object(w.shutil, "which", return_value=fallback):
+            got = w.github_client_for_repo(
+                app, "danielraffel/pulp-planning", explicit=explicit)
+        if got != want:
+            failed += 1
+            print(f"FAIL  GitHub client: {name}: got={got!r} want={want!r} calls={calls!r}")
+        else:
+            print(f"ok    GitHub client: {name}")
+        return calls
+
+    ok_repo = subprocess.CompletedProcess([], 0, "danielraffel/pulp-planning\n", "")
+    missing_app = subprocess.CompletedProcess(
+        [], 1, "", "GraphQL: Could not resolve to a Repository with the name 'danielraffel/pulp-planning'.")
+    inaccessible_app = subprocess.CompletedProcess(
+        [], 1, "", "GraphQL: Resource not accessible by integration")
+    network_error = subprocess.CompletedProcess([], 1, "", "error connecting to api.github.com")
+    wrong_repo = subprocess.CompletedProcess([], 0, "somebody/other-repo\n", "")
+
+    calls = client_case("accessible App stays selected", [ok_repo], app)
+    if len(calls) != 1:
+        failed += 1; print(f"FAIL  accessible App unexpectedly probed ambient gh: {calls!r}")
+    client_case("missing App installation uses verified ambient gh",
+                [missing_app, ok_repo], ambient)
+    client_case("integration access denial uses verified ambient gh",
+                [inaccessible_app, ok_repo], ambient)
+    calls = client_case("explicit client never falls back", [], app, explicit=True)
+    if calls:
+        failed += 1; print(f"FAIL  explicit client was unexpectedly probed: {calls!r}")
+    calls = client_case("network errors fail closed on configured client",
+                        [network_error], app)
+    if len(calls) != 1:
+        failed += 1; print(f"FAIL  network failure unexpectedly probed ambient gh: {calls!r}")
+    client_case("ambient gh must prove the exact repository",
+                [missing_app, wrong_repo], app)
+    client_case("missing ambient gh leaves configured client selected",
+                [missing_app], app, fallback=None)
+
+    rejected = subprocess.CompletedProcess([], 1, "", "Resource not accessible by integration")
+    with mock.patch.object(w, "sh", return_value=rejected):
+        try:
+            w.github_call(app, "pr", "edit", "24")
+        except RuntimeError as exc:
+            checked_failure = "Resource not accessible by integration" in str(exc)
+        else:
+            checked_failure = False
+    if not checked_failure:
+        failed += 1
+        print("FAIL  GitHub mutation rejection was reported as success")
+    else:
+        print("ok    GitHub mutation rejection fails visibly")
+
+    mutation_calls = []
+    mutation_responses = iter([
+        rejected,
+        ok_repo,
+        subprocess.CompletedProcess([], 0, "updated\n", ""),
+    ])
+    def mutation_sh(*args, **kwargs):
+        mutation_calls.append(args)
+        return next(mutation_responses)
+    w._GH_CLIENT_CACHE.clear()
+    with mock.patch.object(w, "sh", side_effect=mutation_sh), \
+         mock.patch.object(w.shutil, "which", return_value=ambient):
+        retried = w.github_call(
+            app, "pr", "edit", "24", "--repo", "danielraffel/pulp-planning",
+            "--add-label", "1·codex")
+    retried_with_ambient = (
+        retried.returncode == 0 and len(mutation_calls) == 3
+        and mutation_calls[0][0] == app
+        and mutation_calls[1][0] == ambient
+        and mutation_calls[2][0] == ambient)
+    if not retried_with_ambient:
+        failed += 1
+        print(f"FAIL  read-only App mutation fallback: {mutation_calls!r}")
+    else:
+        print("ok    read-only App mutation retries through verified ambient gh")
+
     for name, tr, want in OUTCOMES:
         got = w.parse_outcome({"tool_response": tr})
         if got != want:

@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, json, os, re, shlex, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -146,6 +146,85 @@ def sh(*a, **k):
         return subprocess.run(a, capture_output=True, text=True, **k)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
         return subprocess.CompletedProcess(a, 1, "", str(e))
+
+
+_GH_CLIENT_CACHE: dict[tuple[str, str, bool], str] = {}
+_GHAPP_REPO_ACCESS_ERRORS = (
+    "could not resolve to a repository",
+    "resource not accessible by integration",
+)
+
+
+def _verified_ambient_gh(configured: str, repo: str) -> str:
+    fallback = shutil.which("gh")
+    if not fallback or pathlib.Path(fallback).name == pathlib.Path(configured).name:
+        return ""
+    verified = sh(fallback, "repo", "view", repo, "--json", "nameWithOwner",
+                  "-q", ".nameWithOwner")
+    if verified.returncode == 0 and verified.stdout.strip().lower() == repo.lower():
+        return fallback
+    return ""
+
+
+def github_client_for_repo(configured: str, repo: str,
+                           explicit: bool = False) -> str:
+    """Resolve a GitHub client before any provenance mutation.
+
+    A fleet may prefer ``ghapp`` for public repositories while the App is not
+    installed on a private planning repository. Fall back to the ambient ``gh``
+    executable only when a read-only repo preflight returns one of GitHub's
+    exact repository-access errors *and* ambient ``gh`` proves access to the
+    same canonical repository. An explicit ``WHENCE_GH`` never falls back.
+    Other auth, network, timeout, and mutation failures remain failures.
+    """
+    if explicit or not repo or pathlib.Path(configured).name != "ghapp":
+        return configured
+    key = (configured, repo.lower(), explicit)
+    if key in _GH_CLIENT_CACHE:
+        return _GH_CLIENT_CACHE[key]
+    probe = sh(configured, "repo", "view", repo, "--json", "nameWithOwner",
+               "-q", ".nameWithOwner")
+    if probe.returncode == 0 and probe.stdout.strip().lower() == repo.lower():
+        _GH_CLIENT_CACHE[key] = configured
+        return configured
+    detail = f"{probe.stdout}\n{probe.stderr}".lower()
+    if not any(marker in detail for marker in _GHAPP_REPO_ACCESS_ERRORS):
+        return configured
+    fallback = _verified_ambient_gh(configured, repo)
+    if fallback:
+        _GH_CLIENT_CACHE[key] = fallback
+        return fallback
+    return configured
+
+
+def github_call(client: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one GitHub operation and fail visibly on a rejected read or write."""
+    repo = ""
+    if "--repo" in args:
+        index = args.index("--repo")
+        if index + 1 < len(args):
+            repo = args[index + 1]
+    explicit = bool(os.environ.get("WHENCE_GH"))
+    selected = github_client_for_repo(client, repo, explicit=explicit)
+    result = sh(selected, *args)
+    detail = f"{result.stdout}\n{result.stderr}".lower()
+    # An App can read a repository while lacking issue/PR write permission.
+    # Retrying this idempotent operation with a verified ambient identity is
+    # safe and closes the gap a read-only preflight cannot detect.
+    if (result.returncode != 0 and not explicit and repo
+            and pathlib.Path(selected).name == "ghapp"
+            and any(marker in detail for marker in _GHAPP_REPO_ACCESS_ERRORS)):
+        fallback = _verified_ambient_gh(selected, repo)
+        if fallback:
+            _GH_CLIENT_CACHE[(client, repo.lower(), False)] = fallback
+            selected = fallback
+            result = sh(selected, *args)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown GitHub CLI failure").strip()
+        raise RuntimeError(
+            f"whence: GitHub command failed ({pathlib.Path(selected).name} "
+            f"{shlex.join(args[:3])}): {detail}")
+    return result
 
 
 def load_config(cli_hide: str) -> dict:
@@ -1059,39 +1138,47 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     it: without it every `gh` call resolves the PR number against the cwd's repo,
     so a sweep running from an unrelated checkout would stamp a same-numbered PR
     in the WRONG repository."""
+    client = github_client_for_repo(
+        GH, repo, explicit=bool(os.environ.get("WHENCE_GH")))
     R = ["--repo", repo] if repo else []
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
     ft = footer(p, cfg, names) if post_footer else ""
-    body = sh(GH, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
+    body = github_call(
+        client, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
     before = {"labels": prior_labels(body), "prov": prior_prov(body)}
     keep = set(names)
-    existing = sh(GH, "pr", "view", pr, *R, "--json", "labels", "-q", ".labels[].name").stdout.split("\n")
+    existing = github_call(
+        client, "pr", "view", pr, *R, "--json", "labels",
+        "-q", ".labels[].name").stdout.split("\n")
     # In canonical numbered mode each prefix is a Whence-owned class. Remove
     # every old member of all five classes before adding the desired member, so
     # stale/duplicate values converge even if an older footer forgot to list one.
     stale = stale_labels(existing, prior_labels(body), keep, cfg)
     for s in sorted(x for x in stale if x):
-        sh(GH, "pr", "edit", pr, *R, "--remove-label", s)
+        github_call(client, "pr", "edit", pr, *R, "--remove-label", s)
     for n, c in labels:
-        sh(GH, "label", "create", n, *R, "--color", c, "--force")
+        github_call(client, "label", "create", n, *R, "--color", c, "--force")
     if names:
-        sh(GH, "pr", "edit", pr, *R, *sum([["--add-label", n] for n in names], []))
+        github_call(client, "pr", "edit", pr, *R,
+                    *sum([["--add-label", n] for n in names], []))
     # A successful-looking mutation is not proof. Re-read the numbered classes,
     # correct once, and fail visibly if GitHub still has a duplicate/stale value.
     # The hook wrapper absorbs this failure, while the ledger keeps the PR
     # retryable; manual/controller calls receive a non-successful run.
     if cfg.get("order_labels"):
-        current = sh(GH, "pr", "view", pr, *R, "--json", "labels",
-                     "-q", ".labels[].name").stdout.splitlines()
+        current = github_call(
+            client, "pr", "view", pr, *R, "--json", "labels",
+            "-q", ".labels[].name").stdout.splitlines()
         if not numbered_labels_converged(current, keep, cfg):
             for old in sorted(stale_labels(current, [], keep, cfg)):
-                sh(GH, "pr", "edit", pr, *R, "--remove-label", old)
+                github_call(client, "pr", "edit", pr, *R, "--remove-label", old)
             if names:
-                sh(GH, "pr", "edit", pr, *R,
-                   *sum([["--add-label", n] for n in names], []))
-            current = sh(GH, "pr", "view", pr, *R, "--json", "labels",
-                         "-q", ".labels[].name").stdout.splitlines()
+                github_call(client, "pr", "edit", pr, *R,
+                            *sum([["--add-label", n] for n in names], []))
+            current = github_call(
+                client, "pr", "view", pr, *R, "--json", "labels",
+                "-q", ".labels[].name").stdout.splitlines()
             if not numbered_labels_converged(current, keep, cfg):
                 raise RuntimeError(
                     f"whence: PR #{pr} numbered labels did not converge: {current!r}")
@@ -1101,7 +1188,7 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
         fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
         try:
             os.write(fd, newbody.encode()); os.close(fd)
-            sh(GH, "pr", "edit", pr, *R, "--body-file", tmpname)
+            github_call(client, "pr", "edit", pr, *R, "--body-file", tmpname)
         finally:
             try: os.unlink(tmpname)
             except OSError: pass
@@ -1537,7 +1624,9 @@ def sweep(cfg: dict) -> int:
         slug, _, br = key.partition("#")
         if not slug or not br or rec.get("done"):
             continue
-        res = sh(GH, "pr", "list", "--repo", slug, "--head", br,
+        client = github_client_for_repo(
+            GH, slug, explicit=bool(os.environ.get("WHENCE_GH")))
+        res = sh(client, "pr", "list", "--repo", slug, "--head", br,
                  "--state", "all", "--json", "number,body")
         try: prs = json.loads(res.stdout or "[]")
         except Exception: prs = []
@@ -1589,7 +1678,9 @@ def retry_pending_pr(key: str, cfg: dict, attempts: int = 24, delay: float = 5.0
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
-        res = sh(GH, "pr", "list", "--repo", slug, "--head", br,
+        client = github_client_for_repo(
+            GH, slug, explicit=bool(os.environ.get("WHENCE_GH")))
+        res = sh(client, "pr", "list", "--repo", slug, "--head", br,
                  "--state", "all", "--json", "number,body,createdAt,headRefOid",
                  timeout=max(0.1, min(5.0, remaining)))
         prs = _recent_prs(res.stdout, rec)
@@ -2178,7 +2269,14 @@ def main() -> int:
         print("\n[dry-run] pass --apply to stamp the PR")
         return 0
 
-    pr, repo = (hook_pr, hook_slug) if hook_pr else (resolve_pr(args), "")
+    if hook_pr:
+        pr, repo = hook_pr, hook_slug
+    else:
+        repo, _branch = _repo_branch(os.getcwd())
+        if repo:
+            GH = github_client_for_repo(
+                GH, repo, explicit=bool(os.environ.get("WHENCE_GH")))
+        pr = resolve_pr(args)
     if not pr:
         # The command opened no PR we can name (e.g. a plain push, or a PR the
         # daemon opens later). It's in the ledger — the sweep will catch it.
