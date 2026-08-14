@@ -118,6 +118,13 @@ install. GitHub labels are per-repo, so the first time it stamps in a given repo
 it auto-creates the `agent` / `machine` / `tab` labels there; you never make
 labels by hand.
 
+If setup selected `ghapp` but that App is not installed on a private repository,
+Whence performs a read-only repository preflight and uses the ambient `gh`
+identity for that repository only after `gh` proves access to the same canonical
+`owner/name`. The switch is limited to GitHub's explicit missing-repository or
+integration-access errors; network and general authentication failures remain
+failures. Setting `WHENCE_GH` is an explicit override and disables this fallback.
+
 **Will it stamp all my repos, or just one?** Entirely up to how you wire the
 auto-stamp — and you can scope it either way:
 
