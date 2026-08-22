@@ -642,6 +642,8 @@ def main() -> int:
     rec["p"].update({"agent": "claude", "host": "m3", "tab": "Deferred PR",
                      "workstream": "SY-LF-2026-08-20", "launcher": "cmux",
                      "route": "direct",
+                     "origin_state": "known", "session": "session-original",
+                     "resume": "claude --resume session-original",
                      "goals": "https://github.com/acme/planning/blob/main/goal.md"})
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
@@ -656,7 +658,9 @@ def main() -> int:
                 "origin/main", str(pathlib.Path.cwd()), lock_provenance=True,
             )
             conflicting = dict(rec["p"], workstream="SY-LF-WRONG",
-                               launcher="daemon", route="queue")
+                               launcher="daemon", route="queue", agent="unknown",
+                               tab="", origin_state="unresolved", session="",
+                               resume="", goals="")
             w.ledger_record("", conflicting, "danielraffel/pulp", "fix/deferred",
                             "origin/main", str(pathlib.Path.cwd()))
             recorded = json.loads(ledger_path.read_text())[key]
@@ -670,12 +674,17 @@ def main() -> int:
             or recorded["p"].get("workstream") != "SY-LF-2026-08-20"
             or recorded["p"].get("launcher") != "cmux"
             or recorded["p"].get("route") != "direct"
+            or recorded["p"].get("agent") != "claude"
+            or recorded["p"].get("tab") != "Deferred PR"
+            or recorded["p"].get("origin_state") != "known"
+            or recorded["p"].get("session") != "session-original"
+            or recorded["p"].get("resume") != "claude --resume session-original"
             or not recorded.get("provenance_locked")
             or recorded.get("revision") != 3):
         failed += 1
         print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
-        print("ok    ledger capture: same-HEAD delayed worker cannot replace pre-exec provenance")
+        print("ok    ledger capture: same-HEAD delayed worker preserves all known provenance")
 
     # Force a pre-exec write after sweep has read the old record but before it
     # commits. Sweep may mark that same HEAD done, but it must neither stamp the
@@ -748,6 +757,37 @@ def main() -> int:
     else:
         print("ok    sweep revision fence: latest context published; newer revision not done")
 
+    # The revision mismatch above must survive process boundaries. On the next
+    # timer pass, known-but-different provenance is republished even though the
+    # normal healing policy intentionally ignores mere known -> known renames.
+    second_stamped = []
+    old_body = w.footer(stamped_p, sweep_cfg, [])
+    second_prs = subprocess.CompletedProcess([], 0, json.dumps([
+        {"number": 41, "body": old_body, "headRefOid": "same-head"},
+    ]), "")
+    with tempfile.TemporaryDirectory() as tmp:
+        second_ledger = pathlib.Path(tmp) / "ledger.json"
+        second_ledger.write_text(json.dumps({sweep_key: interleaved}))
+        with mock.patch.object(w, "LEDGER", second_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=103), \
+             mock.patch.object(w, "github_client_for_repo", return_value="ghapp"), \
+             mock.patch.object(w, "sh", return_value=second_prs), \
+             mock.patch.object(w, "apply_stamp",
+                               side_effect=lambda pr, p, *a, **k: second_stamped.append((pr, dict(p)))):
+            second_count = w.sweep(sweep_cfg)
+        second_record = json.loads(second_ledger.read_text())[sweep_key]
+    if (second_count != 1 or len(second_stamped) != 1
+            or second_stamped[0][1].get("workstream") != "SY-LF-NEWER"
+            or second_stamped[0][1].get("tab") != "Newer"
+            or second_record.get("published_revision") != second_record.get("revision")
+            or not second_record.get("done")
+            or second_record.get("publication_claim")):
+        failed += 1
+        print(f"FAIL  durable next-sweep revision: count={second_count} "
+              f"stamped={second_stamped!r} rec={second_record!r}")
+    else:
+        print("ok    durable next-sweep revision: newer known context is republished before done")
+
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
         acquired = pathlib.Path(tmp) / "child-acquired"
@@ -772,6 +812,50 @@ def main() -> int:
               f"completed={child_completed} rc={child.returncode}")
     else:
         print("ok    process ledger lock: concurrent writer blocks until atomic update completes")
+
+    # Neither live cmux resolution nor GitHub publication may run beneath the
+    # single process-wide ledger flock. Prove a second process can acquire the
+    # exact lock during both callbacks.
+    with tempfile.TemporaryDirectory() as tmp:
+        free_ledger = pathlib.Path(tmp) / "ledger.json"
+        free_key = "danielraffel/pulp#fix/lock-free"
+        free_p = {f: "" for f in w.FIELDS}
+        free_p.update({"agent": "codex", "tab": "Lock free",
+                       "origin_state": "known"})
+        free_ledger.write_text(json.dumps({free_key: {
+            "p": free_p, "ts": 100, "head": "lock-free-head", "revision": 1,
+        }}))
+        callback_acquired = []
+
+        def acquire_during(label):
+            marker = pathlib.Path(tmp) / label
+            child = subprocess.Popen([
+                sys.executable, "-c", child_code,
+                str(free_ledger) + ".lock", str(marker),
+            ])
+            child.wait(timeout=2)
+            callback_acquired.append(child.returncode == 0 and marker.exists())
+
+        def lock_free_best(record, cfg, body=""):
+            acquire_during("cmux-acquired")
+            return dict(record["p"]), ""
+
+        def lock_free_apply(*args, **kwargs):
+            acquire_during("github-acquired")
+            return []
+
+        with mock.patch.object(w, "LEDGER", free_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=101), \
+             mock.patch.object(w, "_best_provenance", side_effect=lock_free_best), \
+             mock.patch.object(w, "apply_stamp", side_effect=lock_free_apply):
+            free_published = w._publish_ledger_pr(
+                free_key, "lock-free-head", "99", "", sweep_cfg, "sweep:new")
+    if not free_published or callback_acquired != [True, True]:
+        failed += 1
+        print(f"FAIL  publication lock scope: published={free_published} "
+              f"callbacks={callback_acquired!r}")
+    else:
+        print("ok    publication lock scope: cmux and GitHub callbacks never hold global flock")
 
     responses = iter([
         subprocess.CompletedProcess(

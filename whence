@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, contextlib, fcntl, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -1595,6 +1595,24 @@ def _ledger_lock():
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
+@contextlib.contextmanager
+def _publication_lock(key: str):
+    """Serialize publication for one repository/branch, never the whole ledger.
+
+    The kernel releases this lock when a worker exits, so crash recovery does
+    not depend on a timeout that could expire during a slow but live mutation.
+    """
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    lock_path = LEDGER.with_name(f"{LEDGER.name}.{digest}.publish.lock")
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _write_ledger(ledger: dict) -> None:
     """Atomically publish one complete ledger while `_ledger_lock` is held."""
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
@@ -1643,6 +1661,18 @@ def _recent_prs(raw: str, rec: dict) -> list[dict]:
     return recent
 
 
+def _locked_value_known(field: str, value: str) -> bool:
+    """Whether a locked launcher value is resolved enough to preserve."""
+    value = value or ""
+    if value in ("", "unknown", "unresolved"):
+        return False
+    if field == "origin_state":
+        return value in ("known", "automation", "external")
+    if field == "tab":
+        return not re.fullmatch(r"surface:\d+", value)
+    return True
+
+
 def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                   source_ref: str = "", hook_cwd: str = "",
                   lock_provenance: bool = False) -> str:
@@ -1680,8 +1710,16 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                             and prior.get("provenance_locked"))
         if prior_locked:
             old = prior.get("p", {})
-            for field in ("workstream", "launcher", "route", "router"):
-                captured[field] = old.get(field, "")
+            # A pre-exec snapshot is the last point where the originating
+            # launcher is guaranteed to have its full cmux/session context.
+            # PostToolUse and delayed daemon hooks commonly retain only part of
+            # it.  Preserve every resolved field for the same immutable HEAD,
+            # while still allowing a later hook to fill fields the launcher did
+            # not know yet (for example a goal URL).
+            for field in FIELDS:
+                value = old.get(field, "")
+                if _locked_value_known(field, value):
+                    captured[field] = value
         led[key] = {"p": captured,
                     "ts": _now_epoch(), "head": head,
                     "provenance_locked": prior_locked or lock_provenance,
@@ -1767,50 +1805,85 @@ def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
                        cfg: dict, source: str) -> bool:
     """Publish only the latest revision for one exact ledger HEAD.
 
-    The process lock is the publication fence: a launcher cannot replace the
-    record between the latest-record reload and the GitHub mutation. Reloading
-    once more before setting ``done`` also fails closed if a hostile/non-locking
-    writer changed the revision during the mutation.
+    The global ledger lock protects only tiny local read/modify/write cycles;
+    cmux discovery and GitHub calls must never hold it. A per-key OS lock keeps
+    same-branch publishers ordered without blocking unrelated PRs and is
+    automatically released on process death. If the record changes while
+    GitHub is being updated, the old revision is not marked published or done,
+    so the next sweep must publish the newer context.
     """
+    with _publication_lock(key):
+        return _publish_ledger_pr_serialized(
+            key, expected_head, pr, body, cfg, source)
+
+
+def _publish_ledger_pr_serialized(key: str, expected_head: str, pr: str,
+                                  body: str, cfg: dict, source: str) -> bool:
+    """Per-key serialized implementation; global ledger locks stay local-only."""
     slug = key.partition("#")[0]
+
+    # Snapshot locally, then resolve cmux provenance without the fleet-wide
+    # lock. A later locked comparison closes the intervening record race.
     with _ledger_lock():
         ledger = _load_ledger()
         rec = ledger.get(key, {})
         if not rec or not expected_head or rec.get("head") != expected_head:
             return False
         revision = int(rec.get("revision", 0))
-        best, surf = _best_provenance(rec, cfg, body)
-        best_labels = [x for x, _ in labels_for(best, cfg)]
-        publish = False
-        done = False
-        if source == "retry":
-            publish = not is_stamped(body)
-        elif not is_stamped(body):
+        rec = json.loads(json.dumps(rec))
+
+    best, surf = _best_provenance(rec, cfg, body)
+    best_labels = [x for x, _ in labels_for(best, cfg)]
+    publish = False
+    done = False
+    # Equality, not merely "better than", is the durable fence. A known newer
+    # launcher context may intentionally differ from a known older one; it must
+    # be published once even though rename-healing correctly ignores known to
+    # known changes.
+    revision_unpublished = int(rec.get("published_revision", -1)) != revision
+    if revision_unpublished:
+        publish = True
+        done = _prov_good(best, cfg)
+    elif source == "retry":
+        publish = not is_stamped(body)
+    elif not is_stamped(body):
+        publish = True
+        done = _prov_good(best, cfg)
+    else:
+        cur = prior_prov(body)
+        better = _prov_better(best, cur, cfg)
+        if prior_labels(body) == best_labels and not better:
+            done = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
+        elif _prov_good(cur, cfg) and not better:
+            done = True
+        elif better:
             publish = True
             done = _prov_good(best, cfg)
         else:
-            cur = prior_prov(body)
-            better = _prov_better(best, cur, cfg)
-            if prior_labels(body) == best_labels and not better:
-                done = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
-            elif _prov_good(cur, cfg) and not better:
-                done = True
-            elif better:
-                publish = True
-                done = _prov_good(best, cfg)
-            else:
-                done = not (surf and _surface_ref(surf))
-        if publish:
-            apply_stamp(pr, best, cfg, cfg["labels"], cfg["footer"],
-                        repo=slug, source=source)
-        latest_ledger = _load_ledger()
-        latest = latest_ledger.get(key, {})
+            done = not (surf and _surface_ref(surf))
+
+    with _ledger_lock():
+        ledger = _load_ledger()
+        latest = ledger.get(key, {})
+        if (latest.get("head") != expected_head
+                or int(latest.get("revision", 0)) != revision):
+            return False
+
+    if publish:
+        apply_stamp(pr, best, cfg, cfg["labels"], cfg["footer"],
+                    repo=slug, source=source)
+
+    with _ledger_lock():
+        ledger = _load_ledger()
+        latest = ledger.get(key, {})
         if (latest.get("head") == expected_head
                 and int(latest.get("revision", 0)) == revision):
+            if publish:
+                latest["published_revision"] = revision
             if source != "retry":
                 latest["done"] = done
-            _write_ledger(latest_ledger)
-        return publish
+        _write_ledger(ledger)
+    return publish
 
 
 def sweep(cfg: dict) -> int:
