@@ -466,8 +466,11 @@ workers read it instead of depending on their minimal environment, and a later
 hook for the same exact HEAD cannot degrade known context to unresolved. The
 `provenance` config block is part of the existing private config-repo sync, so
 M1/M3/M5 converge automatically and an offline host catches up on its next
-sweep tick. Exact repository overrides make different routing policy possible
-without per-worktree files.
+sweep tick. Retry and global-sweep stamping require the captured `headRefOid`,
+and process-locked atomic ledger updates prevent a delayed sweep from replacing
+a launcher snapshot. A failed config pull is inert; a successful pull is
+reloaded before that tick stamps anything. Exact repository overrides make
+different routing policy possible without per-worktree files.
 
 These values are public metadata, so Whence accepts only compact identifiers.
 URLs, paths, email/account names, query strings, and credentials fail closed.

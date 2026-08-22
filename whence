@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, contextlib, fcntl, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -1531,8 +1531,9 @@ def command_provenance_context(cmd: str) -> dict[str, str]:
             for j, arg in enumerate(argv[1:], 1):
                 if arg == "-c" or (arg.startswith("-") and "c" in arg[1:]):
                     if j + 1 < len(argv):
-                        nested = command_provenance_context(argv[j + 1])
-                        if nested:
+                        nested_cmd = argv[j + 1]
+                        nested = command_provenance_context(nested_cmd)
+                        if _command_action(nested_cmd)[0]:
                             return {**explicit, **nested}
                     break
             continue
@@ -1579,6 +1580,38 @@ def _repo_branch(cwd):
 def _load_ledger() -> dict:
     try: return json.loads(LEDGER.read_text()) if LEDGER.exists() else {}
     except Exception: return {}
+
+
+@contextlib.contextmanager
+def _ledger_lock():
+    """Serialize ledger read/modify/write cycles across hooks and sweep jobs."""
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = LEDGER.with_name(LEDGER.name + ".lock")
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_ledger(ledger: dict) -> None:
+    """Atomically publish one complete ledger while `_ledger_lock` is held."""
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", dir=LEDGER.parent, prefix=LEDGER.name + ".",
+                suffix=".tmp", delete=False) as tmp:
+            tmp_name = tmp.name
+            json.dump(ledger, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, LEDGER)
+    finally:
+        if tmp_name:
+            try: os.unlink(tmp_name)
+            except FileNotFoundError: pass
 
 
 def _recent_prs(raw: str, rec: dict) -> list[dict]:
@@ -1630,28 +1663,29 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
         # asking "any PR with head=main?" — and stamp whatever unrelated PR that
         # matched, with this session's provenance.
         return ""
-    led = _load_ledger()
     key = f"{slug}#{br}"
     head = _git(cmd_cwd, "rev-parse", source_ref or br or "HEAD").stdout.strip()
     captured = {k: p.get(k, "") for k in FIELDS}
-    prior = led.get(key, {})
-    # The synchronous shell wrapper locks context before a long-running
-    # Shipyard command. A later PostToolUse hook may run after command-scoped
-    # environment vanished or fleet config may have changed while the command
-    # ran. For the same immutable head only, never replace that pre-exec
-    # snapshot. An older unlocked push observation must not outrank the actual
-    # launcher handoff, so it remains replaceable until pre-exec takes the lock.
-    prior_locked = bool(head and prior.get("head") == head
-                        and prior.get("provenance_locked"))
-    if prior_locked:
-        old = prior.get("p", {})
-        for field in ("workstream", "launcher", "route", "router"):
-            captured[field] = old.get(field, "")
-    led[key] = {"p": captured,
-                "ts": _now_epoch(), "head": head,
-                "provenance_locked": prior_locked or lock_provenance}
-    LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    LEDGER.write_text(json.dumps(led))
+    with _ledger_lock():
+        led = _load_ledger()
+        prior = led.get(key, {})
+        # The synchronous shell wrapper locks context before a long-running
+        # Shipyard command. A later PostToolUse hook may run after command-scoped
+        # environment vanished or fleet config may have changed while the
+        # command ran. For the same immutable head only, never replace that
+        # pre-exec snapshot. An older unlocked push observation must not outrank
+        # the actual launcher handoff, so it remains replaceable until pre-exec
+        # takes the lock.
+        prior_locked = bool(head and prior.get("head") == head
+                            and prior.get("provenance_locked"))
+        if prior_locked:
+            old = prior.get("p", {})
+            for field in ("workstream", "launcher", "route", "router"):
+                captured[field] = old.get(field, "")
+        led[key] = {"p": captured,
+                    "ts": _now_epoch(), "head": head,
+                    "provenance_locked": prior_locked or lock_provenance}
+        _write_ledger(led)
     return key
 
 
@@ -1743,6 +1777,7 @@ def sweep(cfg: dict) -> int:
     led = _load_ledger()
     if not led:
         return 0
+    original = json.loads(json.dumps(led))
     post_labels, post_footer = cfg["labels"], cfg["footer"]
     now, keep, n = _now_epoch(), {}, 0
     for key, rec in led.items():
@@ -1755,10 +1790,12 @@ def sweep(cfg: dict) -> int:
         client = github_client_for_repo(
             GH, slug, explicit=bool(os.environ.get("WHENCE_GH")))
         res = sh(client, "pr", "list", "--repo", slug, "--head", br,
-                 "--state", "all", "--json", "number,body")
+                 "--state", "all", "--json", "number,body,headRefOid")
         try: prs = json.loads(res.stdout or "[]")
         except Exception: prs = []
         for pr in prs:
+            if not rec.get("head") or pr.get("headRefOid") != rec.get("head"):
+                continue
             num, body = str(pr["number"]), pr.get("body", "")
             best, surf = _best_provenance(rec, cfg, body)
             best_labels = [x for x, _ in labels_for(best, cfg)]
@@ -1782,7 +1819,23 @@ def sweep(cfg: dict) -> int:
                 rec["done"] = _prov_good(best, cfg)
             else:                                      # can't improve yet; retry only while the tab lives
                 rec["done"] = not (surf and _surface_ref(surf))
-    LEDGER.write_text(json.dumps(keep))
+    # Network work above intentionally runs without holding the process lock.
+    # Merge only sweep's completion bit into the latest same-HEAD record so a
+    # pre-exec writer that interleaves cannot lose its locked provenance.
+    with _ledger_lock():
+        current = _load_ledger()
+        for key, old in original.items():
+            updated = keep.get(key)
+            latest = current.get(key)
+            if updated is None:
+                if latest == old:
+                    current.pop(key, None)
+                continue
+            if not latest or latest.get("head") != old.get("head"):
+                continue
+            if "done" in updated:
+                latest["done"] = updated["done"]
+        _write_ledger(current)
     return n
 
 
@@ -2028,7 +2081,9 @@ def pull_config() -> bool:
     Returns True if the local config changed."""
     if not _backup_ready():
         return False
-    _git(str(BACKUP_DIR), "pull", "--ff-only", "--quiet")
+    pulled = _git(str(BACKUP_DIR), "pull", "--ff-only", "--quiet")
+    if pulled.returncode != 0:
+        return False
     repo_cfg = _read_json(BACKUP_DIR / "config.json")
     if not repo_cfg:
         return False
@@ -2042,6 +2097,22 @@ def pull_config() -> bool:
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(new)
     return True
+
+
+def _config_for_sweep(cli_hide: str) -> tuple[dict, bool]:
+    """Pull fleet policy and return the config that this sweep must apply."""
+    global GH
+    cfg = load_config(cli_hide)
+    GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+    changed = False
+    try:
+        changed = pull_config()
+    except Exception:
+        pass
+    if changed:
+        cfg = load_config(cli_hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+    return cfg, changed
 
 
 def push_config() -> int:
@@ -2239,15 +2310,13 @@ def main() -> int:
         preexec_capture(args.pre_exec, cfg, post_labels, post_footer)
         return 0
     if args.sweep:
-        cfg = load_config(args.hide)
-        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         # Inbound config catch-up on the same 10-min tick every host already runs.
         # A machine that was offline when you edited converges here after it wakes.
-        try:
-            if pull_config():
-                print("whence: pulled updated fleet config")
-        except Exception:
-            pass
+        cfg, config_changed = _config_for_sweep(args.hide)
+        if config_changed:
+            print("whence: pulled updated fleet config")
+        cfg["labels"] = cfg["labels"] and not args.no_labels
+        cfg["footer"] = cfg["footer"] and not args.no_footer
         print(f"whence: swept {sweep(cfg)} PR(s)")
         return 0
     if args.setup:

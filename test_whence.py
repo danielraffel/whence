@@ -277,6 +277,10 @@ def main() -> int:
              "WHENCE_LAUNCHER=cmux setsid bash -lc "
              "'exec shipyard pr --workstream-id SY-LF-P2' &",
              {"workstream": "SY-LF-P2", "launcher": "cmux"}),
+            ("outer context survives nested command without inner flag",
+             "WHENCE_LAUNCHER=cmux WHENCE_ROUTE=direct nohup bash -lc "
+             "'exec shipyard pr' &",
+             {"launcher": "cmux", "route": "direct"}),
             ("diagnostic literal is not context",
              "rg 'shipyard pr --workstream-id WRONG' .",
              {}),
@@ -543,16 +547,37 @@ def main() -> int:
         local_config.write_text(json.dumps({"gh": "ghapp", "labels": False}))
         with mock.patch.object(w, "BACKUP_DIR", backup), \
              mock.patch.object(w, "CONFIG_FILE", local_config), \
+             mock.patch.object(w, "_git", return_value=subprocess.CompletedProcess([], 1, "", "offline")):
+            failed_pull = w.pull_config()
+            after_failure = json.loads(local_config.read_text())
+        with mock.patch.object(w, "BACKUP_DIR", backup), \
+             mock.patch.object(w, "CONFIG_FILE", local_config), \
              mock.patch.object(w, "_git", return_value=subprocess.CompletedProcess([], 0, "", "")):
             first_pull = w.pull_config()
             second_pull = w.pull_config()
         synced = json.loads(local_config.read_text())
-    if (not first_pull or second_pull or synced.get("gh") != "ghapp"
+    if (failed_pull or after_failure != {"gh": "ghapp", "labels": False}
+            or not first_pull or second_pull or synced.get("gh") != "ghapp"
             or synced.get("provenance") != fleet_provenance or synced.get("labels") is not True):
         failed += 1
-        print(f"FAIL  offline config rejoin: first={first_pull} second={second_pull} synced={synced!r}")
+        print(f"FAIL  offline config rejoin: failed={failed_pull} after={after_failure!r} "
+              f"first={first_pull} second={second_pull} synced={synced!r}")
     else:
-        print("ok    offline config rejoin: provenance converges once; host-local gh preserved")
+        print("ok    offline config rejoin: failed pull is inert; successful pull converges once")
+
+    stale_policy = {"labels": True, "footer": True, "gh": "gh-old"}
+    fresh_policy = {"labels": False, "footer": True, "gh": "gh-new"}
+    with mock.patch.object(w, "GH", "gh"), \
+         mock.patch.object(w, "load_config", side_effect=[stale_policy, fresh_policy]), \
+         mock.patch.object(w, "pull_config", return_value=True):
+        refreshed_policy, refreshed_changed = w._config_for_sweep("")
+        refreshed_gh = w.GH
+    if (not refreshed_changed or refreshed_policy != fresh_policy or refreshed_gh != "gh-new"):
+        failed += 1
+        print(f"FAIL  refreshed sweep policy: changed={refreshed_changed} "
+              f"cfg={refreshed_policy!r} gh={refreshed_gh!r}")
+    else:
+        print("ok    refreshed sweep policy: successful pull reloads config before stamping")
 
     # A launcher supplies identity and route independently. The exact values
     # survive collection and appear in the machine-readable tag plus footer.
@@ -650,6 +675,85 @@ def main() -> int:
         print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
         print("ok    ledger capture: same-HEAD delayed worker cannot replace pre-exec provenance")
+
+    # Force a pre-exec write after sweep has read the old record but before it
+    # commits. Sweep may mark that same HEAD done, but it must neither stamp the
+    # force-pushed branch-reuse PR nor overwrite the interleaved locked context.
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger_path = pathlib.Path(tmp) / "ledger.json"
+        sweep_key = "danielraffel/pulp#fix/reused"
+        old_p = {f: "" for f in w.FIELDS}
+        old_p.update({"agent": "codex", "host": "m3", "tab": "Old",
+                      "origin_state": "known", "launcher": "daemon", "route": "queue"})
+        ledger_path.write_text(json.dumps({sweep_key: {
+            "p": old_p, "ts": 100, "head": "same-head", "provenance_locked": False,
+        }}))
+        locked_p = dict(old_p, tab="Launcher", workstream="SY-LF-LOCKED",
+                        launcher="cmux", route="direct")
+        queried = []
+        stamped = []
+
+        def sweep_query(*args, **kwargs):
+            queried.append(args)
+            return subprocess.CompletedProcess([], 0, json.dumps([
+                {"number": 40, "body": "", "headRefOid": "force-pushed-head"},
+                {"number": 41, "body": "", "headRefOid": "same-head"},
+            ]), "")
+
+        def interleaved_stamp(pr, *args, **kwargs):
+            stamped.append(pr)
+            w.ledger_record("", locked_p, "danielraffel/pulp", "fix/reused",
+                            "same-head", str(pathlib.Path.cwd()), lock_provenance=True)
+
+        sweep_cfg = {
+            "labels": False, "footer": False, "hide": set(),
+            "colors": dict(w.DEFAULT_COLORS), "label_maxlen": 24,
+            "denylist": [], "redact_placeholder": "(redacted)",
+        }
+        with mock.patch.object(w, "LEDGER", ledger_path), \
+             mock.patch.object(w, "_now_epoch", return_value=101), \
+             mock.patch.object(w, "_git", return_value=subprocess.CompletedProcess([], 0, "same-head\n", "")), \
+             mock.patch.object(w, "github_client_for_repo", return_value="ghapp"), \
+             mock.patch.object(w, "sh", side_effect=sweep_query), \
+             mock.patch.object(w, "apply_stamp", side_effect=interleaved_stamp):
+            sweep_count = w.sweep(sweep_cfg)
+        interleaved = json.loads(ledger_path.read_text())[sweep_key]
+    query_fields = queried[0][queried[0].index("--json") + 1] if queried else ""
+    if (sweep_count != 1 or stamped != ["41"] or "headRefOid" not in query_fields
+            or not interleaved.get("provenance_locked")
+            or interleaved.get("p", {}).get("workstream") != "SY-LF-LOCKED"
+            or interleaved.get("p", {}).get("launcher") != "cmux"
+            or interleaved.get("p", {}).get("route") != "direct"):
+        failed += 1
+        print(f"FAIL  sweep HEAD/race guard: count={sweep_count} stamped={stamped} "
+              f"query={query_fields!r} rec={interleaved!r}")
+    else:
+        print("ok    sweep HEAD/race guard: branch reuse skipped; interleaved lock preserved")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger_path = pathlib.Path(tmp) / "ledger.json"
+        acquired = pathlib.Path(tmp) / "child-acquired"
+        child_code = (
+            "import fcntl,pathlib,sys; "
+            "f=open(sys.argv[1],'a+'); fcntl.flock(f.fileno(),fcntl.LOCK_EX); "
+            "pathlib.Path(sys.argv[2]).write_text('acquired')"
+        )
+        with mock.patch.object(w, "LEDGER", ledger_path):
+            with w._ledger_lock():
+                child = subprocess.Popen(
+                    [sys.executable, "-c", child_code,
+                     str(ledger_path) + ".lock", str(acquired)]
+                )
+                w.time.sleep(0.1)
+                child_blocked = child.poll() is None and not acquired.exists()
+            child.wait(timeout=5)
+        child_completed = child.returncode == 0 and acquired.exists()
+    if not child_blocked or not child_completed:
+        failed += 1
+        print(f"FAIL  process ledger lock: blocked={child_blocked} "
+              f"completed={child_completed} rc={child.returncode}")
+    else:
+        print("ok    process ledger lock: concurrent writer blocks until atomic update completes")
 
     responses = iter([
         subprocess.CompletedProcess(
