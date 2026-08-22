@@ -1684,7 +1684,8 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                 captured[field] = old.get(field, "")
         led[key] = {"p": captured,
                     "ts": _now_epoch(), "head": head,
-                    "provenance_locked": prior_locked or lock_provenance}
+                    "provenance_locked": prior_locked or lock_provenance,
+                    "revision": int(prior.get("revision", 0)) + 1}
         _write_ledger(led)
     return key
 
@@ -1762,6 +1763,56 @@ def _best_provenance(rec: dict, cfg: dict, body: str = "") -> tuple[dict, str]:
     return p, surf
 
 
+def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
+                       cfg: dict, source: str) -> bool:
+    """Publish only the latest revision for one exact ledger HEAD.
+
+    The process lock is the publication fence: a launcher cannot replace the
+    record between the latest-record reload and the GitHub mutation. Reloading
+    once more before setting ``done`` also fails closed if a hostile/non-locking
+    writer changed the revision during the mutation.
+    """
+    slug = key.partition("#")[0]
+    with _ledger_lock():
+        ledger = _load_ledger()
+        rec = ledger.get(key, {})
+        if not rec or not expected_head or rec.get("head") != expected_head:
+            return False
+        revision = int(rec.get("revision", 0))
+        best, surf = _best_provenance(rec, cfg, body)
+        best_labels = [x for x, _ in labels_for(best, cfg)]
+        publish = False
+        done = False
+        if source == "retry":
+            publish = not is_stamped(body)
+        elif not is_stamped(body):
+            publish = True
+            done = _prov_good(best, cfg)
+        else:
+            cur = prior_prov(body)
+            better = _prov_better(best, cur, cfg)
+            if prior_labels(body) == best_labels and not better:
+                done = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
+            elif _prov_good(cur, cfg) and not better:
+                done = True
+            elif better:
+                publish = True
+                done = _prov_good(best, cfg)
+            else:
+                done = not (surf and _surface_ref(surf))
+        if publish:
+            apply_stamp(pr, best, cfg, cfg["labels"], cfg["footer"],
+                        repo=slug, source=source)
+        latest_ledger = _load_ledger()
+        latest = latest_ledger.get(key, {})
+        if (latest.get("head") == expected_head
+                and int(latest.get("revision", 0)) == revision):
+            if source != "retry":
+                latest["done"] = done
+            _write_ledger(latest_ledger)
+        return publish
+
+
 def sweep(cfg: dict) -> int:
     """Stamp — and HEAL — every ledgered branch's PR. Prunes entries >14 days old.
 
@@ -1778,7 +1829,6 @@ def sweep(cfg: dict) -> int:
     if not led:
         return 0
     original = json.loads(json.dumps(led))
-    post_labels, post_footer = cfg["labels"], cfg["footer"]
     now, keep, n = _now_epoch(), {}, 0
     for key, rec in led.items():
         if now - rec.get("ts", 0) > 14 * 86400:
@@ -1796,45 +1846,18 @@ def sweep(cfg: dict) -> int:
         for pr in prs:
             if not rec.get("head") or pr.get("headRefOid") != rec.get("head"):
                 continue
-            num, body = str(pr["number"]), pr.get("body", "")
-            best, surf = _best_provenance(rec, cfg, body)
-            best_labels = [x for x, _ in labels_for(best, cfg)]
-            if not is_stamped(body):
-                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug, source="sweep:new")
+            source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
+            if _publish_ledger_pr(key, rec.get("head", ""), str(pr["number"]),
+                                  pr.get("body", ""), cfg, source):
                 n += 1
-                rec["done"] = _prov_good(best, cfg)
-                continue
-            cur = prior_prov(body)
-            better = _prov_better(best, cur, cfg)
-            if prior_labels(body) == best_labels and not better:
-                # Labels and durable provenance already match — nothing to gain.
-                rec["done"] = _prov_good(best, cfg) or not (surf and _surface_ref(surf))
-                continue
-            if _prov_good(cur, cfg) and not better:    # good stamp — freeze, don't chase renames
-                rec["done"] = True
-                continue
-            if better:                                 # missing identity or goal provenance — heal it
-                apply_stamp(num, best, cfg, post_labels, post_footer, repo=slug, source="sweep:heal")
-                n += 1
-                rec["done"] = _prov_good(best, cfg)
-            else:                                      # can't improve yet; retry only while the tab lives
-                rec["done"] = not (surf and _surface_ref(surf))
-    # Network work above intentionally runs without holding the process lock.
-    # Merge only sweep's completion bit into the latest same-HEAD record so a
-    # pre-exec writer that interleaves cannot lose its locked provenance.
+    # Network discovery above intentionally runs without holding the process
+    # lock. Publication is separately fenced; this final transaction only
+    # prunes an expired record if no writer changed it since the snapshot.
     with _ledger_lock():
         current = _load_ledger()
         for key, old in original.items():
-            updated = keep.get(key)
-            latest = current.get(key)
-            if updated is None:
-                if latest == old:
-                    current.pop(key, None)
-                continue
-            if not latest or latest.get("head") != old.get("head"):
-                continue
-            if "done" in updated:
-                latest["done"] = updated["done"]
+            if key not in keep and current.get(key) == old:
+                current.pop(key, None)
         _write_ledger(current)
     return n
 
@@ -1867,12 +1890,8 @@ def retry_pending_pr(key: str, cfg: dict, attempts: int = 24, delay: float = 5.0
         prs = _recent_prs(res.stdout, rec)
         if prs:
             for pr in prs:
-                body = pr.get("body", "")
-                if is_stamped(body):
-                    continue
-                best, _surf = _best_provenance(rec, cfg, body)
-                apply_stamp(str(pr["number"]), best, cfg, cfg["labels"], cfg["footer"],
-                            repo=slug, source="retry")
+                _publish_ledger_pr(key, rec.get("head", ""), str(pr["number"]),
+                                   pr.get("body", ""), cfg, "retry")
             return 0
         remaining = deadline - time.monotonic()
         if attempt + 1 < max(1, attempts) and remaining > 0:

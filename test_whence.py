@@ -670,7 +670,8 @@ def main() -> int:
             or recorded["p"].get("workstream") != "SY-LF-2026-08-20"
             or recorded["p"].get("launcher") != "cmux"
             or recorded["p"].get("route") != "direct"
-            or not recorded.get("provenance_locked")):
+            or not recorded.get("provenance_locked")
+            or recorded.get("revision") != 3):
         failed += 1
         print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
@@ -690,20 +691,32 @@ def main() -> int:
         }}))
         locked_p = dict(old_p, tab="Launcher", workstream="SY-LF-LOCKED",
                         launcher="cmux", route="direct")
+        newer_p = dict(locked_p, tab="Newer", workstream="SY-LF-NEWER")
         queried = []
         stamped = []
 
         def sweep_query(*args, **kwargs):
             queried.append(args)
+            # Interleave a legitimate pre-exec revision after sweep's branch
+            # snapshot but before its locked publication preflight.
+            w.ledger_record("", locked_p, "danielraffel/pulp", "fix/reused",
+                            "same-head", str(pathlib.Path.cwd()), lock_provenance=True)
             return subprocess.CompletedProcess([], 0, json.dumps([
                 {"number": 40, "body": "", "headRefOid": "force-pushed-head"},
                 {"number": 41, "body": "", "headRefOid": "same-head"},
             ]), "")
 
-        def interleaved_stamp(pr, *args, **kwargs):
-            stamped.append(pr)
-            w.ledger_record("", locked_p, "danielraffel/pulp", "fix/reused",
-                            "same-head", str(pathlib.Path.cwd()), lock_provenance=True)
+        def interleaved_stamp(pr, provenance, *args, **kwargs):
+            stamped.append((pr, dict(provenance)))
+            # Force a hostile non-locking write during the external mutation.
+            # The post-mutation revision check must not mark it done.
+            latest = w._load_ledger()
+            latest[sweep_key] = {
+                "p": newer_p, "ts": 102, "head": "same-head",
+                "provenance_locked": True,
+                "revision": latest[sweep_key]["revision"] + 1,
+            }
+            w._write_ledger(latest)
 
         sweep_cfg = {
             "labels": False, "footer": False, "hide": set(),
@@ -719,16 +732,21 @@ def main() -> int:
             sweep_count = w.sweep(sweep_cfg)
         interleaved = json.loads(ledger_path.read_text())[sweep_key]
     query_fields = queried[0][queried[0].index("--json") + 1] if queried else ""
-    if (sweep_count != 1 or stamped != ["41"] or "headRefOid" not in query_fields
+    stamped_pr = stamped[0][0] if stamped else ""
+    stamped_p = stamped[0][1] if stamped else {}
+    if (sweep_count != 1 or stamped_pr != "41" or "headRefOid" not in query_fields
+            or stamped_p.get("workstream") != "SY-LF-LOCKED"
+            or stamped_p.get("launcher") != "cmux" or stamped_p.get("route") != "direct"
             or not interleaved.get("provenance_locked")
-            or interleaved.get("p", {}).get("workstream") != "SY-LF-LOCKED"
+            or interleaved.get("p", {}).get("workstream") != "SY-LF-NEWER"
             or interleaved.get("p", {}).get("launcher") != "cmux"
-            or interleaved.get("p", {}).get("route") != "direct"):
+            or interleaved.get("p", {}).get("route") != "direct"
+            or interleaved.get("done")):
         failed += 1
         print(f"FAIL  sweep HEAD/race guard: count={sweep_count} stamped={stamped} "
               f"query={query_fields!r} rec={interleaved!r}")
     else:
-        print("ok    sweep HEAD/race guard: branch reuse skipped; interleaved lock preserved")
+        print("ok    sweep revision fence: latest context published; newer revision not done")
 
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
@@ -777,28 +795,50 @@ def main() -> int:
     queries = []
     def fake_pr_list(*args, **kwargs):
         queries.append((args, kwargs))
-        return next(responses)
-    publication_cfg = {"labels": False, "footer": True}
-    with mock.patch.object(w, "_load_ledger", return_value={key: rec}), \
-         mock.patch.object(w, "sh", side_effect=fake_pr_list), \
-         mock.patch.object(w, "apply_stamp", side_effect=lambda *a, **k: applied.append((a, k))), \
-         mock.patch.object(w.time, "sleep") as sleep:
-        rc = w.retry_pending_pr(key, publication_cfg, attempts=2, delay=0.01)
+        response = next(responses)
+        if len(queries) == 2:
+            latest = w._load_ledger()
+            latest[key] = {**latest[key], "p": rec["p"], "revision": 2,
+                           "provenance_locked": True}
+            w._write_ledger(latest)
+        return response
+    publication_cfg = {
+        "labels": False, "footer": True, "hide": set(),
+        "colors": dict(w.DEFAULT_COLORS), "label_maxlen": 24,
+        "denylist": [], "redact_placeholder": "(redacted)",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        retry_ledger = pathlib.Path(tmp) / "ledger.json"
+        retry_rec = json.loads(json.dumps(rec))
+        retry_rec.update({"revision": 1, "provenance_locked": False})
+        retry_rec["p"].update({"workstream": "SY-LF-OLD", "launcher": "daemon", "route": "queue"})
+        retry_ledger.write_text(json.dumps({key: retry_rec}))
+        with mock.patch.object(w, "LEDGER", retry_ledger), \
+             mock.patch.object(w, "sh", side_effect=fake_pr_list), \
+             mock.patch.object(w, "apply_stamp", side_effect=lambda *a, **k: applied.append((a, k))), \
+             mock.patch.object(w.time, "sleep") as sleep:
+            rc = w.retry_pending_pr(key, publication_cfg, attempts=2, delay=0.01)
     policy_kept = (len(applied) == 1 and applied[0][0][0] == "6195"
+                   and applied[0][0][1].get("workstream") == "SY-LF-2026-08-20"
+                   and applied[0][0][1].get("launcher") == "cmux"
+                   and applied[0][0][1].get("route") == "direct"
                    and applied[0][0][3:5] == (False, True))
     timeouts_bounded = all(0 < q[1].get("timeout", 0) <= 5 for q in queries)
     if rc != 0 or not policy_kept or not timeouts_bounded or applied[0][1].get("repo") != "danielraffel/pulp" or sleep.call_count != 1:
         failed += 1
         print(f"FAIL  deferred retry: rc={rc} applied={applied} sleeps={sleep.call_count}")
     else:
-        print("ok    deferred retry: exact HEAD appears later; old/fork PRs ignored")
+        print("ok    deferred retry fence: exact HEAD uses latest same-HEAD revision")
 
     empty = subprocess.CompletedProcess([], 0, "[]", "")
-    with mock.patch.object(w, "_load_ledger", return_value={key: rec}), \
-         mock.patch.object(w, "sh", return_value=empty) as deadline_sh, \
-         mock.patch.object(w.time, "monotonic", side_effect=[0, 0, 119, 121]), \
-         mock.patch.object(w.time, "sleep") as deadline_sleep:
-        w.retry_pending_pr(key, publication_cfg, attempts=24, delay=5, max_wait=120)
+    with tempfile.TemporaryDirectory() as tmp:
+        deadline_ledger = pathlib.Path(tmp) / "ledger.json"
+        deadline_ledger.write_text(json.dumps({key: rec}))
+        with mock.patch.object(w, "LEDGER", deadline_ledger), \
+             mock.patch.object(w, "sh", return_value=empty) as deadline_sh, \
+             mock.patch.object(w.time, "monotonic", side_effect=[0, 0, 119, 121]), \
+             mock.patch.object(w.time, "sleep") as deadline_sleep:
+            w.retry_pending_pr(key, publication_cfg, attempts=24, delay=5, max_wait=120)
     if deadline_sh.call_count != 1 or deadline_sleep.call_args_list != [mock.call(1)]:
         failed += 1
         print(f"FAIL  retry deadline: queries={deadline_sh.call_count} sleeps={deadline_sleep.call_args_list}")
