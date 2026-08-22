@@ -49,6 +49,13 @@ environment variables through the PR command: `WHENCE_WORKSTREAM_ID`,
 `WHENCE_LAUNCHER`, `WHENCE_ROUTE`, and `WHENCE_ROUTER`. Never put an account
 identity, credential, URL, private path, or transcript in those fields.
 
+For Shipyard, pass the same durable identity with
+`shipyard pr --workstream-id <id>`. Whence snapshots that literal flag before a
+detached worker can outlive the shell. Stable launcher/route defaults and exact
+repository overrides may live under `provenance` in the fleet-synced Whence
+config; explicit launcher environment always wins. Missing or malformed values
+remain unresolved rather than being inferred.
+
 ## Notes
 
 - Works for Claude Code and Codex — the resume command is sourced from cmux's

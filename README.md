@@ -383,13 +383,20 @@ settings any time (so you never have to wonder where it lives).
 {
   "fields": {
     "agent": true, "host": true, "workspace": true, "tab": true,
+    "workstream": true, "launcher": true, "route": true, "router": true,
     "session": true, "resume": true, "url": true,
     "jump": true, "relaunch": true, "stamped": true
   },
   "labels": true,
   "footer": true,
-  "colors": { "agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df" },
+  "colors": { "agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700", "tab": "8250df", "route": "d4a72c" },
   "repos": { "mode": "all", "list": [] },
+  "provenance": {
+    "default": { "launcher": "cmux", "route": "direct" },
+    "repositories": {
+      "Generous-Corp/forge": { "route": "subrouter", "router": "m3" }
+    }
+  },
   "gh": "gh",
   "label_maxlen": 24
 }
@@ -437,6 +444,35 @@ WHENCE_ROUTE=subrouter \
 WHENCE_ROUTER=m3 \
 codex
 ```
+
+The automatic `shipyard`/`pulp` wrapper also snapshots an explicit durable
+handoff before the command starts, so a daemon may open the PR after the shell,
+SSH connection, or agent has exited without losing its workstream:
+
+```bash
+shipyard pr --workstream-id agent-workstream-continuity-20260813
+```
+
+Launcher and route values resolve in this order: command/session `WHENCE_*`, an
+exact case-sensitive repository entry under `provenance.repositories`, then
+`provenance.default`. The synced config is useful for stable fleet facts such as
+`cmux` + `direct`; a Subrouter or repair launcher should override them in its
+own environment. A repository workstream override is supported for a genuinely
+repo-wide durable workstream, but ordinary task work should use the explicit
+launcher variable or `--workstream-id` rather than a mutable repo default.
+
+The synchronous pre-exec ledger owns the snapshot. Detached retries and delayed
+workers read it instead of depending on their minimal environment, and a later
+hook for the same exact HEAD cannot degrade known context to unresolved. The
+`provenance` config block is part of the existing private config-repo sync, so
+M1/M3/M5 converge automatically and an offline host catches up on its next
+sweep tick. Retry and global-sweep stamping require the captured `headRefOid`,
+and a monotonic record revision plus process-locked publication fence ensures
+they reload the latest same-HEAD context before mutating GitHub. Atomic ledger
+updates prevent a delayed sweep from replacing or completing a newer launcher
+snapshot. A failed config pull is inert; a successful pull is reloaded before
+that tick stamps anything. Exact repository overrides make different routing
+policy possible without per-worktree files.
 
 These values are public metadata, so Whence accepts only compact identifiers.
 URLs, paths, email/account names, query strings, and credentials fail closed.
