@@ -265,6 +265,33 @@ def main() -> int:
             else:
                 print(f"ok    command action: {name}")
 
+        context_cases = [
+            ("explicit handoff",
+             "shipyard pr --workstream-id SY-LF-2026-08-20",
+             {"workstream": "SY-LF-2026-08-20"}),
+            ("equals handoff through wrappers",
+             "nohup env WHENCE_LAUNCHER=cmux WHENCE_ROUTE=direct "
+             "shipyard pr --workstream-id=SY-LF-P1 &",
+             {"workstream": "SY-LF-P1", "launcher": "cmux", "route": "direct"}),
+            ("nested delayed worker",
+             "WHENCE_LAUNCHER=cmux setsid bash -lc "
+             "'exec shipyard pr --workstream-id SY-LF-P2' &",
+             {"workstream": "SY-LF-P2", "launcher": "cmux"}),
+            ("diagnostic literal is not context",
+             "rg 'shipyard pr --workstream-id WRONG' .",
+             {}),
+            ("malformed explicit value fails closed",
+             "WHENCE_ROUTE=https://router.invalid shipyard pr --workstream-id=/private/path",
+             {"workstream": "", "route": ""}),
+        ]
+        for name, cmd, want in context_cases:
+            got = w.command_provenance_context(cmd)
+            if got != want:
+                failed += 1
+                print(f"FAIL  command provenance: {name}: got={got!r} want={want!r}")
+            else:
+                print(f"ok    command provenance: {name}")
+
     # Denylist redaction: a cmux tab/workspace title with a forbidden name must
     # never reach a label OR the public footer. cmux gives us no way to rename a
     # tab, so redaction at publish time is the only enforcement.
@@ -447,6 +474,86 @@ def main() -> int:
             failed += 1; print(f"FAIL  stable_identifier({src!r})={got!r} want={want!r}")
         else: print(f"ok    stable_identifier({src!r}) -> {got!r}")
 
+    provenance_cfg = {
+        "denylist": [], "hide": set(),
+        "provenance": {
+            "default": {"launcher": "cmux", "route": "direct"},
+            "repositories": {
+                "Generous-Corp/pulp": {
+                    "workstream": "SY-LF-2026-08-20", "route": "shipyard-daemon"
+                },
+                "Generous-Corp/bad": {"route": "https://router.invalid"},
+            },
+        },
+    }
+    collect_patches = (
+        mock.patch.object(w, "host_label", return_value="m3"),
+        mock.patch.object(w, "cmux_workspace", return_value=""),
+        mock.patch.object(w, "cmux_tab_title", return_value=("", "")),
+        mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")),
+    )
+    with mock.patch.dict(_os.environ, {}, clear=True), collect_patches[0], \
+         collect_patches[1], collect_patches[2], collect_patches[3]:
+        absent = w.collect({"denylist": [], "hide": set()}, "Generous-Corp/pulp")
+        configured = w.collect(provenance_cfg, "Generous-Corp/pulp")
+        malformed = w.collect(provenance_cfg, "Generous-Corp/bad")
+    with mock.patch.dict(_os.environ, {
+            "WHENCE_WORKSTREAM_ID": "SY-LF-P3", "WHENCE_LAUNCHER": "cmux-continue-session",
+            "WHENCE_ROUTE": "subrouter", "WHENCE_ROUTER": "m5",
+         }, clear=True), mock.patch.object(w, "host_label", return_value="m3"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("", "")), \
+         mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+        inherited = w.collect(provenance_cfg, "Generous-Corp/pulp")
+    with mock.patch.dict(_os.environ, {"WHENCE_ROUTE": "https://bad.invalid"}, clear=True), \
+         mock.patch.object(w, "host_label", return_value="m3"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("", "")), \
+         mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+        invalid_inherited = w.collect(provenance_cfg, "Generous-Corp/pulp")
+    context_ok = (
+        absent["workstream"] == "" and absent["launcher"] == "unresolved"
+        and absent["route"] == "unresolved"
+        and configured["workstream"] == "SY-LF-2026-08-20"
+        and configured["launcher"] == "cmux" and configured["route"] == "shipyard-daemon"
+        and malformed["launcher"] == "cmux" and malformed["route"] == "unresolved"
+        and inherited["workstream"] == "SY-LF-P3"
+        and inherited["launcher"] == "cmux-continue-session"
+        and inherited["route"] == "subrouter" and inherited["router"] == "m5"
+        and invalid_inherited["route"] == "unresolved")
+    if not context_ok:
+        failed += 1
+        print(f"FAIL  configured/inherited provenance: absent={absent!r} configured={configured!r} "
+              f"malformed={malformed!r} inherited={inherited!r} invalid={invalid_inherited!r}")
+    else:
+        print("ok    configured/inherited provenance: explicit precedence + fail-closed absence")
+
+    # The context policy uses Whence's existing offline-rejoin channel. Pulling
+    # a newer fleet snapshot must preserve the host-local GitHub client while
+    # applying the provenance block exactly once.
+    with tempfile.TemporaryDirectory() as tmp:
+        sync_root = pathlib.Path(tmp)
+        backup = sync_root / "config-repo"
+        local_config = sync_root / "config.json"
+        (backup / ".git").mkdir(parents=True)
+        fleet_provenance = provenance_cfg["provenance"]
+        (backup / "config.json").write_text(json.dumps({
+            "provenance": fleet_provenance, "labels": True,
+        }))
+        local_config.write_text(json.dumps({"gh": "ghapp", "labels": False}))
+        with mock.patch.object(w, "BACKUP_DIR", backup), \
+             mock.patch.object(w, "CONFIG_FILE", local_config), \
+             mock.patch.object(w, "_git", return_value=subprocess.CompletedProcess([], 0, "", "")):
+            first_pull = w.pull_config()
+            second_pull = w.pull_config()
+        synced = json.loads(local_config.read_text())
+    if (not first_pull or second_pull or synced.get("gh") != "ghapp"
+            or synced.get("provenance") != fleet_provenance or synced.get("labels") is not True):
+        failed += 1
+        print(f"FAIL  offline config rejoin: first={first_pull} second={second_pull} synced={synced!r}")
+    else:
+        print("ok    offline config rejoin: provenance converges once; host-local gh preserved")
+
     # A launcher supplies identity and route independently. The exact values
     # survive collection and appear in the machine-readable tag plus footer.
     env = {
@@ -508,15 +615,25 @@ def main() -> int:
     key = "danielraffel/pulp#fix/deferred"
     rec = {"p": {f: "" for f in w.FIELDS}, "ts": 1784270822, "head": "new-head"}
     rec["p"].update({"agent": "claude", "host": "m3", "tab": "Deferred PR",
+                     "workstream": "SY-LF-2026-08-20", "launcher": "cmux",
+                     "route": "direct",
                      "goals": "https://github.com/acme/planning/blob/main/goal.md"})
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
         with mock.patch.object(w, "LEDGER", ledger_path), \
              mock.patch.object(w, "_now_epoch", return_value=1):
+            unlocked = dict(rec["p"], workstream="SY-LF-STALE",
+                            launcher="daemon", route="queue")
+            w.ledger_record("", unlocked, "danielraffel/pulp", "fix/deferred",
+                            "origin/main", str(pathlib.Path.cwd()))
             recorded_key = w.ledger_record(
                 "", rec["p"], "danielraffel/pulp", "fix/deferred",
-                "origin/main", str(pathlib.Path.cwd()),
+                "origin/main", str(pathlib.Path.cwd()), lock_provenance=True,
             )
+            conflicting = dict(rec["p"], workstream="SY-LF-WRONG",
+                               launcher="daemon", route="queue")
+            w.ledger_record("", conflicting, "danielraffel/pulp", "fix/deferred",
+                            "origin/main", str(pathlib.Path.cwd()))
             recorded = json.loads(ledger_path.read_text())[key]
             recorded_head = recorded["head"]
             recorded_goal = recorded["p"].get("goals")
@@ -524,11 +641,15 @@ def main() -> int:
         ["git", "rev-parse", "origin/main"], check=True, capture_output=True, text=True
     ).stdout.strip()
     if (recorded_key != key or recorded_head != expected_head
-            or recorded_goal != rec["p"]["goals"]):
+            or recorded_goal != rec["p"]["goals"]
+            or recorded["p"].get("workstream") != "SY-LF-2026-08-20"
+            or recorded["p"].get("launcher") != "cmux"
+            or recorded["p"].get("route") != "direct"
+            or not recorded.get("provenance_locked")):
         failed += 1
         print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
-        print("ok    ledger capture: deferred retry receives branch + HEAD identity")
+        print("ok    ledger capture: same-HEAD delayed worker cannot replace pre-exec provenance")
 
     responses = iter([
         subprocess.CompletedProcess(
@@ -638,6 +759,7 @@ def main() -> int:
         ).stdout.strip()
         pre_ok = (pre_key == "danielraffel/preexec-test#fix/preexec"
                   and pre_rec.get("head") == current_head
+                  and pre_rec.get("provenance_locked") is True
                   and pre_rec.get("p", {}).get("path", "").endswith("/repo")
                   and pre_spawn.call_args_list == [mock.call(pre_key, pcfg, False, True)])
         if not pre_ok:
@@ -670,6 +792,8 @@ def main() -> int:
             "#!/bin/sh\n"
             "if [ \"$1\" = --pre-exec ]; then\n"
             "  touch \"$WHENCE_FAKE_STATE/preexec\"\n"
+            "  printf '%s|%s|%s\\n' \"$WHENCE_WORKSTREAM_ID\" \"$WHENCE_LAUNCHER\" \"$WHENCE_ROUTE\" "
+            "> \"$WHENCE_FAKE_STATE/context\"\n"
             "  (while [ ! -f \"$WHENCE_FAKE_STATE/pr-created\" ]; do sleep 0.01; done; "
             "touch \"$WHENCE_FAKE_STATE/stamped\") >/dev/null 2>&1 &\n"
             "elif [ \"$1\" = --sweep ]; then\n"
@@ -712,19 +836,23 @@ def main() -> int:
         env.update({"WHENCE_FAKE_STATE": str(state), "ZDOTDIR": str(root)})
         late_path = f'PATH="{bindir}:$PATH"'
         driven = subprocess.run(
-            ["zsh", "-fc", f'source "{hook_file}"; {late_path}; shipyard pr'],
+            ["zsh", "-fc", f'source "{hook_file}"; {late_path}; '
+             'WHENCE_LAUNCHER=cmux WHENCE_ROUTE=direct '
+             'shipyard pr --workstream-id SY-LF-2026-08-20'],
             env=env, capture_output=True, text=True, timeout=5,
         )
         lifecycle_ok = (driven.returncode == 0 and (state / "preexec").exists()
                         and (state / "started").exists() and (state / "stamped").exists()
                         and (state / "swept").exists()
-                        and not (state / "recollected").exists())
+                        and not (state / "recollected").exists()
+                        and (state / "context").read_text().strip()
+                        == "SY-LF-2026-08-20|cmux|direct")
         if not lifecycle_ok:
             failed += 1
             print(f"FAIL  long-running wrapper: rc={driven.returncode} out={driven.stdout!r} err={driven.stderr!r}")
         else:
             print("ok    long-running wrapper: pre-exec stamp kept; post path sweeps ledger")
-        for name in ("preexec", "stamped", "pr-created", "started", "swept", "recollected"):
+        for name in ("preexec", "stamped", "pr-created", "started", "swept", "recollected", "context"):
             try: (state / name).unlink()
             except FileNotFoundError: pass
         help_run = subprocess.run(

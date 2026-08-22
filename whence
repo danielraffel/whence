@@ -116,6 +116,10 @@ DEFAULT_CONFIG = {
     "footer": True,
     "colors": dict(DEFAULT_COLORS),
     "repos": {"mode": "all", "list": []},
+    # Explicit launcher-owned context. Fleet config syncs this block through the
+    # private config repository; an exact repository key may override defaults.
+    # Empty means fail closed to unresolved rather than infer an account/route.
+    "provenance": {"default": {}, "repositories": {}},
     "gh": "gh",
     "label_maxlen": 24,
     # Names we must never publish — a cmux tab/workspace title that contains any of
@@ -230,6 +234,7 @@ def github_call(client: str, *args: str) -> subprocess.CompletedProcess:
 def load_config(cli_hide: str) -> dict:
     # footer/labels default ON; either can be turned off globally or per-run.
     cfg = {"hide": set(), "colors": dict(DEFAULT_COLORS), "repos": {},
+           "provenance": {"default": {}, "repositories": {}},
            "footer": True, "labels": True, "gh": "", "label_maxlen": 24,
            "denylist": [], "redact_placeholder": "(redacted)", "audit_log": False,
            "order_labels": False}
@@ -251,6 +256,8 @@ def load_config(cli_hide: str) -> dict:
         field("hide", lambda v: cfg["hide"].update(set(v)))
         field("colors", lambda v: cfg["colors"].update(v))
         field("repos", lambda v: cfg.__setitem__("repos", v if isinstance(v, dict) else cfg["repos"]))
+        field("provenance", lambda v: cfg.__setitem__(
+            "provenance", v if isinstance(v, dict) else cfg["provenance"]))
         field("footer", lambda v: cfg.__setitem__("footer", bool(v)))
         field("labels", lambda v: cfg.__setitem__("labels", bool(v)))
         field("gh", lambda v: cfg.__setitem__("gh", str(v or "")))
@@ -489,7 +496,38 @@ def stable_identifier(value: str, default: str = "", maxlen: int = 80) -> str:
     return value
 
 
-def collect(cfg: dict | None = None) -> dict:
+def configured_provenance(cfg: dict, repo: str = "") -> dict[str, str]:
+    """Resolve explicit fleet defaults plus one exact repository override.
+
+    Repository keys are exact GitHub slugs. Values still pass the public-safe
+    identifier gate, so a bad synced config degrades to absent/unresolved and
+    can never leak a URL, path, account, or credential into public metadata.
+    """
+    section = cfg.get("provenance") if isinstance(cfg, dict) else {}
+    if not isinstance(section, dict):
+        return {}
+    default = section.get("default")
+    repositories = section.get("repositories")
+    values = dict(default) if isinstance(default, dict) else {}
+    override = repositories.get(repo) if isinstance(repositories, dict) and repo else None
+    if isinstance(override, dict):
+        values.update(override)
+    return {field: stable_identifier(values.get(field, ""))
+            for field in ("workstream", "launcher", "route", "router")}
+
+
+def _context_value(env_name: str, configured: str, default: str = "") -> str:
+    """Prefer an explicitly present launcher value, even when it is invalid.
+
+    Falling back after a malformed explicit value would silently replace the
+    launcher's claim with fleet policy. Fail closed instead.
+    """
+    if env_name in os.environ:
+        return stable_identifier(os.environ.get(env_name, ""), default)
+    return stable_identifier(configured, default)
+
+
+def collect(cfg: dict | None = None, repo: str = "") -> dict:
     explicit_agent = stable_identifier(os.environ.get("WHENCE_AGENT", ""))
     agent = explicit_agent or os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
@@ -522,10 +560,14 @@ def collect(cfg: dict | None = None) -> dict:
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
     p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
-    p["workstream"] = stable_identifier(os.environ.get("WHENCE_WORKSTREAM_ID", ""))
-    p["launcher"] = stable_identifier(os.environ.get("WHENCE_LAUNCHER", ""), "unresolved")
-    p["route"] = stable_identifier(os.environ.get("WHENCE_ROUTE", ""), "unresolved")
-    p["router"] = stable_identifier(os.environ.get("WHENCE_ROUTER", ""))
+    context = configured_provenance(cfg or {}, repo)
+    p["workstream"] = _context_value(
+        "WHENCE_WORKSTREAM_ID", context.get("workstream", ""))
+    p["launcher"] = _context_value(
+        "WHENCE_LAUNCHER", context.get("launcher", ""), "unresolved")
+    p["route"] = _context_value(
+        "WHENCE_ROUTE", context.get("route", ""), "unresolved")
+    p["router"] = _context_value("WHENCE_ROUTER", context.get("router", ""))
 
     restore = ""
     if surface:
@@ -717,7 +759,14 @@ def _hook_file_text() -> tuple[str, list]:
         "__whence_real() { if [ -n \"${ZSH_VERSION:-}\" ]; then whence -p \"$1\"; "
         "else type -P \"$1\"; fi 2>/dev/null; }",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
-        "__whence_preexec() { command whence --pre-exec \"$PWD\" >/dev/null 2>&1 || true; }",
+        "__whence_preexec() { "
+        "__whence_workstream=; while [ \"$#\" -gt 0 ]; do case \"$1\" in "
+        "--workstream-id=*) __whence_workstream=${1#*=} ;; "
+        "--workstream-id) shift; [ \"$#\" -gt 0 ] && __whence_workstream=$1 ;; "
+        "esac; shift; done; "
+        "if [ -n \"$__whence_workstream\" ]; then "
+        "WHENCE_WORKSTREAM_ID=\"$__whence_workstream\" command whence --pre-exec \"$PWD\"; "
+        "else command whence --pre-exec \"$PWD\"; fi >/dev/null 2>&1 || true; }",
         "__whence_sweep() { command whence --sweep >/dev/null 2>&1 || true; }",
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
@@ -725,7 +774,7 @@ def _hook_file_text() -> tuple[str, list]:
     for tool, trig in tools:
         binary = f"$__whence_{tool}_bin"
         active = f'[ -n "{binary}" ] && {trig} && __whence_will_act "$@"'
-        before = f"if {active}; then __whence_preexec; fi; " if tool in PREEXEC_TOOLS else ""
+        before = f"if {active}; then __whence_preexec \"$@\"; fi; " if tool in PREEXEC_TOOLS else ""
         after = "__whence_sweep" if tool in PREEXEC_TOOLS else "__whence_stamp"
         lines.append(
             f'{tool}() {{ __whence_{tool}_bin="$(__whence_real {tool})"; '
@@ -1224,6 +1273,12 @@ def _git(cwd, *a):
 
 
 _ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.S)
+_COMMAND_CONTEXT_ENV = {
+    "WHENCE_WORKSTREAM_ID": "workstream",
+    "WHENCE_LAUNCHER": "launcher",
+    "WHENCE_ROUTE": "route",
+    "WHENCE_ROUTER": "router",
+}
 
 
 def _without_heredoc_bodies(cmd: str) -> str:
@@ -1341,6 +1396,37 @@ def _simple_shell_commands(cmd: str) -> list[list[str]]:
     return out
 
 
+def _peel_command_wrappers(argv: list[str], explicit: dict[str, str] | None = None) -> list[str]:
+    """Remove supported launch wrappers and capture literal `env` context."""
+    argv = list(argv)
+    while argv:
+        exe = os.path.basename(argv[0])
+        if exe in ("command", "builtin", "nohup", "exec", "setsid", "time"):
+            argv = argv[1:]
+            continue
+        if exe == "env":
+            argv = argv[1:]
+            while argv and (argv[0].startswith("-") or _ASSIGN_TOKEN_RE.match(argv[0])):
+                assignment = _ASSIGN_TOKEN_RE.match(argv[0])
+                if assignment and explicit is not None:
+                    field = _COMMAND_CONTEXT_ENV.get(assignment.group(1))
+                    if field:
+                        explicit[field] = stable_identifier(assignment.group(2))
+                argv = argv[1:]
+            continue
+        if exe == "timeout":
+            argv = argv[1:]
+            while argv and argv[0].startswith("-"):
+                option = argv.pop(0)
+                if option in ("-k", "--kill-after", "-s", "--signal") and argv:
+                    argv.pop(0)
+            if argv:
+                argv = argv[1:]
+            continue
+        break
+    return argv
+
+
 def _resolve_cmd_path(raw: str, vars_: dict[str, str], cwd: str | None = None):
     value = raw.strip().strip("'\"")
     value = re.sub(r"\$\{?(\w+)\}?", lambda m: vars_.get(m.group(1), ""), value)
@@ -1379,26 +1465,7 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
         # Peel the wrappers agents actually use around long-running PR commands.
         # In particular, `nohup bash -lc '... shipyard pr ...'` bypasses the live
         # shell function, so the PostToolUse parser is the only capture path.
-        while argv:
-            exe = os.path.basename(argv[0])
-            if exe in ("command", "builtin", "nohup", "exec", "setsid", "time"):
-                argv = argv[1:]
-                continue
-            if exe == "env":
-                argv = argv[1:]
-                while argv and (_ASSIGN_TOKEN_RE.match(argv[0]) or argv[0].startswith("-")):
-                    argv = argv[1:]
-                continue
-            if exe == "timeout":
-                argv = argv[1:]
-                while argv and argv[0].startswith("-"):
-                    option = argv.pop(0)
-                    if option in ("-k", "--kill-after", "-s", "--signal") and argv:
-                        argv.pop(0)
-                if argv:                         # duration (e.g. 900 or 2m)
-                    argv = argv[1:]
-                continue
-            break
+        argv = _peel_command_wrappers(argv)
         if not argv:
             continue
         raw_exe = argv[0]
@@ -1433,6 +1500,51 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
             if j < len(argv) and argv[j] == "push":
                 return False, True, git_cwd
     return False, False, None
+
+
+def command_provenance_context(cmd: str) -> dict[str, str]:
+    """Read only literal context supplied to the PR-opening command.
+
+    This mirrors the small wrapper vocabulary accepted by `_command_action` and
+    never evaluates shell text. `--workstream-id` is Shipyard's durable handoff
+    identifier, so it is safe to snapshot as Whence's workstream. Literal
+    `WHENCE_*` assignments are also preserved when a PostToolUse hook runs after
+    their command-scoped environment has disappeared.
+    """
+    for tokens in _simple_shell_commands(cmd):
+        explicit: dict[str, str] = {}
+        i = 0
+        while i < len(tokens):
+            assignment = _ASSIGN_TOKEN_RE.match(tokens[i])
+            if not assignment:
+                break
+            field = _COMMAND_CONTEXT_ENV.get(assignment.group(1))
+            if field:
+                explicit[field] = stable_identifier(assignment.group(2))
+            i += 1
+        argv = tokens[i:]
+        argv = _peel_command_wrappers(argv, explicit)
+        if not argv:
+            continue
+        exe = os.path.basename(os.path.expanduser(argv[0]))
+        if exe in ("bash", "zsh", "sh", "dash", "ksh"):
+            for j, arg in enumerate(argv[1:], 1):
+                if arg == "-c" or (arg.startswith("-") and "c" in arg[1:]):
+                    if j + 1 < len(argv):
+                        nested = command_provenance_context(argv[j + 1])
+                        if nested:
+                            return {**explicit, **nested}
+                    break
+            continue
+        if exe not in ("shipyard", "pulp") or argv[1:2] != ["pr"]:
+            continue
+        for j, arg in enumerate(argv[2:], 2):
+            if arg.startswith("--workstream-id="):
+                explicit["workstream"] = stable_identifier(arg.partition("=")[2])
+            elif arg == "--workstream-id" and j + 1 < len(argv):
+                explicit["workstream"] = stable_identifier(argv[j + 1])
+        return explicit
+    return {}
 
 
 def _cmd_cwd(cmd: str):
@@ -1499,7 +1611,8 @@ def _recent_prs(raw: str, rec: dict) -> list[dict]:
 
 
 def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
-                  source_ref: str = "", hook_cwd: str = "") -> str:
+                  source_ref: str = "", hook_cwd: str = "",
+                  lock_provenance: bool = False) -> str:
     """Remember which tab/session/machine owns this branch, keyed owner/repo#branch.
 
     `slug`/`br` come from the command's own output when it named them — always
@@ -1520,8 +1633,23 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
     led = _load_ledger()
     key = f"{slug}#{br}"
     head = _git(cmd_cwd, "rev-parse", source_ref or br or "HEAD").stdout.strip()
-    led[key] = {"p": {k: p.get(k, "") for k in FIELDS},
-                "ts": _now_epoch(), "head": head}
+    captured = {k: p.get(k, "") for k in FIELDS}
+    prior = led.get(key, {})
+    # The synchronous shell wrapper locks context before a long-running
+    # Shipyard command. A later PostToolUse hook may run after command-scoped
+    # environment vanished or fleet config may have changed while the command
+    # ran. For the same immutable head only, never replace that pre-exec
+    # snapshot. An older unlocked push observation must not outrank the actual
+    # launcher handoff, so it remains replaceable until pre-exec takes the lock.
+    prior_locked = bool(head and prior.get("head") == head
+                        and prior.get("provenance_locked"))
+    if prior_locked:
+        old = prior.get("p", {})
+        for field in ("workstream", "launcher", "route", "router"):
+            captured[field] = old.get(field, "")
+    led[key] = {"p": captured,
+                "ts": _now_epoch(), "head": head,
+                "provenance_locked": prior_locked or lock_provenance}
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     LEDGER.write_text(json.dumps(led))
     return key
@@ -1746,9 +1874,9 @@ def preexec_capture(cwd: str, cfg: dict, post_labels: bool, post_footer: bool) -
     if ((top and (pathlib.Path(top) / ".whence-off").exists())
             or not slug or not br or not repo_allowed(cfg, slug)):
         return ""
-    p = collect(cfg)
+    p = collect(cfg, slug)
     p["path"] = sanitize_path(cwd, cfg)
-    key = ledger_record("", p, slug, br, "HEAD", cwd)
+    key = ledger_record("", p, slug, br, "HEAD", cwd, lock_provenance=True)
     if key:
         _spawn_retry(key, cfg, post_labels, post_footer)
     return key
@@ -2217,7 +2345,14 @@ def main() -> int:
             print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
 
-    p = collect(cfg)
+    context_cwd = _cmd_cwd(hook_cmd) if args.hook else os.getcwd()
+    context_repo = hook_slug or _repo_branch(context_cwd or os.getcwd())[0]
+    p = collect(cfg, context_repo)
+    if args.hook:
+        # Command-scoped assignments are gone by PostToolUse time. Preserve
+        # only literal validated values attached to the actual PR command.
+        for field, value in command_provenance_context(hook_cmd).items():
+            p[field] = value or ("unresolved" if field in ("launcher", "route") else "")
     if args.goal:
         p["goals"] = normalize_goals([*p.get("goals", "").splitlines(), *args.goal])
     if args.hook:
