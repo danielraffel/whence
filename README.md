@@ -72,6 +72,8 @@ current name. The denylist is the one thing that always wins, at every stamp.
   Launchers can also stamp a stable **workstream**, **launcher**, **route**, and
   **router**. Agent identity stays separate from transport, so `codex` through
   `subrouter` on `m3` is not confused with a different kind of agent.
+  The same footer marker carries its visible recovery facts as JSON, so tools
+  such as Shipyard can read them without scraping prose.
 
 ![What whence adds: color-coded queue labels and a provenance footer that links back to the session](docs/hero.png)
 
@@ -383,7 +385,9 @@ settings any time (so you never have to wonder where it lives).
 {
   "fields": {
     "agent": true, "host": true, "workspace": true, "tab": true,
-    "workstream": true, "launcher": true, "route": true, "router": true,
+    "workstream": true, "launcher": true, "terminal": true,
+    "terminal_address": true, "terminal_instance": true,
+    "route": true, "router": true,
     "session": true, "resume": true, "url": true,
     "jump": true, "relaunch": true, "stamped": true
   },
@@ -440,10 +444,42 @@ Session launchers should provide routing provenance explicitly:
 ```bash
 WHENCE_WORKSTREAM_ID=agent-workstream-continuity-20260813 \
 WHENCE_LAUNCHER=cmux-continue-session \
+WHENCE_TERMINAL_RUNTIME=cmux \
 WHENCE_ROUTE=subrouter \
 WHENCE_ROUTER=m3 \
 codex
 ```
+
+For HerdR or another launcher that knows the native session and exact recovery
+commands, pass the existing facts explicitly instead of asking Whence to guess:
+
+```bash
+WHENCE_AGENT=qwen \
+WHENCE_TERMINAL_RUNTIME=herdr \
+WHENCE_TERMINAL_ADDRESS=pane:42 \
+WHENCE_TERMINAL_INSTANCE=herdr-run-8f7c \
+WHENCE_TERMINAL_TAB='Fix queue' \
+WHENCE_SESSION_ID=qwen-session-42 \
+WHENCE_RESUME_COMMAND='qwen resume qwen-session-42' \
+WHENCE_RELAUNCH_COMMAND='herdr attach pane:42' \
+WHENCE_ROUTE=subrouter \
+shipyard pr
+```
+
+`WHENCE_TERMINAL_WORKSPACE` is optional; HerdR normally needs only a tab/pane.
+Whence omits it when it duplicates the tab. `terminal_address` is a reusable
+location such as `pane:42`; it is not identity. `terminal_instance` is optional
+and must come only from an adapter that can prove a non-reusable incarnation.
+Whence rejects pane/surface refs in that field and never promotes a cmux surface
+UUID to instance identity. Workspace and tab are mutable display locations. A
+later observation may refresh a nonempty name only for the same proven runtime
+and instance and the same native session. A later synchronous `shipyard pr` or
+`pulp pr` pre-exec capture may replace stale same-HEAD provenance only when it
+has a concrete agent, named tab, native session, terminal runtime, and terminal
+address. Delayed hooks and sweeps cannot perform that replacement. Name or
+address similarity never correlates sessions. The marker
+is recovery evidence, not delivery authority: Whence does not authorize a
+Shipyard route rebind or ownership transfer.
 
 The automatic `shipyard`/`pulp` wrapper also snapshots an explicit durable
 handoff before the command starts, so a daemon may open the PR after the shell,
@@ -476,6 +512,8 @@ policy possible without per-worktree files.
 
 These values are public metadata, so Whence accepts only compact identifiers.
 URLs, paths, email/account names, query strings, and credentials fail closed.
+Explicit resume/relaunch commands accept only short argv-shaped commands; shell
+syntax, paths, endpoints, assignments, and credential-like flags fail closed.
 `WHENCE_ORIGIN_KIND=automation`, `external`, or `unresolved` gives non-agent PRs
 an explicit provenance label instead of leaving them blank. Missing launcher or
 route data is recorded as `unresolved`; Whence does not guess an account.
@@ -496,8 +534,9 @@ for agents whose CLI syntax is known (claude, codex; easy to add more), and the
 is correct for *any* agent. Machine names are free-form — whatever token you drop
 in `host-label`.
 
-**No cmux?** You still get the `agent` + `machine` labels and whatever session
-handle the agent exposes; cmux just adds the tab name and the universal resume.
+**No cmux?** You still get the `agent` + `machine` labels. A launcher can add the
+generic native session and recovery fields above; cmux otherwise discovers the
+tab and universal relaunch command automatically.
 
 ### Label order — agent, host, workspace, tab, route
 

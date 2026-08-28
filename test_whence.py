@@ -281,6 +281,18 @@ def main() -> int:
              "WHENCE_LAUNCHER=cmux WHENCE_ROUTE=direct nohup bash -lc "
              "'exec shipyard pr' &",
              {"launcher": "cmux", "route": "direct"}),
+            ("portable recovery context",
+             "WHENCE_AGENT=qwen WHENCE_TERMINAL_RUNTIME=herdr WHENCE_TERMINAL_ADDRESS=pane:42 "
+             "WHENCE_TERMINAL_INSTANCE=herdr-run-8f7c "
+             "WHENCE_TERMINAL_WORKSPACE='Fix queue' WHENCE_TERMINAL_TAB='Fix queue' "
+             "WHENCE_SESSION_ID=qwen-session-42 "
+             "WHENCE_RESUME_COMMAND='qwen resume qwen-session-42' "
+             "WHENCE_RELAUNCH_COMMAND='herdr attach pane:42' shipyard pr",
+             {"agent": "qwen", "terminal": "herdr", "terminal_address": "pane:42",
+              "terminal_instance": "herdr-run-8f7c",
+              "workspace": "Fix queue", "tab": "Fix queue",
+              "session": "qwen-session-42", "resume": "qwen resume qwen-session-42",
+              "relaunch": "herdr attach pane:42"}),
             ("diagnostic literal is not context",
              "rg 'shipyard pr --workstream-id WRONG' .",
              {}),
@@ -375,6 +387,54 @@ def main() -> int:
         print(f"FAIL  _prov_better: upgrade={better} rename={rename} goal={goal_upgrade}")
     else:
         print("ok    _prov_better: heals degraded/goals, ignores renames")
+
+    same_terminal_move = w._prov_better(
+        {"tab": "New pane name", "workspace": "w2", "agent": "qwen",
+         "origin_state": "known", "terminal": "herdr", "terminal_instance": "herdr-run-1",
+         "session": "qwen-1"},
+        {"tab": "Old pane name", "workspace": "w1", "agent": "qwen",
+         "origin_state": "known", "terminal": "herdr", "terminal_instance": "herdr-run-1",
+         "session": "qwen-1"},
+        healcfg)
+    different_terminal_name_match = w._prov_better(
+        {"tab": "Same name", "workspace": "", "agent": "qwen",
+         "origin_state": "known", "terminal": "herdr", "terminal_instance": "herdr-run-2",
+         "session": "qwen-2"},
+        {"tab": "Same name", "workspace": "", "agent": "qwen",
+         "origin_state": "known", "terminal": "herdr", "terminal_instance": "herdr-run-1",
+         "session": "qwen-1"},
+        healcfg)
+    hidden_display_move = w._prov_better(
+        {"tab": "New", "workspace": "w2", "agent": "qwen", "origin_state": "known",
+         "terminal": "herdr", "terminal_instance": "herdr-run-1", "session": "qwen-1"},
+        {"agent": "qwen", "origin_state": "known", "terminal": "herdr",
+         "terminal_instance": "herdr-run-1", "session": "qwen-1"},
+        {**healcfg, "hide": {"tab", "workspace"}})
+    reused_address_without_instance = w._prov_better(
+        {"tab": "New", "agent": "qwen", "origin_state": "known", "terminal": "herdr",
+         "terminal_address": "pane:42", "terminal_instance": ""},
+        {"tab": "Old", "agent": "qwen", "origin_state": "known", "terminal": "herdr",
+         "terminal_address": "pane:42", "terminal_instance": ""}, healcfg)
+    degraded_same_instance = w._prov_better(
+        {"tab": "", "workspace": "", "agent": "qwen", "origin_state": "lookup_failed",
+         "terminal": "herdr", "terminal_instance": "herdr-run-1", "session": "qwen-1"},
+        {"tab": "Useful name", "workspace": "w1", "agent": "qwen", "origin_state": "known",
+         "terminal": "herdr", "terminal_instance": "herdr-run-1", "session": "qwen-1"}, healcfg)
+    different_native_session = w._prov_better(
+        {"tab": "New", "agent": "qwen", "origin_state": "known", "terminal": "herdr",
+         "terminal_instance": "herdr-run-1", "session": "qwen-2"},
+        {"tab": "Old", "agent": "qwen", "origin_state": "known", "terminal": "herdr",
+         "terminal_instance": "herdr-run-1", "session": "qwen-1"}, healcfg)
+    if (not same_terminal_move or different_terminal_name_match or hidden_display_move
+            or reused_address_without_instance or degraded_same_instance
+            or different_native_session):
+        failed += 1
+        print(f"FAIL  terminal identity healing: same={same_terminal_move} "
+              f"different={different_terminal_name_match} hidden={hidden_display_move} "
+              f"reused_address={reused_address_without_instance} degraded={degraded_same_instance} "
+              f"different_session={different_native_session}")
+    else:
+        print("ok    terminal identity heals same-instance display moves, never similar-name identity")
 
     # A workspace cmux auto-titled is just some tab's name wearing a workspace
     # label — the bug that put two tab-looking labels on one PR. No id, no label.
@@ -477,6 +537,42 @@ def main() -> int:
         if got != want:
             failed += 1; print(f"FAIL  stable_identifier({src!r})={got!r} want={want!r}")
         else: print(f"ok    stable_identifier({src!r}) -> {got!r}")
+
+    # Explicit recovery commands cross the public PR boundary. Preserve simple
+    # argv exactly, but reject shell syntax, paths, endpoints, and credentials.
+    recovery_commands = [
+        ("qwen resume qwen-session-42", "qwen resume qwen-session-42"),
+        ("herdr attach pane:42", "herdr attach pane:42"),
+        ("qwen resume s; curl bad.invalid", ""),
+        ("/private/bin/qwen resume s", ""),
+        ("qwen --api-key hunter2 resume s", ""),
+        ("env TOKEN=hunter2 qwen resume s", ""),
+        ("qwen resume https://router.invalid/s", ""),
+    ]
+    for src, want in recovery_commands:
+        got = w.safe_public_command(src)
+        if got != want:
+            failed += 1; print(f"FAIL  safe_public_command({src!r})={got!r} want={want!r}")
+        else: print(f"ok    safe_public_command({src!r}) -> {got!r}")
+
+    if (w.terminal_runtime("cmux") != "cmux" or w.terminal_runtime("herdr") != "herdr"
+            or w.terminal_runtime("subrouter") != ""
+            or w.terminal_instance_id("pane:42") != ""
+            or w.terminal_instance_id("pane:abc") != ""
+            or w.terminal_instance_id("surface:123e4567-e89b-12d3-a456-426614174000") != ""):
+        failed += 1; print("FAIL  terminal runtime must be cmux or herdr, never provider route")
+    else: print("ok    terminal runtime is distinct from provider routing")
+    display_cases = {
+        "Fix queue (pane:42)": "Fix queue (pane:42)",
+        "Fix `x` ![probe](//attacker.invalid/p)": "",
+        "[link](https://attacker.invalid)": "",
+        "Fix | table": "",
+    }
+    for src, want in display_cases.items():
+        got = w.safe_public_display(src)
+        if got != want:
+            failed += 1; print(f"FAIL  safe_public_display({src!r})={got!r} want={want!r}")
+        else: print(f"ok    safe_public_display({src!r}) -> {got!r}")
 
     provenance_cfg = {
         "denylist": [], "hide": set(),
@@ -604,6 +700,52 @@ def main() -> int:
         failed += 1; print(f"FAIL  explicit routed provenance: {routed!r} footer={routed_ft!r}")
     else: print("ok    explicit routed provenance keeps agent separate from route/router")
 
+    # A launcher outside cmux can supply portable native-session and terminal
+    # recovery facts without teaching Whence agent-specific resume syntax.
+    portable_env = {
+        "WHENCE_AGENT": "qwen", "WHENCE_HOST_LABEL": "m1",
+        "WHENCE_TERMINAL_RUNTIME": "herdr", "WHENCE_TERMINAL_ADDRESS": "pane:42",
+        "WHENCE_TERMINAL_INSTANCE": "herdr-run-8f7c",
+        "WHENCE_TERMINAL_WORKSPACE": "Fix queue", "WHENCE_TERMINAL_TAB": "Fix queue",
+        "WHENCE_SESSION_ID": "qwen-session-42",
+        "WHENCE_RESUME_COMMAND": "qwen resume qwen-session-42",
+        "WHENCE_RELAUNCH_COMMAND": "herdr attach pane:42",
+        "WHENCE_ROUTE": "subrouter", "WHENCE_ROUTER": "m3",
+    }
+    with mock.patch.dict(_os.environ, portable_env, clear=True), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("", "")):
+        portable = w.collect({"denylist": [], "hide": set()})
+    portable_ft = w.footer(portable, {"hide": set()}, [])
+    portable_marker = w.prior_prov(portable_ft)
+    required_portable = {
+        "agent": "qwen", "terminal": "herdr", "terminal_address": "pane:42",
+        "terminal_instance": "herdr-run-8f7c",
+        "workspace": "", "tab": "Fix queue",
+        "session": "qwen-session-42", "resume": "qwen resume qwen-session-42",
+        "relaunch": "herdr attach pane:42", "route": "subrouter", "router": "m3",
+    }
+    hidden_marker = w.prior_prov(w.footer(
+        portable, {"hide": {"session", "resume", "relaunch"}}, []))
+    if (any(portable.get(k) != v for k, v in required_portable.items())
+            or any(portable_marker.get(k) != v for k, v in required_portable.items() if v)
+            or "workspace" in portable_marker
+            or any(k in hidden_marker for k in ("session", "resume", "relaunch"))):
+        failed += 1
+        print(f"FAIL  portable recovery provenance: p={portable!r} marker={portable_marker!r} "
+              f"hidden={hidden_marker!r}")
+    else:
+        print("ok    portable recovery provenance is public-safe, machine-readable, and hide-aware")
+
+    comment_name = dict(portable, tab="Investigate alpha--beta")
+    comment_marker = w.footer(comment_name, {"hide": set()}, [])
+    if ("alpha--beta" not in w.prior_prov(comment_marker).get("tab", "")
+            or "alpha--beta" in comment_marker.splitlines()[0]):
+        failed += 1
+        print(f"FAIL  marker HTML-comment escaping: {comment_marker.splitlines()[0]!r}")
+    else:
+        print("ok    machine-readable marker round-trips HTML-comment-sensitive names")
+
     # Canonical numbered classes converge even when the old footer omitted a
     # duplicate. Unrelated labels are never touched.
     stale = w.stale_labels(
@@ -685,6 +827,64 @@ def main() -> int:
         print(f"FAIL  ledger capture: key={recorded_key!r} head={recorded_head!r} goal={recorded_goal!r}")
     else:
         print("ok    ledger capture: same-HEAD delayed worker preserves all known provenance")
+
+    # A later synchronous pre-exec is an explicit provenance recapture. It may
+    # replace a stale locked owner for the same immutable HEAD, but an unlocked
+    # delayed observation or an unresolved/name-only capture cannot revert it.
+    with tempfile.TemporaryDirectory() as tmp:
+        ledger_path = pathlib.Path(tmp) / "ledger.json"
+        branch = "fix/recaptured"
+        capture_key = f"danielraffel/pulp#{branch}"
+        old = {f: "" for f in w.FIELDS}
+        old.update({"agent": "qwen", "tab": "Old pane", "workspace": "old-ws",
+                    "origin_state": "known", "terminal": "herdr",
+                    "terminal_address": "pane:42", "terminal_instance": "herdr-run-old",
+                    "session": "qwen-old", "resume": "qwen resume qwen-old",
+                    "relaunch": "herdr attach pane:42", "workstream": "GEN-14",
+                    "launcher": "herdr", "route": "direct",
+                    "goals": "https://example.com/goal-one"})
+        new = dict(old, tab="New pane", workspace="new-ws", terminal_address="pane:99",
+                   terminal_instance="herdr-run-new", session="qwen-new",
+                   resume="qwen resume qwen-new", relaunch="herdr attach pane:99",
+                   workstream="", launcher="unresolved", route="subrouter", router="m3",
+                   goals="https://example.com/goal-two")
+        moved = dict(new, tab="Renamed pane", workspace="moved-ws", resume="", relaunch="")
+        unresolved = dict(old, agent="unresolved", origin_state="unresolved", session="",
+                          terminal_address="", terminal_instance="")
+        with mock.patch.object(w, "LEDGER", ledger_path):
+            w.ledger_record("", old, "danielraffel/pulp", branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            w.ledger_record("", new, "danielraffel/pulp", branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            w.ledger_record("", moved, "danielraffel/pulp", branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            w.ledger_record("", old, "danielraffel/pulp", branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=False)
+            w.ledger_record("", unresolved, "danielraffel/pulp", branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            recaptured = json.loads(ledger_path.read_text())[capture_key]
+            no_resume_branch = "fix/recaptured-no-resume"
+            no_resume_key = f"danielraffel/pulp#{no_resume_branch}"
+            w.ledger_record("", old, "danielraffel/pulp", no_resume_branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            no_resume = dict(new, resume="", relaunch="")
+            w.ledger_record("", no_resume, "danielraffel/pulp", no_resume_branch, "origin/main",
+                            str(pathlib.Path.cwd()), lock_provenance=True)
+            recaptured_no_resume = json.loads(ledger_path.read_text())[no_resume_key]
+    if any(recaptured["p"].get(k) != v for k, v in {
+            "agent": "qwen", "tab": "Renamed pane", "workspace": "moved-ws",
+            "terminal": "herdr", "terminal_address": "pane:99",
+            "terminal_instance": "herdr-run-new", "session": "qwen-new",
+            "resume": "qwen resume qwen-new", "relaunch": "herdr attach pane:99",
+            "workstream": "GEN-14", "launcher": "herdr", "route": "subrouter",
+            "router": "m3",
+            "goals": "https://example.com/goal-one\nhttps://example.com/goal-two"}.items()
+            or recaptured_no_resume["p"].get("resume")
+            or recaptured_no_resume["p"].get("relaunch")):
+        failed += 1
+        print(f"FAIL  locked provenance recapture boundary: {recaptured!r}")
+    else:
+        print("ok    locked provenance recapture replaces only from a complete synchronous capture")
 
     # Force a pre-exec write after sweep has read the old record but before it
     # commits. Sweep may mark that same HEAD done, but it must neither stamp the
@@ -1022,8 +1222,9 @@ def main() -> int:
             "  touch \"$WHENCE_FAKE_STATE/preexec\"\n"
             "  printf '%s|%s|%s\\n' \"$WHENCE_WORKSTREAM_ID\" \"$WHENCE_LAUNCHER\" \"$WHENCE_ROUTE\" "
             "> \"$WHENCE_FAKE_STATE/context\"\n"
-            "  (while [ ! -f \"$WHENCE_FAKE_STATE/pr-created\" ]; do sleep 0.01; done; "
-            "touch \"$WHENCE_FAKE_STATE/stamped\") >/dev/null 2>&1 &\n"
+            "  nohup sh -c 'while [ ! -f \"$WHENCE_FAKE_STATE/pr-created\" ]; do "
+            "sleep 0.01; done; touch \"$WHENCE_FAKE_STATE/stamped\"' "
+            "</dev/null >/dev/null 2>&1 &\n"
             "elif [ \"$1\" = --sweep ]; then\n"
             "  touch \"$WHENCE_FAKE_STATE/swept\"\n"
             "elif [ \"$1\" = --auto ]; then\n"
