@@ -49,6 +49,19 @@ environment variables through the PR command: `WHENCE_WORKSTREAM_ID`,
 `WHENCE_LAUNCHER`, `WHENCE_ROUTE`, and `WHENCE_ROUTER`. Never put an account
 identity, credential, URL, private path, or transcript in those fields.
 
+For a non-cmux launcher, preserve its already-known recovery facts with
+`WHENCE_TERMINAL_RUNTIME=herdr`, `WHENCE_TERMINAL_ADDRESS`,
+`WHENCE_TERMINAL_INSTANCE`,
+`WHENCE_TERMINAL_TAB`, `WHENCE_SESSION_ID`, `WHENCE_RESUME_COMMAND`, and
+`WHENCE_RELAUNCH_COMMAND`. `WHENCE_TERMINAL_WORKSPACE` is optional. Resume and
+relaunch values must be short argv-shaped commands with no shell syntax, paths,
+endpoints, assignments, or credential flags. Terminal runtime (`cmux` or
+`herdr`) is distinct from provider route (`direct` or `subrouter`). Whence only
+records provenance; it does not authorize a route rebind or owner transfer.
+Treat pane/surface refs as reusable addresses, never instance identity. Supply
+`WHENCE_TERMINAL_INSTANCE` only when the terminal adapter proves a non-reusable
+incarnation; otherwise omit it.
+
 For Shipyard, pass the same durable identity with
 `shipyard pr --workstream-id <id>`. Whence snapshots that literal flag before a
 detached worker can outlive the shell. Stable launcher/route defaults and exact
@@ -58,8 +71,8 @@ remain unresolved rather than being inferred.
 
 ## Notes
 
-- Works for Claude Code and Codex — the resume command is sourced from cmux's
-  own per-tab restore handle, so no agent-specific configuration is needed.
+- Works for any cmux agent via cmux's per-tab restore handle. Other launchers can
+  supply the generic native-session and recovery variables above.
 - If the repo authenticates with a GitHub App token, set
   `WHENCE_GH=ghapp` (or the appropriate CLI) before running.
 - Preview first with no `--apply` to see the labels and footer it would add.

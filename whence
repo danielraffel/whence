@@ -29,9 +29,9 @@ CFG_DIR = pathlib.Path.home() / ".config/whence"
 # Fields, in footer order. `agent`/`host`/`tab`/`route` are also queue labels.
 # `workspace` = cmux workspace name; `tab` = the per-tab (surface) title you
 # navigate by — the one you need most to find your way back.
-FIELDS = ["agent", "host", "workspace", "tab", "workstream", "launcher", "route",
-          "router", "origin_state", "path", "session", "resume", "url", "goals",
-          "jump", "relaunch", "stamped"]
+FIELDS = ["agent", "host", "workspace", "tab", "workstream", "launcher", "terminal",
+          "terminal_address", "terminal_instance", "route", "router", "origin_state",
+          "path", "session", "resume", "url", "goals", "jump", "relaunch", "stamped"]
 LABEL_FIELDS = ["agent", "host", "workspace", "tab", "route"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700",
                   "tab": "8250df", "route": "d4a72c"}
@@ -496,6 +496,70 @@ def stable_identifier(value: str, default: str = "", maxlen: int = 80) -> str:
     return value
 
 
+def safe_public_command(value: str, maxlen: int = 512) -> str:
+    """Return a launcher-supplied recovery command only when it is public-safe.
+
+    PR provenance is public metadata.  Accept a short argv-shaped command, not
+    shell syntax: no paths, URLs, assignments, substitutions, or credential-like
+    flags.  This intentionally rejects clever commands; launchers can still
+    publish the opaque session id when an exact command cannot pass safely.
+    """
+    value = str(value or "").strip()
+    if not value or len(value) > maxlen or any(ch in value for ch in "\r\n\0"):
+        return ""
+    try:
+        argv = shlex.split(value, posix=True)
+    except ValueError:
+        return ""
+    if not 1 <= len(argv) <= 16:
+        return ""
+    sensitive = re.compile(
+        r"(?:api[-_]?key|auth|bearer|cookie|credential|password|secret|token)", re.I)
+    for token in argv:
+        if (not token or sensitive.search(token) or "=" in token or "@" in token
+                or "://" in token or token.startswith(("/", "~/", "./", "../"))
+                or not re.fullmatch(r"(?:--?[A-Za-z0-9][A-Za-z0-9._:-]*|"
+                                    r"[A-Za-z0-9][A-Za-z0-9._:-]*)", token)):
+            return ""
+    return shlex.join(argv)
+
+
+def safe_public_display(value: str, maxlen: int = 160) -> str:
+    """A bounded one-line terminal location supplied by a launcher.
+
+    Display names remain subject to the repository denylist in ``redact``.
+    Structural URL/path/HTML shapes fail closed before that content can enter a
+    marker or footer.
+    """
+    value = str(value or "").strip()
+    if (not value or len(value) > maxlen or any(ord(ch) < 32 for ch in value)
+            or "://" in value or value.startswith(("/", "~/", "./", "../"))
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._:#/+()-]*", value)):
+        return ""
+    return value
+
+
+def terminal_runtime(value: str, default: str = "") -> str:
+    value = stable_identifier(value)
+    return value if value in ("cmux", "herdr") else default
+
+
+def terminal_instance_id(value: str) -> str:
+    """Accept an adapter-proven instance id, never a reusable pane/surface ref."""
+    value = stable_identifier(value, maxlen=160)
+    if re.match(r"(?:pane|surface):", value, re.I):
+        return ""
+    return value
+
+
+def dedupe_terminal_display(p: dict) -> None:
+    """Do not publish the same mutable display location twice."""
+    workspace = (p.get("workspace") or "").strip()
+    tab = (p.get("tab") or "").strip()
+    if workspace and tab and workspace.casefold() == tab.casefold():
+        p["workspace"] = ""
+
+
 def configured_provenance(cfg: dict, repo: str = "") -> dict[str, str]:
     """Resolve explicit fleet defaults plus one exact repository override.
 
@@ -557,6 +621,12 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
                              else "lookup_failed" if surface else "unnamed")
     if agent == "unresolved":
         p["origin_state"] = "unresolved"
+    if "WHENCE_TERMINAL_WORKSPACE" in os.environ:
+        p["workspace"] = safe_public_display(os.environ.get("WHENCE_TERMINAL_WORKSPACE", ""))
+    if "WHENCE_TERMINAL_TAB" in os.environ:
+        p["tab"] = safe_public_display(os.environ.get("WHENCE_TERMINAL_TAB", ""))
+        if p["tab"] and agent != "unresolved":
+            p["origin_state"] = "known"
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
     p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
@@ -565,6 +635,14 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         "WHENCE_WORKSTREAM_ID", context.get("workstream", ""))
     p["launcher"] = _context_value(
         "WHENCE_LAUNCHER", context.get("launcher", ""), "unresolved")
+    p["terminal"] = (terminal_runtime(os.environ.get("WHENCE_TERMINAL_RUNTIME", ""))
+                     if "WHENCE_TERMINAL_RUNTIME" in os.environ
+                     else "cmux" if surface else "")
+    p["terminal_address"] = _context_value(
+        "WHENCE_TERMINAL_ADDRESS", stable_identifier(surface, maxlen=160))
+    p["terminal_instance"] = (terminal_instance_id(
+        os.environ.get("WHENCE_TERMINAL_INSTANCE", ""))
+        if "WHENCE_TERMINAL_INSTANCE" in os.environ else "")
     p["route"] = _context_value(
         "WHENCE_ROUTE", context.get("route", ""), "unresolved")
     p["router"] = _context_value("WHENCE_ROUTER", context.get("router", ""))
@@ -579,25 +657,36 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
 
     # Session id must be CONSISTENT with the detected agent — never pair claude's
     # session with codex's resume syntax (or vice versa) if both env vars leak in.
-    if agent == "claude":
-        sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    if "WHENCE_SESSION_ID" in os.environ:
+        sid = stable_identifier(os.environ.get("WHENCE_SESSION_ID", ""), maxlen=160)
+    elif agent == "claude":
+        sid = stable_identifier(os.environ.get("CLAUDE_CODE_SESSION_ID", ""), maxlen=160)
     elif agent == "codex":
-        sid = os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or ""
+        sid = stable_identifier(
+            os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or "",
+            maxlen=160)
     else:
-        sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
-               or os.environ.get("CODEX_SESSION_ID") or os.environ.get("CODEX_ROLLOUT_ID") or "")
+        sid = stable_identifier(
+            os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("CODEX_SESSION_ID")
+            or os.environ.get("CODEX_ROLLOUT_ID") or "", maxlen=160)
     if not sid and restore:
         m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", restore)
         sid = m.group(0) if m else ""
     p["session"] = sid
 
-    if agent in KNOWN_RESUME and sid:
+    if "WHENCE_RESUME_COMMAND" in os.environ:
+        p["resume"] = safe_public_command(os.environ.get("WHENCE_RESUME_COMMAND", ""))
+    elif agent in KNOWN_RESUME and sid:
         p["resume"] = KNOWN_RESUME[agent].format(sid=sid)
+    if "WHENCE_RELAUNCH_COMMAND" in os.environ:
+        p["relaunch"] = safe_public_command(os.environ.get("WHENCE_RELAUNCH_COMMAND", ""))
     if agent in KNOWN_URL:
-        bridge = os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID", "")
+        bridge = stable_identifier(
+            os.environ.get("CLAUDE_CODE_BRIDGE_SESSION_ID", ""), maxlen=160)
         if bridge:
             p["url"] = KNOWN_URL[agent].format(bridge=bridge)
     p["_redacted"] = redact(p, cfg if cfg is not None else load_config(""), surface)
+    dedupe_terminal_display(p)
     return p
 
 
@@ -642,11 +731,15 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     # Carry identity plus durable goal links that were actually stamped, so the
     # sweep can heal degraded identity or a missing goal without re-deriving
     # either from GitHub's labels.
+    marker_fields = ("agent", "host", "workspace", "tab", "workstream", "launcher",
+                     "terminal", "terminal_address", "terminal_instance", "route", "router", "origin_state",
+                     "path", "session", "resume", "url", "goals", "jump", "relaunch")
     tag = json.dumps({"labels": label_names,
-                      "prov": {f: p.get(f, "") for f in
-                               ("agent", "tab", "workstream", "launcher", "route",
-                                "router", "origin_state", "goals")}},
-                     ensure_ascii=False)
+                      "prov": {f: p.get(f, "") for f in marker_fields
+                               if visible(f, p, hide)}}, ensure_ascii=False)
+    # HTML comments cannot safely contain ``--``. JSON escapes round-trip to the
+    # exact value while keeping arbitrary public tab names from breaking the tag.
+    tag = tag.replace("--", "\\u002d\\u002d")
     def cell(v):                              # keep a value from breaking the table
         return (v or "").replace("|", "\\|").replace("\n", " ")
     # identity, as a two-column table in agent -> host -> workspace -> tab order
@@ -656,6 +749,9 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
                          ("workspace", "Workspace", True), ("tab", "Tab", False),
                          ("workstream", "Workstream", True),
                          ("launcher", "Launcher", True), ("route", "Route", True),
+                         ("terminal", "Terminal", True),
+                         ("terminal_address", "Terminal address", True),
+                         ("terminal_instance", "Terminal instance", True),
                          ("router", "Router", True), ("origin_state", "Origin state", True),
                          ("path", "Directory", True), ("session", "Session", True),
                          ("goals", "Goal docs", False)]:
@@ -1241,10 +1337,7 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
         finally:
             try: os.unlink(tmpname)
             except OSError: pass
-    after = {"labels": names,
-             "prov": {f: p.get(f, "") for f in
-                      ("agent", "tab", "workstream", "launcher", "route", "router",
-                       "origin_state", "goals")}}
+    after = {"labels": names, "prov": prior_prov(ft)}
     if before != after:                       # only log a real change, not a no-op re-stamp
         _audit(cfg, {"ts": datetime.datetime.now(datetime.timezone.utc)
                             .strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -1274,11 +1367,34 @@ def _git(cwd, *a):
 
 _ASSIGN_TOKEN_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.S)
 _COMMAND_CONTEXT_ENV = {
+    "WHENCE_AGENT": "agent",
     "WHENCE_WORKSTREAM_ID": "workstream",
     "WHENCE_LAUNCHER": "launcher",
+    "WHENCE_TERMINAL_RUNTIME": "terminal",
+    "WHENCE_TERMINAL_ADDRESS": "terminal_address",
+    "WHENCE_TERMINAL_INSTANCE": "terminal_instance",
+    "WHENCE_TERMINAL_WORKSPACE": "workspace",
+    "WHENCE_TERMINAL_TAB": "tab",
     "WHENCE_ROUTE": "route",
     "WHENCE_ROUTER": "router",
+    "WHENCE_SESSION_ID": "session",
+    "WHENCE_RESUME_COMMAND": "resume",
+    "WHENCE_RELAUNCH_COMMAND": "relaunch",
 }
+
+
+def _public_context_value(field: str, value: str) -> str:
+    if field in ("resume", "relaunch"):
+        return safe_public_command(value)
+    if field in ("workspace", "tab"):
+        return safe_public_display(value)
+    if field == "terminal":
+        return terminal_runtime(value)
+    if field == "terminal_instance":
+        return terminal_instance_id(value)
+    if field in ("session", "terminal_address"):
+        return stable_identifier(value, maxlen=160)
+    return stable_identifier(value)
 
 
 def _without_heredoc_bodies(cmd: str) -> str:
@@ -1411,7 +1527,7 @@ def _peel_command_wrappers(argv: list[str], explicit: dict[str, str] | None = No
                 if assignment and explicit is not None:
                     field = _COMMAND_CONTEXT_ENV.get(assignment.group(1))
                     if field:
-                        explicit[field] = stable_identifier(assignment.group(2))
+                        explicit[field] = _public_context_value(field, assignment.group(2))
                 argv = argv[1:]
             continue
         if exe == "timeout":
@@ -1520,7 +1636,7 @@ def command_provenance_context(cmd: str) -> dict[str, str]:
                 break
             field = _COMMAND_CONTEXT_ENV.get(assignment.group(1))
             if field:
-                explicit[field] = stable_identifier(assignment.group(2))
+                explicit[field] = _public_context_value(field, assignment.group(2))
             i += 1
         argv = tokens[i:]
         argv = _peel_command_wrappers(argv, explicit)
@@ -1673,6 +1789,17 @@ def _locked_value_known(field: str, value: str) -> bool:
     return True
 
 
+def _complete_locked_capture(p: dict) -> bool:
+    """A synchronous recovery snapshot concrete enough to replace an old lock."""
+    return (p.get("agent") not in ("", "unknown", "unresolved")
+            and p.get("origin_state") == "known"
+            and _locked_value_known("tab", p.get("tab", ""))
+            and p.get("tab") != "(redacted)"
+            and terminal_runtime(p.get("terminal", "")) == p.get("terminal")
+            and bool(stable_identifier(p.get("terminal_address", ""), maxlen=160))
+            and bool(stable_identifier(p.get("session", ""), maxlen=160)))
+
+
 def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                   source_ref: str = "", hook_cwd: str = "",
                   lock_provenance: bool = False) -> str:
@@ -1708,8 +1835,10 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
         # takes the lock.
         prior_locked = bool(head and prior.get("head") == head
                             and prior.get("provenance_locked"))
-        if prior_locked:
-            old = prior.get("p", {})
+        old = prior.get("p", {})
+        replace_locked = bool(prior_locked and lock_provenance
+                              and _complete_locked_capture(captured))
+        if prior_locked and not replace_locked:
             # A pre-exec snapshot is the last point where the originating
             # launcher is guaranteed to have its full cmux/session context.
             # PostToolUse and delayed daemon hooks commonly retain only part of
@@ -1720,6 +1849,25 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                 value = old.get(field, "")
                 if _locked_value_known(field, value):
                     captured[field] = value
+        elif replace_locked:
+            # A later synchronous pre-exec is an explicit recapture boundary.
+            # It may replace stale session/address provenance for this same HEAD;
+            # delayed/unlocked observations never reach this branch. For the
+            # same concrete session/location, retain optional facts that the new
+            # observation could not see rather than degrading them.
+            same_core = all(captured.get(field) == old.get(field) for field in
+                            ("terminal", "terminal_address", "session"))
+            for field in ("workstream", "launcher", "route", "router"):
+                if not _locked_value_known(field, captured.get(field, "")):
+                    captured[field] = old.get(field, "")
+            captured["goals"] = normalize_goals([
+                *old.get("goals", "").splitlines(),
+                *captured.get("goals", "").splitlines(),
+            ])
+            if same_core:
+                for field in ("workspace", "terminal_instance", "resume", "relaunch"):
+                    if not captured.get(field) and old.get(field):
+                        captured[field] = old[field]
         led[key] = {"p": captured,
                     "ts": _now_epoch(), "head": head,
                     "provenance_locked": prior_locked or lock_provenance,
@@ -1757,14 +1905,27 @@ def _prov_better(best: dict, cur: dict, cfg: dict) -> bool:
         t = (pr.get("tab") or "").strip()
         return bool(t) and not _is_ref_tab(t, cfg)
     def agent_real(pr): return (pr.get("agent") or "") not in ("", "unknown", "unresolved")
-    best_goals = set(normalize_goals(best.get("goals", "")).splitlines())
+    hidden = cfg.get("hide", set())
+    best_goals = (set(normalize_goals(best.get("goals", "")).splitlines())
+                  if "goals" not in hidden else set())
     cur_goals = set(normalize_goals(cur.get("goals", "")).splitlines())
     def missing(value): return (value or "") in ("", "unknown", "unresolved")
-    explicit = ("workstream", "launcher", "route", "router")
+    explicit = tuple(f for f in ("workstream", "launcher", "route", "router")
+                     if f not in hidden)
     state_rank = {"": 0, "unresolved": 0, "unnamed": 1, "lookup_failed": 1,
                   "known": 2, "automation": 2, "external": 2}
-    return ((tab_real(best) and not tab_real(cur))
-            or (agent_real(best) and not agent_real(cur))
+    return (("tab" not in hidden and tab_real(best) and not tab_real(cur))
+            or ("agent" not in hidden and agent_real(best) and not agent_real(cur))
+            or (bool(best.get("terminal")) and best.get("terminal") == cur.get("terminal")
+                and bool(best.get("terminal_instance"))
+                and best.get("terminal_instance") == cur.get("terminal_instance")
+                and bool(best.get("session"))
+                and best.get("session") == cur.get("session")
+                and (("tab" not in hidden and tab_real(best)
+                      and best.get("tab") != cur.get("tab"))
+                     or ("workspace" not in hidden
+                         and bool(best.get("workspace"))
+                         and best.get("workspace") != cur.get("workspace"))))
             or bool(best_goals - cur_goals)
             or any(not missing(best.get(f)) and missing(cur.get(f)) for f in explicit)
             or state_rank.get(best.get("origin_state", ""), 0)
@@ -2509,11 +2670,17 @@ def main() -> int:
     context_cwd = _cmd_cwd(hook_cmd) if args.hook else os.getcwd()
     context_repo = hook_slug or _repo_branch(context_cwd or os.getcwd())[0]
     p = collect(cfg, context_repo)
+    explicit_context = command_provenance_context(hook_cmd) if args.hook else {}
     if args.hook:
         # Command-scoped assignments are gone by PostToolUse time. Preserve
         # only literal validated values attached to the actual PR command.
-        for field, value in command_provenance_context(hook_cmd).items():
+        for field, value in explicit_context.items():
             p[field] = value or ("unresolved" if field in ("launcher", "route") else "")
+        if (p.get("tab") and p.get("agent") not in ("", "unknown", "unresolved")
+                and "tab" in explicit_context):
+            p["origin_state"] = "known"
+        redact(p, cfg, p.get("terminal_address", "") if p.get("terminal") == "cmux" else "")
+        dedupe_terminal_display(p)
     if args.goal:
         p["goals"] = normalize_goals([*p.get("goals", "").splitlines(), *args.goal])
     if args.hook:
@@ -2525,11 +2692,14 @@ def main() -> int:
             p["agent"] = hook_agent
             if p.get("origin_state") == "unresolved":
                 p["origin_state"] = "known" if p.get("tab") else "unnamed"
-        if hook_sid:
-            p["session"] = hook_sid
-        if p["agent"] in KNOWN_RESUME and p["session"]:
+        if (hook_sid and "session" not in explicit_context
+                and "WHENCE_SESSION_ID" not in os.environ):
+            p["session"] = stable_identifier(hook_sid, maxlen=160)
+        if "resume" in explicit_context:
+            pass
+        elif p["agent"] in KNOWN_RESUME and p["session"]:
             p["resume"] = KNOWN_RESUME[p["agent"]].format(sid=p["session"])
-        elif p["agent"] not in KNOWN_RESUME:
+        elif p["agent"] not in KNOWN_RESUME and "WHENCE_RESUME_COMMAND" not in os.environ:
             p["resume"] = ""
         # Capture this branch's provenance while the env is live, then run the
         # cheap throttled maintenance: converge to the repo + backfill any PR the
