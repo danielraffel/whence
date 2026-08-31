@@ -201,10 +201,9 @@ def github_client_for_repo(configured: str, repo: str,
     return configured
 
 
-def github_call(client: str, *args: str) -> subprocess.CompletedProcess:
+def github_call(client: str, *args: str, repo: str = "") -> subprocess.CompletedProcess:
     """Run one GitHub operation and fail visibly on a rejected read or write."""
-    repo = ""
-    if "--repo" in args:
+    if not repo and "--repo" in args:
         index = args.index("--repo")
         if index + 1 < len(args):
             repo = args[index + 1]
@@ -229,6 +228,116 @@ def github_call(client: str, *args: str) -> subprocess.CompletedProcess:
             f"whence: GitHub command failed ({pathlib.Path(selected).name} "
             f"{shlex.join(args[:3])}): {detail}")
     return result
+
+
+def _api_endpoint(repo: str, suffix: str) -> str:
+    return f"repos/{repo}/{suffix.lstrip('/')}"
+
+
+def _encoded_path(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
+def _repo_labels(client: str, repo: str) -> dict[str, str]:
+    """Read all repository labels once, preserving exact names and colors."""
+    result = github_call(
+        client, "api", "--paginate", "--slurp",
+        _api_endpoint(repo, "labels"),
+        repo=repo)
+    try:
+        if not result.stdout.strip():
+            raise ValueError("paginated label response was empty")
+        pages = json.loads(result.stdout)
+        if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+            raise ValueError("paginated label response was not a list of pages")
+        labels = [item for page in pages for item in page]
+        if any(not isinstance(item, dict)
+               or not isinstance(item.get("name"), str)
+               or not isinstance(item.get("color"), str)
+               for item in labels):
+            raise ValueError("label response contained a malformed item")
+        return {item["name"]: item["color"] for item in labels}
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"whence: malformed GitHub label response: {exc}") from exc
+
+
+def ensure_repo_labels(client: str, repo: str,
+                       labels: list[tuple[str, str]]) -> None:
+    """Create or recolor labels through the privileged GitHub App API surface.
+
+    The initial complete read makes exact replay a no-op. A concurrent create or
+    rejected update fails visibly; Whence never treats an uncertain write as a
+    successful provenance stamp.
+    """
+    existing = _repo_labels(client, repo)
+    for name, color in labels:
+        color = color.lower()
+        current = existing.get(name)
+        if current is not None and current.lower() == color:
+            continue
+        if current is None:
+            try:
+                github_call(
+                    client, "api", "--method", "POST",
+                    _api_endpoint(repo, "labels"),
+                    "-f", f"name={name}", "-f", f"color={color}",
+                    repo=repo)
+            except RuntimeError as mutation_error:
+                # A concurrent hook may have created the same label after our
+                # complete read. Accept only authoritative convergence; any
+                # absent label or subsequent correction failure remains fatal.
+                raced = _repo_labels(client, repo).get(name)
+                if raced is None:
+                    raise mutation_error
+                if raced.lower() == color:
+                    existing[name] = raced
+                    continue
+                current = raced
+        if current is not None:
+            github_call(
+                client, "api", "--method", "PATCH",
+                _api_endpoint(repo, f"labels/{_encoded_path(name)}"),
+                "-f", f"new_name={name}", "-f", f"color={color}",
+                repo=repo)
+        existing[name] = color
+
+
+def add_issue_labels(client: str, repo: str, pr: str,
+                     labels: list[str]) -> None:
+    if labels:
+        github_call(
+            client, "api", "--method", "POST",
+            _api_endpoint(repo, f"issues/{pr}/labels"),
+            *sum([["-f", f"labels[]={label}"] for label in labels], []),
+            repo=repo)
+
+
+def remove_issue_label(client: str, repo: str, pr: str, label: str) -> None:
+    try:
+        github_call(
+            client, "api", "--method", "DELETE",
+            _api_endpoint(repo, f"issues/{pr}/labels/{_encoded_path(label)}"),
+            repo=repo)
+    except RuntimeError as mutation_error:
+        current = github_call(
+            client, "pr", "view", pr, "--repo", repo, "--json", "labels",
+            "-q", ".labels[].name").stdout.splitlines()
+        if label in current:
+            raise mutation_error
+
+
+def update_issue_body(client: str, repo: str, pr: str, body: str) -> None:
+    fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"body": body}, handle, ensure_ascii=False)
+        github_call(
+            client, "api", "--method", "PATCH",
+            _api_endpoint(repo, f"issues/{pr}"), "--input", tmpname,
+            repo=repo)
+    finally:
+        try: os.unlink(tmpname)
+        except OSError: pass
 
 
 def load_config(cli_hide: str) -> dict:
@@ -1217,6 +1326,14 @@ def prior_prov(body: str) -> dict:
     return _prior_tag(body).get("prov", {})
 
 
+def prior_stamp(body: str) -> str:
+    marker = MARK_RE.search(body or "")
+    if not marker:
+        return ""
+    stamped = re.search(r"<sub>stamped ([^<\r\n]+)</sub>", marker.group(0))
+    return stamped.group(1).strip() if stamped else ""
+
+
 def stale_labels(existing: list[str], prior: list[str], keep: set[str], cfg: dict) -> set[str]:
     """Whence-owned labels that must be removed before desired labels are added."""
     numbered = {label for label in existing
@@ -1283,14 +1400,36 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     it: without it every `gh` call resolves the PR number against the cwd's repo,
     so a sweep running from an unrelated checkout would stamp a same-numbered PR
     in the WRONG repository."""
+    pr = str(pr)
+    if not re.fullmatch(r"[1-9][0-9]*", pr):
+        raise RuntimeError("whence: PR number must be a positive decimal integer")
+    target_repo = repo
+    if not target_repo:
+        target_repo = github_call(
+            GH, "repo", "view", "--json", "nameWithOwner",
+            "-q", ".nameWithOwner").stdout.strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]+",
+                            target_repo):
+            raise RuntimeError("whence: could not resolve an exact GitHub repository")
     client = github_client_for_repo(
-        GH, repo, explicit=bool(os.environ.get("WHENCE_GH")))
-    R = ["--repo", repo] if repo else []
+        GH, target_repo, explicit=bool(os.environ.get("WHENCE_GH")))
+    R = ["--repo", target_repo]
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
-    ft = footer(p, cfg, names) if post_footer else ""
     body = github_call(
         client, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
+    ft = footer(p, cfg, names) if post_footer else ""
+    # Collection timestamps describe the first publication of one exact public
+    # provenance snapshot, not the latest retry. Preserve that time only when
+    # both the marker payload and label set are unchanged, making hook replay a
+    # true zero-write operation while material provenance changes remain fresh.
+    if (post_footer and prior_labels(body) == names
+            and prior_prov(body) == prior_prov(ft)):
+        stamped = prior_stamp(body)
+        if stamped and stamped != p.get("stamped"):
+            published = dict(p)
+            published["stamped"] = stamped
+            ft = footer(published, cfg, names)
     before = {"labels": prior_labels(body), "prov": prior_prov(body)}
     keep = set(names)
     existing = github_call(
@@ -1301,12 +1440,10 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     # stale/duplicate values converge even if an older footer forgot to list one.
     stale = stale_labels(existing, prior_labels(body), keep, cfg)
     for s in sorted(x for x in stale if x):
-        github_call(client, "pr", "edit", pr, *R, "--remove-label", s)
-    for n, c in labels:
-        github_call(client, "label", "create", n, *R, "--color", c, "--force")
-    if names:
-        github_call(client, "pr", "edit", pr, *R,
-                    *sum([["--add-label", n] for n in names], []))
+        remove_issue_label(client, target_repo, pr, s)
+    ensure_repo_labels(client, target_repo, labels)
+    add_issue_labels(client, target_repo, pr,
+                     [name for name in names if name not in existing])
     # A successful-looking mutation is not proof. Re-read the numbered classes,
     # correct once, and fail visibly if GitHub still has a duplicate/stale value.
     # The hook wrapper absorbs this failure, while the ledger keeps the PR
@@ -1317,10 +1454,9 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
             "-q", ".labels[].name").stdout.splitlines()
         if not numbered_labels_converged(current, keep, cfg):
             for old in sorted(stale_labels(current, [], keep, cfg)):
-                github_call(client, "pr", "edit", pr, *R, "--remove-label", old)
-            if names:
-                github_call(client, "pr", "edit", pr, *R,
-                            *sum([["--add-label", n] for n in names], []))
+                remove_issue_label(client, target_repo, pr, old)
+            add_issue_labels(client, target_repo, pr,
+                             [name for name in names if name not in current])
             current = github_call(
                 client, "pr", "view", pr, *R, "--json", "labels",
                 "-q", ".labels[].name").stdout.splitlines()
@@ -1330,18 +1466,12 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     stripped = MARK_RE.sub("", body).rstrip()
     newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
     if newbody != body:
-        fd, tmpname = tempfile.mkstemp(prefix="whence-body-", suffix=".md")
-        try:
-            os.write(fd, newbody.encode()); os.close(fd)
-            github_call(client, "pr", "edit", pr, *R, "--body-file", tmpname)
-        finally:
-            try: os.unlink(tmpname)
-            except OSError: pass
+        update_issue_body(client, target_repo, pr, newbody)
     after = {"labels": names, "prov": prior_prov(ft)}
     if before != after:                       # only log a real change, not a no-op re-stamp
         _audit(cfg, {"ts": datetime.datetime.now(datetime.timezone.utc)
                             .strftime("%Y-%m-%d %H:%M:%S UTC"),
-                     "pr": pr, "repo": repo, "source": source,
+                     "pr": pr, "repo": target_repo, "source": source,
                      "by": f"{p.get('agent','?')}@{p.get('host','?')}",
                      "before": before, "after": after})
     return names
