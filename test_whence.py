@@ -158,7 +158,9 @@ def main() -> int:
     rejected = subprocess.CompletedProcess([], 1, "", "Resource not accessible by integration")
     with mock.patch.object(w, "sh", return_value=rejected):
         try:
-            w.github_call(app, "pr", "edit", "24")
+            w.github_call(app, "api", "--method", "POST",
+                          "repos/danielraffel/whence/issues/24/labels",
+                          repo="danielraffel/whence")
         except RuntimeError as exc:
             checked_failure = "Resource not accessible by integration" in str(exc)
         else:
@@ -182,8 +184,9 @@ def main() -> int:
     with mock.patch.object(w, "sh", side_effect=mutation_sh), \
          mock.patch.object(w.shutil, "which", return_value=ambient):
         retried = w.github_call(
-            app, "pr", "edit", "24", "--repo", "danielraffel/pulp-planning",
-            "--add-label", "1·codex")
+            app, "api", "--method", "POST",
+            "repos/danielraffel/pulp-planning/issues/24/labels",
+            "-f", "labels[]=1·codex", repo="danielraffel/pulp-planning")
     retried_with_ambient = (
         retried.returncode == 0 and len(mutation_calls) == 3
         and mutation_calls[0][0] == app
@@ -194,6 +197,154 @@ def main() -> int:
         print(f"FAIL  read-only App mutation fallback: {mutation_calls!r}")
     else:
         print("ok    read-only App mutation retries through verified ambient gh")
+
+    # Shipyard's privileged ghapp grammar permits `api`, not `label create` or
+    # `pr edit`. Exercise the complete provenance write path twice against a
+    # stateful fake: every mutation must use the supported API surface and the
+    # second application must perform no writes.
+    class StatefulGitHub:
+        def __init__(self):
+            self.repo_labels = {"1·codex": "FFFFFF"}
+            self.issue_labels = {"1·claude"}
+            self.body = "<sub>stamped forged</sub>\nInitial body\n"
+            self.mutations = []
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            argv = list(args[1:])
+            self.calls.append(tuple(argv))
+            if argv[:2] == ["repo", "view"]:
+                return subprocess.CompletedProcess(args, 0, "danielraffel/whence\n", "")
+            if argv[:2] == ["pr", "view"]:
+                if "body" in argv:
+                    return subprocess.CompletedProcess(args, 0, self.body, "")
+                return subprocess.CompletedProcess(
+                    args, 0, "\n".join(sorted(self.issue_labels)), "")
+            if argv and argv[0] == "api":
+                endpoint = next((x for x in argv if x.startswith("repos/")), "")
+                if "--paginate" in argv:
+                    payload = [{"name": n, "color": c}
+                               for n, c in sorted(self.repo_labels.items())]
+                    return subprocess.CompletedProcess(args, 0, json.dumps([payload]), "")
+                method = argv[argv.index("--method") + 1]
+                self.mutations.append(tuple(argv))
+                fields = [argv[i + 1] for i, value in enumerate(argv[:-1]) if value == "-f"]
+                if method == "POST" and endpoint == "repos/danielraffel/whence/labels":
+                    values = dict(field.split("=", 1) for field in fields)
+                    self.repo_labels[values["name"]] = values["color"]
+                elif method == "POST" and endpoint.endswith("/issues/24/labels"):
+                    self.issue_labels.update(
+                        field.split("=", 1)[1] for field in fields
+                        if field.startswith("labels[]="))
+                elif method == "DELETE" and "/issues/24/labels/" in endpoint:
+                    self.issue_labels.discard(w.urllib.parse.unquote(endpoint.rsplit("/", 1)[1]))
+                elif method == "PATCH" and "/labels/" in endpoint:
+                    old_name = w.urllib.parse.unquote(endpoint.rsplit("/", 1)[1])
+                    values = dict(field.split("=", 1) for field in fields)
+                    self.repo_labels.pop(old_name, None)
+                    self.repo_labels[values["new_name"]] = values["color"]
+                elif method == "PATCH" and endpoint.endswith("/issues/24"):
+                    body_file = argv[argv.index("--input") + 1]
+                    payload = pathlib.Path(body_file).read_bytes().decode("utf-8")
+                    self.body = json.loads(payload)["body"]
+                else:
+                    return subprocess.CompletedProcess(args, 1, "", f"unexpected API call: {argv!r}")
+                return subprocess.CompletedProcess(args, 0, "{}", "")
+            return subprocess.CompletedProcess(args, 1, "", f"unsupported call: {argv!r}")
+
+    stateful = StatefulGitHub()
+    stamp_cfg = {
+        "hide": set(), "colors": w.DEFAULT_COLORS, "label_maxlen": 24,
+        "order_labels": True, "audit_log": False,
+    }
+    stamp_prov = {field: "" for field in w.FIELDS}
+    stamp_prov.update({"agent": "codex", "host": "m5", "stamped": "now"})
+    with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
+         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=stateful):
+        first_names = w.apply_stamp(
+            "24", stamp_prov, stamp_cfg, True, True,
+            repo="danielraffel/whence", source="test")
+        first_mutation_count = len(stateful.mutations)
+        first_body = stateful.body
+        stamp_prov["stamped"] = "later"
+        second_names = w.apply_stamp(
+            "24", stamp_prov, stamp_cfg, True, True,
+            repo="", source="test")
+        replay_mutation_count = len(stateful.mutations)
+        replay_body = stateful.body
+        stamp_prov.update({"agent": "claude", "stamped": "later"})
+        third_names = w.apply_stamp(
+            "24", stamp_prov, stamp_cfg, True, True,
+            repo="danielraffel/whence", source="test")
+    supported_grammar_only = all(
+        call[0] == "api" or call[:2] in (("pr", "view"), ("repo", "view"))
+        for call in stateful.calls)
+    if (first_names != ["1·codex", "2·m5"] or second_names != first_names
+            or third_names != ["1·claude", "2·m5"]
+            or stateful.issue_labels != set(third_names)
+            or stateful.repo_labels != {"1·codex": "1f6feb", "1·claude": "1f6feb",
+                                        "2·m5": "1a7f37"}
+            or w.prior_stamp(first_body) != "now" or w.prior_stamp(stateful.body) != "later"
+            or replay_body != first_body or replay_mutation_count != first_mutation_count
+            or len(stateful.mutations) == replay_mutation_count
+            or not supported_grammar_only):
+        failed += 1
+        print(f"FAIL  ghapp provenance API: names={first_names!r}/{second_names!r} "
+              f"labels={stateful.issue_labels!r} repo_labels={stateful.repo_labels!r} "
+              f"mutations={stateful.mutations!r}")
+    else:
+        print("ok    ghapp provenance API covers create/recolor/remove/body/resolve and replay")
+
+    label_pages = lambda labels: subprocess.CompletedProcess(
+        [], 0, json.dumps([[{"name": n, "color": c} for n, c in labels.items()]]), "")
+    with mock.patch.object(w, "github_call", side_effect=[
+            label_pages({}), RuntimeError("concurrent create"),
+            label_pages({"1·codex": "1f6feb"})]):
+        try:
+            w.ensure_repo_labels(app, "danielraffel/whence", [("1·codex", "1F6FEB")])
+        except RuntimeError:
+            create_race_converged = False
+        else:
+            create_race_converged = True
+    with mock.patch.object(w, "github_call", side_effect=[
+            RuntimeError("concurrent removal"),
+            subprocess.CompletedProcess([], 0, "", "")]):
+        try:
+            w.remove_issue_label(app, "danielraffel/whence", "24", "1·claude")
+        except RuntimeError:
+            remove_race_converged = False
+        else:
+            remove_race_converged = True
+    with mock.patch.object(w, "github_call", side_effect=[
+            RuntimeError("permission denied"),
+            subprocess.CompletedProcess([], 0, "1·claude\n", "")]):
+        try:
+            w.remove_issue_label(app, "danielraffel/whence", "24", "1·claude")
+        except RuntimeError:
+            removal_denial_failed = True
+        else:
+            removal_denial_failed = False
+    if not create_race_converged or not remove_race_converged or not removal_denial_failed:
+        failed += 1
+        print(f"FAIL  API race fences: create={create_race_converged} "
+              f"remove={remove_race_converged} denial={removal_denial_failed}")
+    else:
+        print("ok    API races converge only after authoritative state readback")
+
+    with mock.patch.object(
+            w, "github_call",
+            return_value=subprocess.CompletedProcess([], 0, "not-json", "")):
+        try:
+            w.ensure_repo_labels(app, "danielraffel/whence", [("1·codex", "1f6feb")])
+        except RuntimeError:
+            malformed_labels_failed = True
+        else:
+            malformed_labels_failed = False
+    if not malformed_labels_failed:
+        failed += 1
+        print("FAIL  malformed repository-label read did not fail closed")
+    else:
+        print("ok    malformed repository-label read fails closed before mutation")
 
     for name, tr, want in OUTCOMES:
         got = w.parse_outcome({"tool_response": tr})
