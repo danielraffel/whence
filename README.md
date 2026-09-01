@@ -209,9 +209,9 @@ For the long-running orchestrators (`shipyard pr` and `pulp pr`), the wrapper
 also captures the repo, branch, exact HEAD, and live provenance **before** the
 real command starts, then launches the bounded targeted retry in parallel. The
 PR can therefore be stamped as soon as GitHub exposes it while the orchestrator
-is still building or waiting to merge. When the command finally returns, the
-wrapper sweeps from that captured ledger record instead of recollecting weaker
-shell provenance (for example `agent=unknown`). The command's exit status is
+is still building or waiting to merge. The post-command path does not run a
+whole-ledger sweep: the exact retry already owns this branch, and a synchronous
+global scan could block or outlive the agent. The command's exit status is
 unchanged.
 
 Its limit, honestly: it only fires in shells that load your init file, so it
@@ -307,6 +307,9 @@ when an agent happens to fire the hook again — otherwise the last PR of a sess
 would wait forever for a next command that never comes. Once an entry is stamped
 it is marked done, so a steady-state sweep costs no API calls. `whence --setup`
 installs the timer for you; run it by hand any time with `whence --sweep`.
+Each pass has a hard item/time budget and resumes after a durable fair cursor on
+the next tick. A large or slow ledger therefore converges without one sweep
+blocking an agent or monopolizing the timer.
 
 ### Keeping several machines in sync
 
