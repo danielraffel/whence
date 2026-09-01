@@ -15,6 +15,7 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 from unittest import mock
 
 _src = (pathlib.Path(__file__).parent / "whence").read_text().split("def main(")[0]
@@ -100,6 +101,36 @@ def cwd_cases(tmp):
 
 def main() -> int:
     failed = 0
+
+    # A timeout owns the complete subprocess tree. Plant a TERM-resistant
+    # grandchild that inherits Whence's capture pipes: the helper must return on
+    # schedule and leave no process behind. A normal command is the positive
+    # control proving the same instrument can report success.
+    control = w.sh("sh", "-c", "printf control", timeout=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        child_pid = pathlib.Path(tmp) / "child.pid"
+        script = (
+            "sh -c 'trap \"\" HUP TERM; echo $$ > \"$1\"; "
+            "while :; do sleep 1; done' sh \"$1\" & wait"
+        )
+        started = time.monotonic()
+        timed = w.sh("sh", "-c", script, "sh", str(child_pid), timeout=0.1)
+        elapsed = time.monotonic() - started
+        planted_pid = int(child_pid.read_text()) if child_pid.exists() else 0
+        alive = False
+        for _ in range(20):
+            alive = bool(planted_pid and subprocess.run(
+                ["ps", "-p", str(planted_pid)], capture_output=True).returncode == 0)
+            if not alive:
+                break
+            time.sleep(0.025)
+    if (control.returncode != 0 or control.stdout != "control"
+            or timed.returncode != 124 or elapsed > 1.0 or alive):
+        failed += 1
+        print(f"FAIL  process-tree timeout: control={control!r} timed={timed!r} "
+              f"elapsed={elapsed:.3f} child_alive={alive}")
+    else:
+        print("ok    process-tree timeout: TERM/KILL reaps a pipe-holding grandchild")
 
     # A configured GitHub App remains the preferred client. It may fall back to
     # ambient user auth only when GitHub says the App cannot access this exact
@@ -1139,6 +1170,143 @@ def main() -> int:
     else:
         print("ok    durable next-sweep revision: newer known context is republished before done")
 
+    # A large pending ledger is processed in bounded, fair slices. Successful
+    # rows become terminal and subsequent timer passes resume after the durable
+    # cursor until every row has had its turn.
+    with tempfile.TemporaryDirectory() as tmp:
+        fair_ledger = pathlib.Path(tmp) / "ledger.json"
+        fair_rows = {}
+        for index in range(5):
+            fair_rows[f"example/repo#branch-{index}"] = {
+                "p": {f: "" for f in w.FIELDS}, "ts": 100,
+                "head": f"head-{index}", "revision": 1,
+            }
+        fair_ledger.write_text(json.dumps(fair_rows))
+        queried_keys = []
+
+        def fair_query(*args, **kwargs):
+            branch = args[args.index("--head") + 1]
+            key = f"example/repo#{branch}"
+            queried_keys.append(key)
+            head = fair_rows[key]["head"]
+            return subprocess.CompletedProcess(
+                [], 0, json.dumps([{"number": len(queried_keys), "body": "",
+                                    "headRefOid": head}]), "")
+
+        def fair_publish(key, *args, **kwargs):
+            with w._ledger_lock():
+                current = w._load_ledger()
+                current[key]["done"] = True
+                w._write_ledger(current)
+            return True
+
+        with mock.patch.object(w, "LEDGER", fair_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=101), \
+             mock.patch.object(w, "github_client_for_repo", return_value="ghapp"), \
+             mock.patch.object(w, "sh", side_effect=fair_query), \
+             mock.patch.object(w, "_publish_ledger_pr", side_effect=fair_publish):
+            fair_counts = [w.sweep(sweep_cfg, max_items=2, max_seconds=30)
+                           for _ in range(3)]
+        final_fair = json.loads(fair_ledger.read_text())
+        cursor = fair_ledger.with_name(fair_ledger.name + ".sweep-cursor").read_text().strip()
+    expected_fair = list(sorted(fair_rows))
+    if (fair_counts != [2, 2, 1] or queried_keys != expected_fair
+            or not all(rec.get("done") for rec in final_fair.values())
+            or cursor != expected_fair[-1]):
+        failed += 1
+        print(f"FAIL  bounded fair sweep: counts={fair_counts} queries={queried_keys} "
+              f"cursor={cursor!r} final={final_fair!r}")
+    else:
+        print("ok    bounded fair sweep: repeated timer passes drain every row once")
+
+    # The wall-clock budget is independent of the item budget. Once exhausted,
+    # the current row remains pending and the cursor advances so it cannot starve
+    # later rows forever.
+    with tempfile.TemporaryDirectory() as tmp:
+        budget_ledger = pathlib.Path(tmp) / "ledger.json"
+        budget_ledger.write_text(json.dumps(fair_rows))
+        with mock.patch.object(w, "LEDGER", budget_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=101), \
+             mock.patch.object(w, "github_client_for_repo", return_value="ghapp"), \
+             mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 0, "[]", "")) as budget_sh, \
+             mock.patch.object(w.time, "monotonic", side_effect=[0, 0, 0, 2]):
+            budget_count = w.sweep(sweep_cfg, max_items=10, max_seconds=1)
+        budget_cursor = budget_ledger.with_name(
+            budget_ledger.name + ".sweep-cursor").read_text().strip()
+    if budget_count != 0 or budget_sh.call_count != 1 or budget_cursor != expected_fair[0]:
+        failed += 1
+        print(f"FAIL  sweep wall budget: count={budget_count} calls={budget_sh.call_count} "
+              f"cursor={budget_cursor!r}")
+    else:
+        print("ok    sweep wall budget: pending work survives for the next fair pass")
+
+    # A targeted retry may already own a branch publication lock. The global
+    # sweep must skip that row within its deadline instead of waiting behind the
+    # live owner. A separate whole-sweep lock also prevents concurrent cursor
+    # writers from regressing one another.
+    lock_holder = (
+        "import fcntl,pathlib,sys,time; "
+        "p=pathlib.Path(sys.argv[1]); m=pathlib.Path(sys.argv[2]); "
+        "f=p.open('a+'); fcntl.flock(f.fileno(),fcntl.LOCK_EX); "
+        "m.write_text('held'); time.sleep(float(sys.argv[3]))"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        locked_ledger = pathlib.Path(tmp) / "ledger.json"
+        locked_key = "example/repo#locked"
+        locked_ledger.write_text(json.dumps({locked_key: {
+            "p": {f: "" for f in w.FIELDS}, "ts": 100,
+            "head": "locked-head", "revision": 1,
+        }}))
+        digest = w.hashlib.sha256(locked_key.encode()).hexdigest()
+        publication_path = locked_ledger.with_name(
+            f"{locked_ledger.name}.{digest}.publish.lock")
+        publication_marker = pathlib.Path(tmp) / "publication-held"
+        owner = subprocess.Popen([
+            sys.executable, "-c", lock_holder, str(publication_path),
+            str(publication_marker), "1.2",
+        ])
+        for _ in range(100):
+            if publication_marker.exists(): break
+            time.sleep(0.01)
+        publication_acquired = publication_marker.exists()
+        matching = subprocess.CompletedProcess([], 0, json.dumps([
+            {"number": 1, "body": "", "headRefOid": "locked-head"}]), "")
+        started = time.monotonic()
+        with mock.patch.object(w, "LEDGER", locked_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=101), \
+             mock.patch.object(w, "github_client_for_repo", return_value="ghapp"), \
+             mock.patch.object(w, "sh", return_value=matching):
+            locked_count = w.sweep(sweep_cfg, max_items=1, max_seconds=0.6)
+        locked_elapsed = time.monotonic() - started
+        owner.wait(timeout=3)
+
+        sweep_path = locked_ledger.with_name(locked_ledger.name + ".sweep.lock")
+        sweep_marker = pathlib.Path(tmp) / "sweep-held"
+        sweep_owner = subprocess.Popen([
+            sys.executable, "-c", lock_holder, str(sweep_path), str(sweep_marker), "0.5",
+        ])
+        for _ in range(100):
+            if sweep_marker.exists(): break
+            time.sleep(0.01)
+        cursor_path = locked_ledger.with_name(locked_ledger.name + ".sweep-cursor")
+        cursor_before = cursor_path.read_text() if cursor_path.exists() else ""
+        started = time.monotonic()
+        with mock.patch.object(w, "LEDGER", locked_ledger), \
+             mock.patch.object(w, "sh") as overlap_sh:
+            overlap_count = w.sweep(sweep_cfg, max_items=1, max_seconds=0.6)
+        overlap_elapsed = time.monotonic() - started
+        cursor_after = cursor_path.read_text() if cursor_path.exists() else ""
+        sweep_owner.wait(timeout=2)
+    if (not publication_acquired or locked_count != 0 or locked_elapsed > 1.0
+            or overlap_count != 0 or overlap_elapsed > 0.2 or overlap_sh.called
+            or cursor_before != cursor_after):
+        failed += 1
+        print(f"FAIL  sweep lock deadlines: publication={locked_elapsed:.3f}s "
+              f"overlap={overlap_elapsed:.3f}s counts={locked_count}/{overlap_count} "
+              f"cursor_changed={cursor_before != cursor_after}")
+    else:
+        print("ok    sweep lock deadlines: live owners cannot wedge or regress a pass")
+
     with tempfile.TemporaryDirectory() as tmp:
         ledger_path = pathlib.Path(tmp) / "ledger.json"
         acquired = pathlib.Path(tmp) / "child-acquired"
@@ -1274,11 +1442,11 @@ def main() -> int:
              mock.patch.object(w.time, "monotonic", side_effect=[0, 0, 119, 121]), \
              mock.patch.object(w.time, "sleep") as deadline_sleep:
             w.retry_pending_pr(key, publication_cfg, attempts=24, delay=5, max_wait=120)
-    if deadline_sh.call_count != 1 or deadline_sleep.call_args_list != [mock.call(1)]:
+    if deadline_sh.call_count != 1 or deadline_sleep.call_count:
         failed += 1
         print(f"FAIL  retry deadline: queries={deadline_sh.call_count} sleeps={deadline_sleep.call_args_list}")
     else:
-        print("ok    retry deadline: request + sleep cannot exceed two-minute budget")
+        print("ok    retry deadline: exhausted request budget cannot add a sleep")
 
     retry_cfg = {"hide": {"session", "url"}}
     with mock.patch.object(w, "_spawn_retry") as spawn:
@@ -1399,12 +1567,13 @@ def main() -> int:
         # resulting hook is sourced later from an interactive shell that can.
         with mock.patch("shutil.which", return_value=None):
             hook_text, wrapped_tools = w._hook_file_text()
-        if wrapped_tools != list(w.PR_TOOLS) or not all(
-                f"{tool}()" in hook_text for tool in w.PR_TOOLS):
+        if (wrapped_tools != list(w.PR_TOOLS) or not all(
+                f"{tool}()" in hook_text for tool in w.PR_TOOLS)
+                or "__whence_sweep" in hook_text or "--sweep" in hook_text):
             failed += 1
             print(f"FAIL  deterministic wrappers: tools={wrapped_tools}")
         else:
-            print("ok    shell wrapper generation: reduced deploy PATH cannot drop tools")
+            print("ok    shell wrapper generation: no interruptible global sweep remains")
         hook_file = root / "hook.sh"
         hook_file.write_text(hook_text)
         env = dict(**__import__("os").environ)
@@ -1423,7 +1592,7 @@ def main() -> int:
         )
         lifecycle_ok = (driven.returncode == 0 and (state / "preexec").exists()
                         and (state / "started").exists() and (state / "stamped").exists()
-                        and (state / "swept").exists()
+                        and not (state / "swept").exists()
                         and not (state / "recollected").exists()
                         and (state / "context").read_text().strip()
                         == "SY-LF-2026-08-20|cmux|direct")
@@ -1431,7 +1600,7 @@ def main() -> int:
             failed += 1
             print(f"FAIL  long-running wrapper: rc={driven.returncode} out={driven.stdout!r} err={driven.stderr!r}")
         else:
-            print("ok    long-running wrapper: pre-exec stamp kept; post path sweeps ledger")
+            print("ok    long-running wrapper: exact retry stamps without a global post sweep")
         for name in ("preexec", "stamped", "pr-created", "started", "swept", "recollected", "context"):
             try: (state / name).unlink()
             except FileNotFoundError: pass
@@ -1456,13 +1625,63 @@ def main() -> int:
             env=env, capture_output=True, text=True, timeout=5,
         )
         bash_ok = (bash_run.returncode == 0 and (state / "preexec").exists()
-                   and (state / "stamped").exists() and (state / "swept").exists()
+                   and (state / "stamped").exists() and not (state / "swept").exists()
                    and not (state / "recollected").exists())
         if not bash_ok:
             failed += 1
             print(f"FAIL  bash wrapper: rc={bash_run.returncode} state={[p.name for p in state.iterdir()]}")
         else:
             print("ok    shell wrapper: absolute-path bypass works in zsh and bash")
+
+    # Drive the production PostToolUse entrypoint, not merely helper functions.
+    # A push records its ledger row and returns without invoking the fake GitHub
+    # client; the launchd timer owns global sweep work.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        home, bindir = root / "home", root / "bin"
+        cfg_dir = home / ".config" / "whence"
+        cfg_dir.mkdir(parents=True); bindir.mkdir()
+        (cfg_dir / ".last-selfupdate").write_text(str(int(time.time())))
+        gh_marker = root / "gh-called"
+        fake_gh = bindir / "gh"
+        fake_gh.write_text(
+            "#!/bin/sh\n"
+            f"touch '{gh_marker}'\n"
+            "sleep 2\n"
+            "exit 1\n"
+        )
+        fake_gh.chmod(0o755)
+        payload = {
+            "tool_input": {"command": "git push"},
+            "tool_response": {"stderr":
+                "To github.com:danielraffel/whence.git\n"
+                " * [new branch] fix/hook -> fix/hook\n"},
+            "cwd": str(pathlib.Path(__file__).parent),
+            "session_id": "hook-nonblocking-test",
+            "transcript_path": str(home / ".codex" / "session.jsonl"),
+        }
+        env = dict(__import__("os").environ)
+        env.update({"HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"})
+        for inherited in list(env):
+            if inherited.startswith("CMUX_") or inherited.startswith("WHENCE_"):
+                env.pop(inherited, None)
+        started = time.monotonic()
+        hook_run = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).parent / "whence"), "--hook"],
+            input=json.dumps(payload), env=env, capture_output=True, text=True,
+            timeout=1.5,
+        )
+        hook_elapsed = time.monotonic() - started
+        hook_ledger = cfg_dir / "branch-ledger.json"
+        hook_rows = json.loads(hook_ledger.read_text()) if hook_ledger.exists() else {}
+        gh_called = gh_marker.exists()
+    if (hook_run.returncode != 0 or hook_elapsed > 1.0 or gh_called
+            or "danielraffel/whence#fix/hook" not in hook_rows):
+        failed += 1
+        print(f"FAIL  PostToolUse nonblocking: rc={hook_run.returncode} "
+              f"elapsed={hook_elapsed:.3f} gh_called={gh_called} rows={hook_rows!r}")
+    else:
+        print("ok    PostToolUse: records push and returns without a global sweep")
 
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0

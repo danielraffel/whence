@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -142,14 +142,74 @@ DEFAULT_CONFIG = {
 }
 
 
+PROCESS_TIMEOUT = 15.0
+PROCESS_TERM_GRACE = 0.25
+_PROCESS_DEADLINE: float | None = None
+
+
+@contextlib.contextmanager
+def _bounded_process_deadline(deadline: float):
+    """Clamp every nested subprocess, including publication helpers, to one budget."""
+    global _PROCESS_DEADLINE
+    previous = _PROCESS_DEADLINE
+    _PROCESS_DEADLINE = deadline if previous is None else min(previous, deadline)
+    try:
+        yield
+    finally:
+        _PROCESS_DEADLINE = previous
+
+
+def _stop_process_group(proc: subprocess.Popen, grace: float) -> tuple[str, str]:
+    """Bounded TERM -> KILL for the complete subprocess tree.
+
+    GitHub clients may run credential helpers before they ``exec`` the network
+    client. Killing only their immediate shell can leave a helper holding our
+    capture pipes open, so a nominal subprocess timeout would still strand the
+    caller in ``communicate()``.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            return proc.communicate(timeout=grace)
+        except subprocess.TimeoutExpired:
+            continue
+    # SIGKILL should make every group member release the pipes. Keep even this
+    # last collection bounded rather than turning cleanup into another hang.
+    try:
+        return proc.communicate(timeout=grace)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr):
+            if stream:
+                stream.close()
+        return "", ""
+
+
 def sh(*a, **k):
     # Bounded + graceful: a missing binary (e.g. no cmux) or a slow network call
     # degrades to an empty result instead of crashing or hanging the caller.
-    k.setdefault("timeout", 15)
+    timeout = float(k.pop("timeout", PROCESS_TIMEOUT))
+    if _PROCESS_DEADLINE is not None:
+        remaining = _PROCESS_DEADLINE - time.monotonic()
+        if remaining <= PROCESS_TERM_GRACE * 2:
+            return subprocess.CompletedProcess(a, 124, "", "command deadline exhausted")
+        timeout = min(timeout, remaining - PROCESS_TERM_GRACE * 2)
     try:
-        return subprocess.run(a, capture_output=True, text=True, **k)
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        proc = subprocess.Popen(
+            a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True, **k)
+    except (FileNotFoundError, OSError) as e:
         return subprocess.CompletedProcess(a, 1, "", str(e))
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(a, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        stdout, stderr = _stop_process_group(proc, PROCESS_TERM_GRACE)
+        detail = f"command timed out after {timeout:g}s"
+        stderr = f"{stderr.rstrip()}\n{detail}" if stderr else detail
+        return subprocess.CompletedProcess(a, 124, stdout, stderr)
 
 
 _GH_CLIENT_CACHE: dict[tuple[str, str, bool], str] = {}
@@ -159,19 +219,21 @@ _GHAPP_REPO_ACCESS_ERRORS = (
 )
 
 
-def _verified_ambient_gh(configured: str, repo: str) -> str:
+def _verified_ambient_gh(configured: str, repo: str,
+                         timeout: float = PROCESS_TIMEOUT) -> str:
     fallback = shutil.which("gh")
     if not fallback or pathlib.Path(fallback).name == pathlib.Path(configured).name:
         return ""
     verified = sh(fallback, "repo", "view", repo, "--json", "nameWithOwner",
-                  "-q", ".nameWithOwner")
+                  "-q", ".nameWithOwner", timeout=timeout)
     if verified.returncode == 0 and verified.stdout.strip().lower() == repo.lower():
         return fallback
     return ""
 
 
 def github_client_for_repo(configured: str, repo: str,
-                           explicit: bool = False) -> str:
+                           explicit: bool = False,
+                           timeout: float = PROCESS_TIMEOUT) -> str:
     """Resolve a GitHub client before any provenance mutation.
 
     A fleet may prefer ``ghapp`` for public repositories while the App is not
@@ -187,14 +249,14 @@ def github_client_for_repo(configured: str, repo: str,
     if key in _GH_CLIENT_CACHE:
         return _GH_CLIENT_CACHE[key]
     probe = sh(configured, "repo", "view", repo, "--json", "nameWithOwner",
-               "-q", ".nameWithOwner")
+               "-q", ".nameWithOwner", timeout=timeout)
     if probe.returncode == 0 and probe.stdout.strip().lower() == repo.lower():
         _GH_CLIENT_CACHE[key] = configured
         return configured
     detail = f"{probe.stdout}\n{probe.stderr}".lower()
     if not any(marker in detail for marker in _GHAPP_REPO_ACCESS_ERRORS):
         return configured
-    fallback = _verified_ambient_gh(configured, repo)
+    fallback = _verified_ambient_gh(configured, repo, timeout=timeout)
     if fallback:
         _GH_CLIENT_CACHE[key] = fallback
         return fallback
@@ -972,7 +1034,6 @@ def _hook_file_text() -> tuple[str, list]:
         "if [ -n \"$__whence_workstream\" ]; then "
         "WHENCE_WORKSTREAM_ID=\"$__whence_workstream\" command whence --pre-exec \"$PWD\"; "
         "else command whence --pre-exec \"$PWD\"; fi >/dev/null 2>&1 || true; }",
-        "__whence_sweep() { command whence --sweep >/dev/null 2>&1 || true; }",
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
@@ -980,7 +1041,10 @@ def _hook_file_text() -> tuple[str, list]:
         binary = f"$__whence_{tool}_bin"
         active = f'[ -n "{binary}" ] && {trig} && __whence_will_act "$@"'
         before = f"if {active}; then __whence_preexec \"$@\"; fi; " if tool in PREEXEC_TOOLS else ""
-        after = "__whence_sweep" if tool in PREEXEC_TOOLS else "__whence_stamp"
+        # Long-running orchestrators already start an exact repo/branch retry in
+        # ``--pre-exec``. A synchronous whole-ledger sweep here can outlive an
+        # interrupted agent; the launchd sweep remains the eventual backstop.
+        after = ":" if tool in PREEXEC_TOOLS else "__whence_stamp"
         lines.append(
             f'{tool}() {{ __whence_{tool}_bin="$(__whence_real {tool})"; '
             f'if [ -z "{binary}" ]; then echo "{tool}: command not found" >&2; return 127; fi; '
@@ -1489,6 +1553,8 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
 # the git branch, which every path shares, so it needs no Shipyard dependency.
 LEDGER = CFG_DIR / "branch-ledger.json"
 DEFAULT_BRANCHES = {"main", "master", "trunk", "develop"}
+SWEEP_MAX_ITEMS = 20
+SWEEP_MAX_SECONDS = 60.0
 
 
 def _git(cwd, *a):
@@ -1842,7 +1908,7 @@ def _ledger_lock():
 
 
 @contextlib.contextmanager
-def _publication_lock(key: str):
+def _publication_lock(key: str, deadline: float | None = None):
     """Serialize publication for one repository/branch, never the whole ledger.
 
     The kernel releases this lock when a worker exits, so crash recovery does
@@ -1852,9 +1918,38 @@ def _publication_lock(key: str):
     digest = hashlib.sha256(key.encode()).hexdigest()
     lock_path = LEDGER.with_name(f"{LEDGER.name}.{digest}.publish.lock")
     with lock_path.open("a+") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        if deadline is None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        else:
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= PROCESS_TERM_GRACE * 2:
+                        yield False
+                        return
+                    time.sleep(min(0.02, remaining))
         try:
-            yield
+            yield True
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _sweep_lock():
+    """One cursor owner at a time; overlapping manual/timer sweeps no-op."""
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    path = LEDGER.with_name(LEDGER.name + ".sweep.lock")
+    with path.open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
@@ -2093,7 +2188,8 @@ def _best_provenance(rec: dict, cfg: dict, body: str = "") -> tuple[dict, str]:
 
 
 def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
-                       cfg: dict, source: str) -> bool:
+                       cfg: dict, source: str,
+                       lock_deadline: float | None = None) -> bool:
     """Publish only the latest revision for one exact ledger HEAD.
 
     The global ledger lock protects only tiny local read/modify/write cycles;
@@ -2103,7 +2199,9 @@ def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
     GitHub is being updated, the old revision is not marked published or done,
     so the next sweep must publish the newer context.
     """
-    with _publication_lock(key):
+    with _publication_lock(key, deadline=lock_deadline) as acquired:
+        if not acquired:
+            return False
         return _publish_ledger_pr_serialized(
             key, expected_head, pr, body, cfg, source)
 
@@ -2177,7 +2275,49 @@ def _publish_ledger_pr_serialized(key: str, expected_head: str, pr: str,
     return publish
 
 
-def sweep(cfg: dict) -> int:
+def _sweep_cursor_path() -> pathlib.Path:
+    return LEDGER.with_name(LEDGER.name + ".sweep-cursor")
+
+
+def _load_sweep_cursor() -> str:
+    try:
+        return _sweep_cursor_path().read_text().strip()
+    except OSError:
+        return ""
+
+
+def _write_sweep_cursor(key: str) -> None:
+    path = _sweep_cursor_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as tmp:
+            tmp.write(key + "\n")
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        try: os.unlink(tmp_name)
+        except FileNotFoundError: pass
+
+
+def _fair_sweep_keys(keys: list[str], cursor: str) -> list[str]:
+    ordered = sorted(keys)
+    if not cursor:
+        return ordered
+    return [key for key in ordered if key > cursor] + [key for key in ordered if key <= cursor]
+
+
+def sweep(cfg: dict, max_items: int = SWEEP_MAX_ITEMS,
+          max_seconds: float = SWEEP_MAX_SECONDS) -> int:
+    with _sweep_lock() as acquired:
+        if not acquired:
+            return 0
+        return _sweep_serialized(cfg, max_items=max_items, max_seconds=max_seconds)
+
+
+def _sweep_serialized(cfg: dict, max_items: int,
+                      max_seconds: float) -> int:
     """Stamp — and HEAL — every ledgered branch's PR. Prunes entries >14 days old.
 
     Two jobs in one pass:
@@ -2198,22 +2338,49 @@ def sweep(cfg: dict) -> int:
         if now - rec.get("ts", 0) > 14 * 86400:
             continue
         keep[key] = rec
-        slug, _, br = key.partition("#")
-        if not slug or not br or rec.get("done"):
-            continue
-        client = github_client_for_repo(
-            GH, slug, explicit=bool(os.environ.get("WHENCE_GH")))
-        res = sh(client, "pr", "list", "--repo", slug, "--head", br,
-                 "--state", "all", "--json", "number,body,headRefOid")
-        try: prs = json.loads(res.stdout or "[]")
-        except Exception: prs = []
-        for pr in prs:
-            if not rec.get("head") or pr.get("headRefOid") != rec.get("head"):
-                continue
-            source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
-            if _publish_ledger_pr(key, rec.get("head", ""), str(pr["number"]),
-                                  pr.get("body", ""), cfg, source):
-                n += 1
+    eligible = [key for key, rec in keep.items()
+                if not rec.get("done") and all(key.partition("#")[::2])]
+    deadline = time.monotonic() + max(0.0, max_seconds)
+    attempted = 0
+    last_attempted = ""
+    with _bounded_process_deadline(deadline):
+        for key in _fair_sweep_keys(eligible, _load_sweep_cursor()):
+            if attempted >= max(0, max_items):
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= PROCESS_TERM_GRACE * 2:
+                break
+            rec = keep[key]
+            attempted += 1
+            last_attempted = key
+            slug, _, br = key.partition("#")
+            client = github_client_for_repo(
+                GH, slug, explicit=bool(os.environ.get("WHENCE_GH")),
+                timeout=max(0.1, min(PROCESS_TIMEOUT, remaining - PROCESS_TERM_GRACE)))
+            remaining = deadline - time.monotonic()
+            if remaining <= PROCESS_TERM_GRACE:
+                break
+            res = sh(client, "pr", "list", "--repo", slug, "--head", br,
+                     "--state", "all", "--json", "number,body,headRefOid",
+                     timeout=max(0.1, min(PROCESS_TIMEOUT, remaining - PROCESS_TERM_GRACE)))
+            try: prs = json.loads(res.stdout or "[]")
+            except Exception: prs = []
+            for pr in prs:
+                if not rec.get("head") or pr.get("headRefOid") != rec.get("head"):
+                    continue
+                source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
+                try:
+                    if _publish_ledger_pr(
+                            key, rec.get("head", ""), str(pr["number"]),
+                            pr.get("body", ""), cfg, source,
+                            lock_deadline=deadline):
+                        n += 1
+                except RuntimeError:
+                    if deadline - time.monotonic() <= PROCESS_TERM_GRACE * 2:
+                        break
+                    raise
+    if last_attempted:
+        _write_sweep_cursor(last_attempted)
     # Network discovery above intentionally runs without holding the process
     # lock. Publication is separately fenced; this final transaction only
     # prunes an expired record if no writer changed it since the snapshot.
@@ -2242,24 +2409,32 @@ def retry_pending_pr(key: str, cfg: dict, attempts: int = 24, delay: float = 5.0
     if not rec or not sep or not slug or not br:
         return 0
     deadline = time.monotonic() + max_wait
-    for attempt in range(max(1, attempts)):
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        client = github_client_for_repo(
-            GH, slug, explicit=bool(os.environ.get("WHENCE_GH")))
-        res = sh(client, "pr", "list", "--repo", slug, "--head", br,
-                 "--state", "all", "--json", "number,body,createdAt,headRefOid",
-                 timeout=max(0.1, min(5.0, remaining)))
-        prs = _recent_prs(res.stdout, rec)
-        if prs:
-            for pr in prs:
-                _publish_ledger_pr(key, rec.get("head", ""), str(pr["number"]),
-                                   pr.get("body", ""), cfg, "retry")
-            return 0
-        remaining = deadline - time.monotonic()
-        if attempt + 1 < max(1, attempts) and remaining > 0:
-            time.sleep(min(delay, remaining))
+    with _bounded_process_deadline(deadline):
+        for attempt in range(max(1, attempts)):
+            remaining = deadline - time.monotonic()
+            if remaining <= PROCESS_TERM_GRACE * 2:
+                break
+            client = github_client_for_repo(
+                GH, slug, explicit=bool(os.environ.get("WHENCE_GH")),
+                timeout=max(0.1, min(5.0, remaining - PROCESS_TERM_GRACE)))
+            remaining = deadline - time.monotonic()
+            if remaining <= PROCESS_TERM_GRACE:
+                break
+            res = sh(client, "pr", "list", "--repo", slug, "--head", br,
+                     "--state", "all", "--json", "number,body,createdAt,headRefOid",
+                     timeout=max(0.1, min(5.0, remaining - PROCESS_TERM_GRACE)))
+            prs = _recent_prs(res.stdout, rec)
+            if prs:
+                for pr in prs:
+                    _publish_ledger_pr(
+                        key, rec.get("head", ""), str(pr["number"]),
+                        pr.get("body", ""), cfg, "retry", lock_deadline=deadline)
+                return 0
+            remaining = deadline - time.monotonic()
+            if remaining <= PROCESS_TERM_GRACE * 2:
+                break
+            if attempt + 1 < max(1, attempts) and remaining > 0:
+                time.sleep(min(delay, remaining))
     return 0
 
 
@@ -2831,20 +3006,17 @@ def main() -> int:
             p["resume"] = KNOWN_RESUME[p["agent"]].format(sid=p["session"])
         elif p["agent"] not in KNOWN_RESUME and "WHENCE_RESUME_COMMAND" not in os.environ:
             p["resume"] = ""
-        # Capture this branch's provenance while the env is live, then run the
-        # cheap throttled maintenance: converge to the repo + backfill any PR the
-        # live stamp couldn't reach (worktree / daemon / push-only / timed-out).
+        # Capture this branch's provenance while the env is live. Exact retry is
+        # detached below; global backfill belongs exclusively to the launchd
+        # timer so PostToolUse can never strand an agent in a ledger scan.
         if hook_is_pr or hook_is_push:
             ledger_key = ledger_record(hook_cmd, p, hook_slug, hook_br,
                                        hook_source_ref, hook_cwd)
         try: self_update()                       # throttled once/day internally
         except Exception: pass
-        try:
-            if _throttled("sweep", 120): sweep(cfg)
-        except Exception: pass
         maybe_retry_deferred_pr(hook_is_pr, hook_pr, ledger_key,
                                 cfg, post_labels, post_footer)
-        if not hook_is_pr:                        # a push only records + sweeps
+        if not hook_is_pr:                        # a push records; timer backfills
             return 0
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
