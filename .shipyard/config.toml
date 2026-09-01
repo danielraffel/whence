@@ -1,0 +1,13 @@
+[project]
+name = "whence"
+type = "python"
+platforms = ["macos"]
+
+# Keep this identical to Whence's canonical local acceptance on the deployed
+# Python 3.9 runtime and the current developer Python.
+[validation.default]
+command = "/usr/bin/python3 test_whence.py && python3 test_whence.py && python3 -m py_compile whence test_whence.py"
+
+[targets.mac]
+backend = "local"
+platform = "macos-arm64"
