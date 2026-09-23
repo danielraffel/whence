@@ -987,8 +987,15 @@ PR_TOOLS = {
     "pulp":     '[ "$1" = pr ]',
     "gh":       '[ "$1" = pr ] && [ "$2" = create ]',
     "ghapp":    '[ "$1" = pr ] && [ "$2" = create ]',
+    # `git push` is the one capture route with no PR-opening wrapper, so it used
+    # to depend on parsing "To github.com:" out of the push summary. A -q, a
+    # redirect, or a pipeline destroys that line, and because a second push says
+    # "Everything up-to-date" the branch then becomes permanently uncapturable.
+    # Pre-exec reads provenance from $PWD instead, so capture no longer depends
+    # on stdout surviving a pipeline.
+    "git":      '[ "$1" = push ]',
 }
-PREEXEC_TOOLS = {"shipyard", "pulp"}
+PREEXEC_TOOLS = {"shipyard", "pulp", "git"}
 HOOK_MARK_RE = re.compile(r"\n*# >>> whence hook >>>.*?# <<< whence hook <<<\n", re.S)
 HOOK_FILE = CFG_DIR / "hook.sh"
 
@@ -1023,6 +1030,32 @@ def _hook_file_text() -> tuple[str, list]:
         "# executable is resolved lazily behind its same-named function (no recursion).",
         "# NB: `command whence` — plain `whence` is a zsh BUILTIN (like `which`), so",
         "# `command` is required to reach this script rather than the builtin.",
+        '# Launcher and route provenance are DERIVED from the launch, never guessed.',
+        '# cmux records the exact agent launch argv in CMUX_AGENT_LAUNCH_ARGV_B64, so its',
+        '# presence proves cmux started this agent, and a subrouter-routed session carries',
+        '# the subrouter marker inside it: claude as',
+        '# `--settings .../subrouter-claude-settings-*/settings.json`, codex as',
+        '# `-c model_provider="subrouter"`. Both forms point at the same local subrouter',
+        '# proxy, so that one variable answers "how was this launched and routed" and the',
+        "# PR chip stops reading `unresolved`. Precedence matches whence's own resolution",
+        '# order, so an explicit value from a launcher always wins. A session cmux did not',
+        '# start (ssh, cron, a bare shell) exports nothing and stays honestly unresolved',
+        '# rather than being stamped with a fleet default that may be false -- a wrong',
+        '# route published on every PR is worse than an absent one. Exporting once per',
+        '# session is self-caching: child shells inherit it and never re-decode.',
+        'if [ -n "${CMUX_AGENT_LAUNCH_ARGV_B64:-}" ]; then',
+        '  __whence_argv="$(printf %s "${CMUX_AGENT_LAUNCH_ARGV_B64}" | base64 -d 2>/dev/null | tr \'\\0\' \' \')"',
+        '  case "$__whence_argv" in',
+        '    ?*) [ -n "${WHENCE_LAUNCHER+x}" ] || { WHENCE_LAUNCHER=cmux; export WHENCE_LAUNCHER; } ;;',
+        '  esac',
+        '  if [ -z "${WHENCE_ROUTE+x}" ]; then',
+        '    case "$__whence_argv" in',
+        '      *subrouter*) WHENCE_ROUTE=subrouter; export WHENCE_ROUTE ;;',
+        '      ?*)          WHENCE_ROUTE=direct;    export WHENCE_ROUTE ;;',
+        '    esac',
+        '  fi',
+        '  unset __whence_argv',
+        'fi',
         "__whence_real() { if [ -n \"${ZSH_VERSION:-}\" ]; then whence -p \"$1\"; "
         "else type -P \"$1\"; fi 2>/dev/null; }",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
