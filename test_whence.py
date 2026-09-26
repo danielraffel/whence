@@ -11,6 +11,7 @@ Run: python3 test_whence.py
 """
 import importlib.util
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -1682,6 +1683,200 @@ def main() -> int:
               f"elapsed={hook_elapsed:.3f} gh_called={gh_called} rows={hook_rows!r}")
     else:
         print("ok    PostToolUse: records push and returns without a global sweep")
+
+    # ── Regression: an orchestrator commits on top of the captured HEAD ──
+    # The shell wrapper captures HEAD before `shipyard pr` runs; Shipyard then
+    # adds `chore: bump versions` and opens the PR at that new commit. The exact
+    # HEAD match therefore never fired and the PR stayed unlabelled forever
+    # (danielraffel/Shipyard#616, #612, #607). Drive the real ledger_record and
+    # real git ancestry; only the GitHub client is faked.
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        repo.mkdir()
+        def git(*a):
+            return subprocess.run(["git", "-C", str(repo), *a], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "feat/x")
+        git("config", "user.email", "t@example.com"); git("config", "user.name", "t")
+        git("remote", "add", "origin", "https://github.com/example/repo.git")
+        git("commit", "-q", "--allow-empty", "-m", "base")
+        # A same-named branch reused for different work shares history with the
+        # capture but does not contain the captured commit.
+        git("checkout", "-q", "-b", "other")
+        git("commit", "-q", "--allow-empty", "-m", "unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("checkout", "-q", "feat/x")
+        git("commit", "-q", "--allow-empty", "-m", "work")
+        captured = git("rev-parse", "HEAD")
+        anc_ledger = pathlib.Path(tmp) / "ledger.json"
+        anc_p = {f: "" for f in w.FIELDS}
+        anc_p.update({"agent": "claude", "host": "m3", "tab": "T", "origin_state": "known",
+                      "launcher": "cmux", "route": "direct", "session": "s-1"})
+        anc_cfg = {"labels": True, "footer": True, "hide": set(),
+                   "colors": dict(w.DEFAULT_COLORS), "label_maxlen": 24,
+                   "denylist": [], "redact_placeholder": "(redacted)"}
+        real_sh = w.sh
+        with mock.patch.object(w, "LEDGER", anc_ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=1_790_000_000):
+            key = w.ledger_record("", anc_p, "", "", "HEAD", str(repo), lock_provenance=True)
+        git("commit", "-q", "--allow-empty", "-m", "chore: bump versions")
+        bumped = git("rev-parse", "HEAD")
+        rec = json.loads(anc_ledger.read_text())[key]
+        git_dir_recorded = (os.path.realpath(rec.get("git_dir", ""))
+                            == os.path.realpath(repo / ".git"))
+        after = "2026-09-21T14:20:00Z"   # > ts (2026-09-21T14:13:20Z)
+        before = "2026-09-21T12:00:00Z"
+        def run_case(prs, runner):
+            stamped = []
+            def fake_sh(*args, **kwargs):
+                if args and args[0] == "fakegh":
+                    return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+                return real_sh(*args, **kwargs)
+            anc_ledger.write_text(json.dumps({key: rec}))
+            with mock.patch.object(w, "LEDGER", anc_ledger), \
+                 mock.patch.object(w, "_now_epoch", return_value=1_790_000_100), \
+                 mock.patch.object(w, "github_client_for_repo", return_value="fakegh"), \
+                 mock.patch.object(w, "sh", side_effect=fake_sh), \
+                 mock.patch.object(w, "_best_provenance", side_effect=lambda r, c, b="": (r["p"], "")), \
+                 mock.patch.object(w, "apply_stamp",
+                                   side_effect=lambda pr, p, *a, **k: stamped.append(pr)), \
+                 mock.patch.object(w.time, "sleep"):
+                if runner == "retry":
+                    w.retry_pending_pr(key, anc_cfg, attempts=1, delay=0)
+                else:
+                    w.sweep(anc_cfg)
+            return stamped
+        def pr(n, head, created):
+            return {"number": n, "body": "", "headRefOid": head, "createdAt": created}
+        results = {}
+        for runner in ("retry", "sweep"):
+            results[(runner, "bumped")] = run_case([pr(616, bumped, after)], runner)
+            results[(runner, "unrelated")] = run_case([pr(700, unrelated, after)], runner)
+            results[(runner, "old-pr")] = run_case([pr(500, bumped, before)], runner)
+            results[(runner, "exact-wins")] = run_case(
+                [pr(801, bumped, after), pr(802, captured, after)], runner)
+    anc_ok = (key == "example/repo#feat/x"
+              and git_dir_recorded
+              and all(results[(r, "bumped")] == ["616"] for r in ("retry", "sweep"))
+              and all(results[(r, "unrelated")] == [] for r in ("retry", "sweep"))
+              and all(results[(r, "old-pr")] == [] for r in ("retry", "sweep"))
+              and all(results[(r, "exact-wins")] == ["802"] for r in ("retry", "sweep")))
+    if not anc_ok:
+        failed += 1
+        print(f"FAIL  descendant PR head: key={key} git_dir={rec.get('git_dir')!r} {results}")
+    else:
+        print("ok    orchestrator bump commit: PR descending from the capture is stamped; "
+              "unrelated, older, and non-exact-when-exact-exists are not")
+
+    # ── Launchers hide the PR command from a function wrapper ──
+    # `timeout 900 shipyard pr` (how agents, subagents especially, bound a long
+    # orchestrator) execs the real binary, so the `shipyard` function never ran
+    # and nothing was captured. Drive the generated hook in zsh and bash.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        bindir, state = root / "bin", root / "state"
+        bindir.mkdir(); state.mkdir()
+        (bindir / "whence").write_text(
+            f"#!/bin/sh\necho \"$1\" >> '{state}/calls'\n")
+        # A launcher that, like timeout/nohup/env, runs its command by exec.
+        launcher_body = ("#!/bin/sh\n"
+                         "while [ $# -gt 0 ]; do case \"$1\" in "
+                         "-s|-k|-u) shift 2 ;; -*|*=*|[0-9]*) shift ;; *) break ;; esac; done\n"
+                         "exec \"$@\"\n")
+        for name in ("timeout", "nohup", "env"):
+            (bindir / name).write_text(launcher_body)
+        for tool in ("shipyard", "gh", "grep"):
+            (bindir / tool).write_text(
+                f"#!/bin/sh\necho \"{tool} $*\" >> '{state}/ran'\n"
+                "[ \"$FAKE_RC\" ] && exit \"$FAKE_RC\"; exit 0\n")
+        for f in bindir.iterdir():
+            f.chmod(0o755)
+        hook_file = root / "hook.sh"
+        hook_file.write_text(w._hook_file_text()[0])
+        cases = [
+            ("timeout 900 shipyard pr --base main", "--pre-exec", 0),
+            ("X=1 timeout -s KILL 5m shipyard pr", "--pre-exec", 0),
+            ("nohup env PULP_SKIP_DIFF_COVER=1 shipyard pr --base main", "--pre-exec", 0),
+            ("timeout 900 gh pr create --fill", "--auto", 0),
+            ("timeout 5 grep shipyard pr", "", 0),
+            ("timeout 900 shipyard pr --help", "", 0),
+            ("nohup gh pr list", "", 0),
+            ("env", "", 0),
+            ("FAKE_RC=7 timeout 900 shipyard pr", "--pre-exec", 7),
+        ]
+        launcher_fail = []
+        env = dict(os.environ)
+        env.update({"ZDOTDIR": str(root), "PATH": f"{bindir}:/usr/bin:/bin"})
+        for shell in (["zsh", "-fc"], ["bash", "--noprofile", "--norc", "-c"]):
+            for cmd, want, want_rc in cases:
+                for leftover in ("calls", "ran"):
+                    try: (state / leftover).unlink()
+                    except FileNotFoundError: pass
+                run = subprocess.run([*shell, f'. "{hook_file}"; {cmd} >/dev/null'],
+                                     env=env, capture_output=True, text=True, timeout=10)
+                calls = (state / "calls").read_text().split() if (state / "calls").exists() else []
+                ran = (state / "ran").exists() or cmd == "env"
+                if calls != ([want] if want else []) or run.returncode != want_rc or not ran:
+                    launcher_fail.append((shell[0], cmd, calls, run.returncode, run.stderr[-200:]))
+    if launcher_fail:
+        failed += 1
+        print(f"FAIL  launcher wrappers: {launcher_fail}")
+    else:
+        print("ok    launcher wrappers: timeout/nohup/env capture the PR command they exec, "
+              "ignore non-PR commands, and preserve the exit status")
+
+    # ── Claude sessions launched with their own CLAUDE_CONFIG_DIR ──
+    with tempfile.TemporaryDirectory() as tmp:
+        home = pathlib.Path(tmp)
+        (home / ".claude").mkdir()
+        proxy_a = home / "session-config"   # outside the configured glob
+        proxy_b = home / ".router" / "claude-proxy" / "bbb"
+        proxy_a.mkdir(parents=True); proxy_b.mkdir(parents=True)
+        (home / ".router" / "claude-proxy" / "aaa").mkdir()
+        with mock.patch.dict(os.environ, {
+                "HOME": str(home), "CLAUDE_CONFIG_DIR": str(proxy_a),
+                "WHENCE_CLAUDE_CONFIG_DIRS": "~/.router/claude-proxy/*:~/missing/*"}):
+            files = w.claude_settings_files()
+            for f in files:
+                w._wire_posttooluse(f, "Bash", {})
+        wired = [json.loads(f.read_text())["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+                 for f in files]
+    expected_files = [home / ".claude" / "settings.json", proxy_a / "settings.json",
+                      home / ".router" / "claude-proxy" / "aaa" / "settings.json",
+                      proxy_b / "settings.json"]
+    if files != expected_files or not all(c.endswith("pr-hook.sh") for c in wired):
+        failed += 1
+        print(f"FAIL  claude config dirs: files={files} wired={wired}")
+    else:
+        print("ok    agent hook: wired into ~/.claude, CLAUDE_CONFIG_DIR, and configured dirs once each")
+
+    # ── A missed stamp is detectable ──
+    listing = json.dumps([
+        {"number": 1, "headRefName": "a", "body": "x\n<!-- whence {} -->f<!-- /whence -->", "state": "MERGED",
+         "author": {"login": "bot"}, "labels": []},
+        {"number": 2, "headRefName": "b", "body": "", "state": "OPEN",
+         "author": {"login": "bot"}, "labels": []},
+        {"number": 3, "headRefName": "c", "body": "", "state": "MERGED",
+         "author": {"login": "bot"}, "labels": [{"name": "1·claude"}]},
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        led = pathlib.Path(tmp) / "ledger.json"
+        led.write_text(json.dumps({"o/r#b": {"p": {}, "ts": 1, "head": "h"}}))
+        out = __import__("io").StringIO()
+        with mock.patch.object(w, "LEDGER", led), \
+             mock.patch.object(w, "github_client_for_repo", return_value="fakegh"), \
+             mock.patch.object(w, "github_call",
+                               return_value=subprocess.CompletedProcess([], 0, listing, "")), \
+             mock.patch("sys.stdout", out), mock.patch("sys.stderr", __import__("io").StringIO()):
+            un_rc = w.unstamped("o/r", 10)
+    un_lines = out.getvalue().splitlines()
+    if (un_rc != 1 or len(un_lines) != 2 or "ledger: pending sweep" not in un_lines[0]
+            or "no capture on this host" not in un_lines[1]
+            or "footer missing" not in un_lines[1]):
+        failed += 1
+        print(f"FAIL  --unstamped: rc={un_rc} lines={un_lines}")
+    else:
+        print("ok    --unstamped: lists unstamped PRs with their ledger state, exit 1")
 
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0

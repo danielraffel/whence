@@ -177,6 +177,13 @@ whence --install-agent-hook claude   # just Claude
 whence --install-agent-hook codex    # just Codex
 ```
 
+Claude Code reads user settings from `$CLAUDE_CONFIG_DIR` when it is set, so a
+session launched with its own config dir (an account or proxy router, for example)
+never sees `~/.claude/settings.json`. The Claude hook is therefore also wired into
+the current `CLAUDE_CONFIG_DIR` and into every existing directory matched by the
+colon-separated globs in `WHENCE_CLAUDE_CONFIG_DIRS`
+(`WHENCE_CLAUDE_CONFIG_DIRS='~/.router/claude-proxy/*' whence --install-agent-hook claude`).
+
 It writes a small `pr-hook.sh` and registers a `PostToolUse` hook that runs
 `whence --hook` — which reads the tool call and stamps only when the command
 actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). Both are
@@ -213,6 +220,13 @@ is still building or waiting to merge. The post-command path does not run a
 whole-ledger sweep: the exact retry already owns this branch, and a synchronous
 global scan could block or outlive the agent. The command's exit status is
 unchanged.
+
+Launchers are covered too. `timeout 900 shipyard pr`, `nohup env X=1 shipyard pr`
+and the like exec the real binary, which a function alone would never see, so the
+hook also wraps `timeout`, `gtimeout`, `nohup` and `env`: each looks past its own
+options, assignments and durations to the command it runs and captures (or stamps)
+it exactly as if it had been typed bare. Any other command, such as
+`timeout 5 grep shipyard pr`, passes straight through.
 
 Its limit, honestly: it only fires in shells that load your init file, so it
 catches PRs you open in a normal terminal and in agents whose command shell
@@ -296,6 +310,12 @@ of your own: none of them can push code without saying where it went.
    the global timer fires. The shell wrapper starts this retry before a
    long-running `shipyard pr`/`pulp pr`; PostToolUse remains a second path for
    commands that return promptly or run in shells without the wrapper.
+   A capture is keyed to the exact commit it saw, and orchestrators commit on
+   top of it before opening the PR (Shipyard adds `chore: bump versions`). The
+   retry and the sweep therefore also accept a PR opened after the capture whose
+   head provably *descends* from the captured commit, checked locally against the
+   repository the capture ran in. An exact match still wins; a reused branch name
+   whose history does not contain the captured commit never matches.
 3. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
    but isn't stamped yet, using the *ledger's* provenance (the tab that made the
    branch) — never the sweeping machine's. It covers **merged and closed** PRs,
@@ -310,6 +330,13 @@ installs the timer for you; run it by hand any time with `whence --sweep`.
 Each pass has a hard item/time budget and resumes after a durable fair cursor on
 the next tick. A large or slow ledger therefore converges without one sweep
 blocking an agent or monopolizing the timer.
+
+**Finding a miss.** `whence --unstamped owner/repo [--limit N]` lists recent PRs
+that carry no stamp, and for each one whether this machine's ledger holds a
+capture (the sweep will stamp it) or none (no route on this machine saw it open).
+It exits 1 when anything is unstamped. Ledgers are per machine, so run it on each.
+To repair a PR nothing captured, run `whence --pr N --apply` from the checkout,
+in the tab and session that opened it.
 
 ### Keeping several machines in sync
 
