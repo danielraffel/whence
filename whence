@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, contextlib, fcntl, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, contextlib, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -996,6 +996,13 @@ PR_TOOLS = {
     "git":      '[ "$1" = push ]',
 }
 PREEXEC_TOOLS = {"shipyard", "pulp", "git"}
+# Commands that run another command by exec'ing it. A function wrapper cannot
+# see through them — `timeout 900 shipyard pr` execs the real binary, so the
+# `shipyard` function never runs, nothing is captured, and the PR is silently
+# left unlabelled. Agents wrap long orchestrators in exactly these (a subagent's
+# `timeout N shipyard pr` is the common case), so each gets a thin function that
+# looks past its own options/assignments to the command it launches.
+LAUNCHERS = ("timeout", "gtimeout", "nohup", "env")
 HOOK_MARK_RE = re.compile(r"\n*# >>> whence hook >>>.*?# <<< whence hook <<<\n", re.S)
 HOOK_FILE = CFG_DIR / "hook.sh"
 
@@ -1070,6 +1077,31 @@ def _hook_file_text() -> tuple[str, list]:
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
+    lines += [
+        # Find the command a launcher will exec, skipping only tokens that are
+        # launcher syntax: nested launchers, options, NAME=value assignments,
+        # durations/priorities, and signal names. Any other word ends the scan,
+        # so `timeout 5 grep shipyard pr` is never mistaken for a PR command.
+        "__whence_inner() { __whence_kind=; while [ \"$#\" -gt 0 ]; do "
+        "case \"${1##*/}\" in "
+        "shipyard|pulp) if [ \"${2:-}\" = pr ] && __whence_will_act \"$@\"; "
+        "then __whence_kind=pre; fi; return 0 ;; "
+        "git) if [ \"${2:-}\" = push ] && __whence_will_act \"$@\"; "
+        "then __whence_kind=pre; fi; return 0 ;; "
+        "gh|ghapp) if [ \"${2:-}\" = pr ] && [ \"${3:-}\" = create ] "
+        "&& __whence_will_act \"$@\"; then __whence_kind=post; fi; return 0 ;; "
+        "env|nohup|timeout|gtimeout|setsid|caffeinate|nice|stdbuf|command|-*|*=*|[0-9]*) shift ;; "
+        "[[:upper:]]*) case \"$1\" in *[![:upper:][:digit:]]*) return 0 ;; esac; shift ;; "
+        "*) return 0 ;; esac; done; }",
+        "__whence_launch() { __whence_l=$1; shift; "
+        "__whence_lbin=\"$(__whence_real \"$__whence_l\")\"; "
+        "if [ -z \"$__whence_lbin\" ]; then echo \"$__whence_l: command not found\" >&2; "
+        "return 127; fi; __whence_inner \"$@\"; __whence_lkind=$__whence_kind; "
+        "if [ \"$__whence_lkind\" = pre ]; then __whence_preexec \"$@\"; fi; "
+        "\"$__whence_lbin\" \"$@\"; __whence_rc=$?; "
+        "if [ \"$__whence_lkind\" = post ]; then __whence_stamp; fi; return $__whence_rc; }",
+    ]
+    lines += [f'{name}() {{ __whence_launch {name} "$@"; }}' for name in LAUNCHERS]
     for tool, trig in tools:
         binary = f"$__whence_{tool}_bin"
         active = f'[ -n "{binary}" ] && {trig} && __whence_will_act "$@"'
@@ -1190,15 +1222,41 @@ def _wire_posttooluse(path: pathlib.Path, matcher: str, extra: dict) -> None:
     path.write_text(json.dumps(d, indent=2) + "\n")
 
 
+def claude_settings_files() -> list[pathlib.Path]:
+    """Every Claude Code user-settings file whose sessions should carry the hook.
+
+    Claude reads user settings from ``$CLAUDE_CONFIG_DIR`` when it is set, not
+    from ``~/.claude``. A launcher that points sessions at their own config dir
+    (an account/proxy router, for instance) therefore runs them with NO whence
+    hook even though ``~/.claude/settings.json`` has one, and a PR such a session
+    opens through a path the shell wrapper cannot see is never captured. Wire
+    the default dir, the current ``CLAUDE_CONFIG_DIR``, and any existing dirs
+    matched by the colon-separated globs in ``WHENCE_CLAUDE_CONFIG_DIRS``."""
+    dirs = [os.path.expanduser("~/.claude")]
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        dirs.append(os.path.expanduser(os.environ["CLAUDE_CONFIG_DIR"]))
+    for pattern in os.environ.get("WHENCE_CLAUDE_CONFIG_DIRS", "").split(":"):
+        if pattern.strip():
+            dirs.extend(sorted(glob.glob(os.path.expanduser(pattern.strip()))))
+    out, seen = [], set()
+    for d in dirs:
+        real = os.path.realpath(d)
+        if real in seen or (d != dirs[0] and not os.path.isdir(d)):
+            continue
+        seen.add(real)
+        out.append(pathlib.Path(d) / "settings.json")
+    return out
+
+
 def install_agent_hook(scope: str) -> int:
     """Wire the reliable in-process agent hooks: Claude globally, Codex per-repo
     (Codex only reads a repo's own .codex/hooks.json, and gates it behind trust)."""
     _write_pr_hook()
     did = []
     if scope in ("all", "claude"):
-        _wire_posttooluse(pathlib.Path(os.path.expanduser("~/.claude/settings.json")),
-                          "Bash", {})
-        did.append("claude (~/.claude/settings.json, global)")
+        for settings in claude_settings_files():
+            _wire_posttooluse(settings, "Bash", {})
+            did.append(f"claude ({settings}, global)")
     if scope in ("all", "codex"):
         _wire_posttooluse(pathlib.Path(os.path.expanduser("~/.codex/hooks.json")),
                           "Bash|Shell|shell|local_shell|exec", {"timeout": 20000})
@@ -2021,18 +2079,45 @@ def _recent_prs(raw: str, rec: dict) -> list[dict]:
     captured_head = rec.get("head", "")
     if not captured_head:
         return []
-    recent = []
-    for pr in prs:
-        value = pr.get("createdAt", "")
-        try:
-            created = int(datetime.datetime.fromisoformat(
-                value.replace("Z", "+00:00")
-            ).timestamp())
-        except (TypeError, ValueError):
-            continue
-        if created >= not_before - 5 and pr.get("headRefOid") == captured_head:
-            recent.append(pr)
-    return recent
+    recent = [pr for pr in prs if _created_since(pr, not_before)
+              and pr.get("headRefOid") == captured_head]
+    if recent:
+        return recent
+    return [pr for pr in prs if _created_since(pr, not_before)
+            and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+
+
+def _created_since(pr: dict, not_before: int) -> bool:
+    """Whether a PR was opened by this capture (five seconds of clock skew)."""
+    try:
+        created = int(datetime.datetime.fromisoformat(
+            pr.get("createdAt", "").replace("Z", "+00:00")
+        ).timestamp())
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return created >= not_before - 5
+
+
+def _descends_from_capture(rec: dict, pr_head: str) -> bool:
+    """Whether a PR head is the captured HEAD plus commits added on top of it.
+
+    The shell wrapper captures HEAD *before* ``shipyard pr`` runs, and the
+    orchestrator then commits on top of it (``chore: bump versions``) before it
+    opens the PR. An exact-HEAD match can never succeed for that PR, so it was
+    silently left unlabelled. The captured commit being an ancestor of the PR
+    head keeps the identity boundary exact — a reused branch name or a fork
+    whose history does not contain the captured commit still never matches —
+    while admitting commits the orchestrator appended. The check is local
+    (the repository the capture ran in, via its common git dir, which survives
+    removal of a linked worktree), so it needs no GitHub call and no network."""
+    captured, git_dir = rec.get("head", ""), rec.get("git_dir", "")
+    if not captured or not pr_head or not git_dir or not os.path.isdir(git_dir):
+        return False
+    if captured == pr_head:
+        return True
+    res = sh("git", "--git-dir", git_dir, "merge-base", "--is-ancestor",
+             captured, pr_head, timeout=5)
+    return res.returncode == 0
 
 
 def _locked_value_known(field: str, value: str) -> bool:
@@ -2080,6 +2165,11 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
         return ""
     key = f"{slug}#{br}"
     head = _git(cmd_cwd, "rev-parse", source_ref or br or "HEAD").stdout.strip()
+    # Private, never published: lets the sweep prove a PR head descends from
+    # this capture after an orchestrator appends commits (see
+    # _descends_from_capture). The common dir outlives a removed worktree.
+    git_dir = _git(cmd_cwd, "rev-parse", "--path-format=absolute",
+                   "--git-common-dir").stdout.strip()
     captured = {k: p.get(k, "") for k in FIELDS}
     with _ledger_lock():
         led = _load_ledger()
@@ -2130,6 +2220,8 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                     "ts": _now_epoch(), "head": head,
                     "provenance_locked": prior_locked or lock_provenance,
                     "revision": int(prior.get("revision", 0)) + 1}
+        if git_dir and os.path.isdir(git_dir):
+            led[key]["git_dir"] = git_dir
         _write_ledger(led)
     return key
 
@@ -2394,13 +2486,20 @@ def _sweep_serialized(cfg: dict, max_items: int,
             if remaining <= PROCESS_TERM_GRACE:
                 break
             res = sh(client, "pr", "list", "--repo", slug, "--head", br,
-                     "--state", "all", "--json", "number,body,headRefOid",
+                     "--state", "all", "--json", "number,body,headRefOid,createdAt",
                      timeout=max(0.1, min(PROCESS_TIMEOUT, remaining - PROCESS_TERM_GRACE)))
             try: prs = json.loads(res.stdout or "[]")
             except Exception: prs = []
-            for pr in prs:
-                if not rec.get("head") or pr.get("headRefOid") != rec.get("head"):
-                    continue
+            matched = [pr for pr in prs
+                       if rec.get("head") and pr.get("headRefOid") == rec.get("head")]
+            if not matched:
+                # An orchestrator commits on top of the captured HEAD before it
+                # opens the PR; accept that PR only when it was opened after the
+                # capture and its head provably descends from it.
+                matched = [pr for pr in prs
+                           if _created_since(pr, int(rec.get("ts", 0)))
+                           and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+            for pr in matched:
                 source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
                 try:
                     if _publish_ledger_pr(
@@ -2524,6 +2623,37 @@ def preexec_capture(cwd: str, cfg: dict, post_labels: bool, post_footer: bool) -
     if key:
         _spawn_retry(key, cfg, post_labels, post_footer)
     return key
+
+
+def unstamped(repo: str, limit: int) -> int:
+    """List recent PRs in ``repo`` that carry no whence stamp; exit 1 if any.
+
+    A missed stamp is otherwise silent — the PR just has no label. Each row says
+    whether this machine's ledger holds a capture for the branch (the sweep will
+    stamp it once its PR is provably the captured work) or nothing at all (no
+    route on this machine saw it open; stamp by hand from the tab that made it
+    with ``whence --pr N --apply``). Run it on each host: ledgers are per host."""
+    client = github_client_for_repo(GH, repo, explicit=bool(os.environ.get("WHENCE_GH")))
+    res = github_call(client, "pr", "list", "--repo", repo, "--state", "all",
+                      "--limit", str(max(1, limit)), "--json",
+                      "number,headRefName,body,author,state,labels", repo=repo)
+    try: prs = json.loads(res.stdout or "[]")
+    except Exception: prs = []
+    ledger = _load_ledger()
+    missing = [pr for pr in prs if not is_stamped(pr.get("body") or "")]
+    for pr in missing:
+        rec = ledger.get(f"{repo}#{pr.get('headRefName', '')}")
+        where = ("ledger: pending sweep" if rec and not rec.get("done")
+                 else "ledger: done" if rec else "no capture on this host")
+        if any(re.match(r"^\d·", (lab or {}).get("name", ""))
+               for lab in pr.get("labels") or []):
+            where += "; labelled, footer missing"
+        author = (pr.get("author") or {}).get("login", "")
+        print(f"#{pr.get('number')}\t{pr.get('state', '').lower()}\t{author}\t"
+              f"{pr.get('headRefName', '')}\t{where}")
+    print(f"whence: {len(missing)} of {len(prs)} recent PR(s) in {repo} are unstamped",
+          file=sys.stderr)
+    return 1 if missing else 0
 
 
 def show_log(n: int) -> int:
@@ -2843,6 +2973,9 @@ def main() -> int:
                     help="delete repo-level labels that trip the denylist")
     ap.add_argument("--reorder-labels", metavar="OWNER/REPO",
                     help="force open-PR label chips into agent/host/workspace/tab/route order")
+    ap.add_argument("--unstamped", metavar="OWNER/REPO",
+                    help="list recent PRs with no whence stamp (exit 1 if any)")
+    ap.add_argument("--limit", type=int, default=50, help="with --unstamped: PRs to check")
     ap.add_argument("--log", nargs="?", type=int, const=20, metavar="N",
                     help="show the last N audit entries (label changes; default 20)")
     ap.add_argument("--audit", choices=("on", "off"),
@@ -2928,6 +3061,10 @@ def main() -> int:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         return gc_labels(cfg, args.gc_labels)
+    if args.unstamped:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        return unstamped(args.unstamped, args.limit)
     if args.reorder_labels:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
