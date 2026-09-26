@@ -1829,9 +1829,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         home = pathlib.Path(tmp)
         (home / ".claude").mkdir()
-        proxy_a = home / ".router" / "claude-proxy" / "aaa"
+        proxy_a = home / "session-config"   # outside the configured glob
         proxy_b = home / ".router" / "claude-proxy" / "bbb"
         proxy_a.mkdir(parents=True); proxy_b.mkdir(parents=True)
+        (home / ".router" / "claude-proxy" / "aaa").mkdir()
         with mock.patch.dict(os.environ, {
                 "HOME": str(home), "CLAUDE_CONFIG_DIR": str(proxy_a),
                 "WHENCE_CLAUDE_CONFIG_DIRS": "~/.router/claude-proxy/*:~/missing/*"}):
@@ -1841,6 +1842,7 @@ def main() -> int:
         wired = [json.loads(f.read_text())["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
                  for f in files]
     expected_files = [home / ".claude" / "settings.json", proxy_a / "settings.json",
+                      home / ".router" / "claude-proxy" / "aaa" / "settings.json",
                       proxy_b / "settings.json"]
     if files != expected_files or not all(c.endswith("pr-hook.sh") for c in wired):
         failed += 1
