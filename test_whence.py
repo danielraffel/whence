@@ -796,11 +796,11 @@ def main() -> int:
          mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
         invalid_inherited = w.collect(provenance_cfg, "Generous-Corp/pulp")
     context_ok = (
-        absent["workstream"] == "" and absent["launcher"] == "unresolved"
-        and absent["route"] == "unresolved"
+        absent["workstream"] == "" and absent["launcher"] == "shell"
+        and absent["route"] == "shell"
         and configured["workstream"] == "SY-LF-2026-08-20"
         and configured["launcher"] == "cmux" and configured["route"] == "shipyard-daemon"
-        and malformed["launcher"] == "cmux" and malformed["route"] == "unresolved"
+        and malformed["launcher"] == "cmux" and malformed["route"] == "shell"
         and inherited["workstream"] == "SY-LF-P3"
         and inherited["launcher"] == "cmux-continue-session"
         and inherited["route"] == "subrouter" and inherited["router"] == "m5"
@@ -1953,6 +1953,120 @@ def main() -> int:
         print("ok    rewritten capture: amend and rebase stamp via patch-id; a new head "
               "keeps the lock and its history; two sessions, a replaced claim, an older "
               "or late PR, and a different change do not; exact still wins")
+
+    # ── Launcher/route resolution: no `5·unresolved` from a real session ──
+    # `subrouter codex` scrubs CMUX_* from Codex's environment, so on m5 every
+    # Codex PR stamped launcher/route `unresolved` and no tab. And the route was
+    # derived only by hook.sh, so the Python agent-hook path stamped
+    # `unresolved` over a correct `5·direct` (danielraffel/tartci#260) -- and
+    # `direct` itself was false for `sr claude`, whose cmux launch argv carries
+    # no subrouter marker. Derivation now lives in collect(), from the process
+    # ancestry, and recovers the stripped cmux variables from an ancestor.
+    SURF = "BF748855-B51E-4E48-9F43-EED652E88D07"
+    WS = "16963A89-DE79-43ED-A22F-4885AB7E999A"
+    OTHER = "AAAAAAAA-B51E-4E48-9F43-EED652E88D07"
+    subrouter_codex = [
+        (900, "/bin/zsh -lc gh pr create --fill"),
+        (901, '/Users/u/.local/bin/codex -c model_provider="subrouter" -c x=1'),
+        (902, "/Users/u/bin/subrouter codex -c model_providers.subrouter.supports_websockets=false"),
+        (903, "-/bin/zsh"), (904, "/usr/bin/login -flp u /bin/zsh"),
+        (905, "/Applications/cmux.app/Contents/MacOS/cmux"),
+    ]
+    ancestor_env = {903: {"CMUX_SURFACE_ID": SURF, "CMUX_WORKSPACE_ID": WS},
+                    902: {"CMUX_SURFACE_ID": SURF, "CMUX_WORKSPACE_ID": WS},
+                    904: {"CMUX_SURFACE_ID": OTHER, "CMUX_WORKSPACE_ID": OTHER}}
+    tab_calls = []
+    def launch_collect(env, ancestry, envs=None):
+        tab_calls.clear()
+        def fake_env(pid, names):
+            return {k: v for k, v in (envs or {}).get(pid, {}).items() if k in names}
+        with mock.patch.dict(_os.environ, env, clear=True), \
+             mock.patch.object(w, "_process_ancestry", return_value=ancestry), \
+             mock.patch.object(w, "_process_env", side_effect=fake_env), \
+             mock.patch.object(w, "host_label", return_value="m5"), \
+             mock.patch.object(w, "cmux_workspace", side_effect=lambda ws, s="": ws[:4]), \
+             mock.patch.object(w, "cmux_tab_title",
+                               side_effect=lambda s: (tab_calls.append(s) or ("Fix queue", "") if s else ("", ""))), \
+             mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            return w.collect({"denylist": [], "hide": set()}, "Generous-Corp/pulp")
+    codex_env = {"CODEX_SESSION_ID": "019a-codex", "SUBROUTER_CODEX_LAUNCHER": "subrouter",
+                 "__CFBundleIdentifier": "com.cmuxterm.app"}
+    lc = {}
+    lc["m5-codex"] = launch_collect(codex_env, subrouter_codex, ancestor_env)
+    with tempfile.TemporaryDirectory() as tmp:
+        bindir = pathlib.Path(tmp)
+        real = bindir / "subrouter"; real.write_text("#!/bin/sh\n"); real.chmod(0o755)
+        (bindir / "sr").symlink_to(real)
+        argv_b64 = __import__("base64").b64encode(b"/Users/u/.local/bin/claude\0").decode()
+        claude_env = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "cl-1",
+                      "CMUX_SURFACE_ID": SURF, "CMUX_AGENT_LAUNCH_ARGV_B64": argv_b64,
+                      "PATH": str(bindir)}
+        sr_chain = [(800, "/bin/zsh -c git push"),
+                    (801, "/Users/u/.local/bin/claude --session-id cl-1 --settings /tmp/cmux-claude-settings.x"),
+                    (802, "sr claude"), (803, "-/bin/zsh")]
+        lc["m3-sr-claude"] = launch_collect(claude_env, sr_chain)
+        lc["cmux-direct"] = launch_collect(claude_env, sr_chain[:2] + [(803, "-/bin/zsh")])
+        lc["explicit"] = launch_collect({**claude_env, "WHENCE_ROUTE": "shipyard-daemon",
+                                         "WHENCE_LAUNCHER": "herdr"}, sr_chain)
+    lc["bare-codex"] = launch_collect({"CODEX_SESSION_ID": "c2"},
+                                      [(700, "/bin/zsh -lc x"), (701, "/usr/local/bin/codex")])
+    lc["no-agent"] = launch_collect({}, [(600, "/bin/bash")])
+    got = {k: (v["launcher"], v["route"]) for k, v in lc.items()}
+    want = {"m5-codex": ("subrouter", "subrouter"), "m3-sr-claude": ("cmux", "subrouter"),
+            "cmux-direct": ("cmux", "direct"), "explicit": ("herdr", "shipyard-daemon"),
+            "bare-codex": ("codex-cli", "codex-cli"), "no-agent": ("shell", "shell")}
+    m5 = lc["m5-codex"]
+    recovered = (m5["agent"] == "codex" and m5["terminal"] == "cmux"
+                 and m5["terminal_address"] == SURF and m5["tab"] == "Fix queue"
+                 and m5["origin_state"] == "known" and m5["workspace"] == WS[:4])
+    unresolved_labels = [k for k, v in lc.items()
+                         if any(n.startswith("5·") and n.endswith("unresolved")
+                                for n, _ in w.labels_for(
+                             v, {"hide": set(), "colors": dict(w.DEFAULT_COLORS),
+                                 "label_maxlen": 24, "denylist": [],
+                                 "redact_placeholder": "(redacted)"}))]
+    heal = (w._prov_better({"route": "subrouter", "launcher": "cmux"},
+                           {"route": "codex-cli", "launcher": "codex-cli"}, {"hide": set()})
+            and not w._prov_better({"route": "codex-cli", "launcher": "codex-cli"},
+                                   {"route": "subrouter", "launcher": "cmux"}, {"hide": set()}))
+    hook_text = w._hook_file_text()[0]
+    no_export = "WHENCE_ROUTE=" not in hook_text and "WHENCE_LAUNCHER=" not in hook_text
+    if got != want or not recovered or unresolved_labels or not heal or not no_export:
+        failed += 1
+        print(f"FAIL  launch derivation: got={got} recovered={recovered} m5={ {k: m5[k] for k in ('agent','terminal','terminal_address','tab','origin_state','workspace')} } "
+              f"unresolved={unresolved_labels} heal={heal} no_export={no_export}")
+    else:
+        print("ok    launch derivation: subrouter codex (scrubbed env) and sr claude route "
+              "subrouter, nearest ancestor restores the cmux surface, explicit wins, "
+              "fallbacks are named, and no label reads unresolved")
+
+    # The two process readers against real processes, not mocks.
+    # macOS hides the environment of platform (SIP) binaries such as /bin/zsh or
+    # /usr/bin/python3 from `ps eww`; user-installed ones (subrouter, codex, a
+    # framework Python) are readable. PATH= in the output is the control that
+    # this interpreter is readable at all.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             env={**os.environ, "CMUX_SURFACE_ID": SURF,
+                                  "CMUX_WORKSPACE_ID": "not-a-uuid"})
+    try:
+        time.sleep(0.3)
+        readable = (pathlib.Path(f"/proc/{child.pid}/environ").exists()
+                    or "PATH=" in w.sh("ps", "eww", "-o", "command=", "-p",
+                                       str(child.pid)).stdout)
+        read = w._process_env(child.pid, ["CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"])
+    finally:
+        child.kill(); child.wait()
+    chain = w._process_ancestry()
+    if not readable:
+        print(f"SKIP  process env reader: {sys.executable} is a platform binary whose "
+              "environment ps does not show")
+        read = {"CMUX_SURFACE_ID": SURF}
+    if read != {"CMUX_SURFACE_ID": SURF} or not chain or chain[0][0] != os.getppid():
+        failed += 1
+        print(f"FAIL  process readers: env={read} chain_head={chain[:1]} ppid={os.getppid()}")
+    else:
+        print("ok    process readers: another process's env is read shape-checked; "
+              "the ancestry starts at our parent")
 
     # ── Launchers hide the PR command from a function wrapper ──
     # `timeout 900 shipyard pr` (how agents, subagents especially, bound a long
