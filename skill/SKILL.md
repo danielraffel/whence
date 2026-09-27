@@ -66,8 +66,10 @@ For Shipyard, pass the same durable identity with
 `shipyard pr --workstream-id <id>`. Whence snapshots that literal flag before a
 detached worker can outlive the shell. Stable launcher/route defaults and exact
 repository overrides may live under `provenance` in the fleet-synced Whence
-config; explicit launcher environment always wins. Missing or malformed values
-remain unresolved rather than being inferred.
+config; explicit launcher environment always wins. Otherwise whence derives
+them from the process ancestry (a subrouter ancestor means route `subrouter`,
+cmux's launch argv means launcher `cmux`) and falls back to a named value such
+as `codex-cli` or `shell`. Malformed explicit values remain unresolved.
 
 ## Notes
 

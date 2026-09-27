@@ -557,8 +557,20 @@ URLs, paths, email/account names, query strings, and credentials fail closed.
 Explicit resume/relaunch commands accept only short argv-shaped commands; shell
 syntax, paths, endpoints, assignments, and credential-like flags fail closed.
 `WHENCE_ORIGIN_KIND=automation`, `external`, or `unresolved` gives non-agent PRs
-an explicit provenance label instead of leaving them blank. Missing launcher or
-route data is recorded as `unresolved`; Whence does not guess an account.
+an explicit provenance label instead of leaving them blank.
+
+When no launcher states them, whence derives launcher and route from how the
+session was actually started, in every path (shell wrapper, agent hook, sweep
+capture alike): a `subrouter` process among its ancestors (`sr` resolves to it),
+Codex's `model_provider="subrouter"` argv, or `SUBROUTER_CODEX_LAUNCHER` means
+route `subrouter`; cmux's recorded launch argv means launcher `cmux`. A launcher
+that scrubs the environment (`subrouter codex` drops every `CMUX_*` variable) no
+longer loses the tab: the cmux surface, workspace and launch argv are read from
+the nearest ancestor process that holds them, all from that one process. With
+no evidence the value names only what is known -- `codex-cli` (the agent CLI's
+own configured route) or `shell` -- never a guessed `direct`, and such a fallback
+is replaced when a later capture proves more. A malformed explicit value still
+records `unresolved`; whence does not guess an account.
 
 **Colors:** any GitHub label hex, per category. **Machine label:**
 `WHENCE_HOST_LABEL` env beats the `host-label` file. **`gh` binary:** set
