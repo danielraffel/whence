@@ -156,12 +156,14 @@ def self_heal_checks() -> int:
                                        "hooks": {"Stop": [{"hooks": []}]}}))
         f = d / "settings.json"
         f.chmod(0o600)
+        ino0 = f.stat().st_ino
         r1, n1 = run(claude(d))
         doc = json.loads(f.read_text())
-        check("unwired dir is wired once, keys and mode kept",
+        check("unwired dir is wired once by atomic rename, keys and mode kept",
               r1[0]["action"] == "installed" and wired(f) and doc["model"] == "x"
               and doc["permissions"] == {"allow": ["Bash(ls)"]} and "Stop" in doc["hooks"]
-              and (f.stat().st_mode & 0o777) == 0o600 and n1.count("\n") == 1
+              and (f.stat().st_mode & 0o777) == 0o600 and f.stat().st_ino != ino0
+              and n1.count("\n") == 1
               and "wired the claude PR hook" in n1
               and not list(d.glob(".settings.json.whence-*")), f"{r1} {n1!r}")
         sig = w._file_sig(f)

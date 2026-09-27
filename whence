@@ -1493,9 +1493,6 @@ def install_agent_hook(scope: str) -> int:
             refused.append(f"{agent} ({settings}): {getattr(e, 'kind', e)}")
             continue
         did.append(f"{agent} ({settings}, {where})")
-        # An explicit install is the user's own word: it lifts any opt-out the
-        # self-heal inferred for this file (see self_heal_agent_hooks).
-        _self_heal_forget(agent, settings)
     print(f"whence: wrote {PR_HOOK}")
     for d in did:
         print(f"  wired {d}")
@@ -1554,13 +1551,6 @@ def _self_heal_save(state: dict) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
-
-
-def _self_heal_forget(agent: str, settings) -> None:
-    with contextlib.suppress(Exception):
-        state = _self_heal_load()
-        if state.pop(_self_heal_key(agent, settings), None) is not None:
-            _self_heal_save(state)
 
 
 def _self_heal_notice(msg: str) -> None:
