@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, contextlib, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, base64, contextlib, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -191,6 +191,7 @@ def sh(*a, **k):
     # Bounded + graceful: a missing binary (e.g. no cmux) or a slow network call
     # degrades to an empty result instead of crashing or hanging the caller.
     timeout = float(k.pop("timeout", PROCESS_TIMEOUT))
+    stdin_text = k.pop("input", None)
     if _PROCESS_DEADLINE is not None:
         remaining = _PROCESS_DEADLINE - time.monotonic()
         if remaining <= PROCESS_TERM_GRACE * 2:
@@ -199,11 +200,12 @@ def sh(*a, **k):
     try:
         proc = subprocess.Popen(
             a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             start_new_session=True, **k)
     except (FileNotFoundError, OSError) as e:
         return subprocess.CompletedProcess(a, 1, "", str(e))
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
         return subprocess.CompletedProcess(a, proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         stdout, stderr = _stop_process_group(proc, PROCESS_TERM_GRACE)
@@ -762,6 +764,138 @@ def _context_value(env_name: str, configured: str, default: str = "") -> str:
     return stable_identifier(configured, default)
 
 
+# Environment a launcher may strip. `subrouter codex` starts Codex with a
+# scrubbed environment: no CMUX_SURFACE_ID, CMUX_WORKSPACE_ID or
+# CMUX_AGENT_LAUNCH_ARGV_B64 reach the agent or anything it runs, although
+# the cmux shell that ran `subrouter` still holds them. These are recovered
+# from the nearest ancestor process that has them, and only when absent here.
+_ANCESTOR_ENV = {
+    "CMUX_SURFACE_ID": r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+    "CMUX_WORKSPACE_ID": r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+    "CMUX_AGENT_LAUNCH_ARGV_B64": r"[A-Za-z0-9+/=]{4,}",
+}
+# Process-argv markers that a model request is routed through subrouter:
+# Codex as `-c model_provider="subrouter"`, Claude as the subrouter settings
+# file it is given.
+_SUBROUTER_ARGV_MARKERS = ('model_provider="subrouter"', "model_provider=subrouter",
+                           "subrouter-claude-settings")
+
+
+def _process_ancestry(limit: int = 32) -> list[tuple[int, str]]:
+    """(pid, argv) of every ancestor of this process, nearest first.
+
+    One `ps` call for the whole table; empty when ps is unavailable. The chain
+    is causal: each process was started, directly or through the ones between,
+    by the next one up, so it answers "what launched this agent" by fact."""
+    res = sh("ps", "-axo", "pid=,ppid=,args=", timeout=5)
+    table = {}
+    for line in (res.stdout or "").splitlines() if res.returncode == 0 else []:
+        parts = line.strip().split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+    chain, pid = [], os.getppid()
+    while pid > 1 and pid in table and len(chain) < limit:
+        ppid, args = table[pid]
+        chain.append((pid, args))
+        if ppid == pid:
+            break
+        pid = ppid
+    return chain
+
+
+def _process_env(pid: int, names) -> dict[str, str]:
+    """Selected, shape-checked variables from another process's environment."""
+    text = ""
+    proc = pathlib.Path(f"/proc/{pid}/environ")
+    if proc.exists():
+        try:
+            text = " ".join(proc.read_bytes().decode("utf-8", "replace").split("\0"))
+        except OSError:
+            text = ""
+    else:
+        res = sh("ps", "eww", "-o", "command=", "-p", str(pid), timeout=5)
+        text = res.stdout if res.returncode == 0 else ""
+    out = {}
+    for name in names:
+        m = re.search(rf"(?:^|\s){name}=({_ANCESTOR_ENV[name]})(?=\s|$)", text)
+        if m:
+            out[name] = m.group(1)
+    return out
+
+
+def _launch_env(ancestry: list[tuple[int, str]]) -> dict[str, str]:
+    """This process's environment plus cmux variables a launcher stripped."""
+    env = dict(os.environ)
+    missing = [n for n in _ANCESTOR_ENV if not env.get(n)]
+    if not missing or env.get("WHENCE_TERMINAL_RUNTIME"):
+        return env
+    for pid, _ in ancestry:
+        found = _process_env(pid, missing)
+        if found.get("CMUX_SURFACE_ID") or found.get("CMUX_AGENT_LAUNCH_ARGV_B64"):
+            # One ancestor supplies them all, so a surface and a workspace
+            # can never be stitched together from two different terminals.
+            env.update(found)
+            break
+    return env
+
+
+def _argv0_name(args: str) -> str:
+    try:
+        first = shlex.split(args)[0] if args else ""
+    except ValueError:
+        first = args.split()[0] if args.split() else ""
+    name = os.path.basename(first)
+    resolved = shutil.which(first) if first and "/" not in first else first
+    if resolved:
+        real = os.path.basename(os.path.realpath(resolved))
+        if real and real != name:
+            return real
+    return name
+
+
+def is_fallback_context(value: str) -> bool:
+    """Whether a launcher/route value is absent or only a derive_launch fallback."""
+    value = value or ""
+    return value in ("", "unknown", "unresolved", "shell") or value.endswith("-cli")
+
+
+def derive_launch(env: dict[str, str], agent: str, origin_kind: str = "",
+                  ancestry: list[tuple[int, str]] | None = None) -> dict[str, str]:
+    """Launcher and route from how this session was actually started.
+
+    Evidence, strongest first: a subrouter process among our ancestors (or its
+    marker in an ancestor's or cmux's recorded launch argv, or the variable
+    `subrouter codex` sets) means the model route is subrouter; cmux's
+    recorded launch argv means cmux started the agent. When nothing proves a
+    route, the value names what IS known (`codex-cli`: the agent CLI's own
+    configured route; `shell`: a command no agent owns) rather than a bare
+    `unresolved` — never a guessed `direct`."""
+    argv = ""
+    if env.get("CMUX_AGENT_LAUNCH_ARGV_B64"):
+        try:
+            argv = base64.b64decode(env["CMUX_AGENT_LAUNCH_ARGV_B64"]).decode(
+                "utf-8", "replace").replace("\0", " ")
+        except (ValueError, TypeError):
+            argv = ""
+    ancestry = ancestry or []
+    names = [_argv0_name(args) for _, args in ancestry]
+    subrouter = ("subrouter" in names
+                 or bool(env.get("SUBROUTER_CODEX_LAUNCHER"))
+                 or any(m in text for m in _SUBROUTER_ARGV_MARKERS
+                        for text in [argv, *(args for _, args in ancestry)]))
+    known_agent = agent not in ("", "unknown", "unresolved", "automation", "external")
+    fallback = (origin_kind if origin_kind in ("automation", "external")
+                else f"{agent}-cli" if known_agent else "shell")
+    if argv:
+        launcher = "cmux"
+    elif "subrouter" in names or env.get("SUBROUTER_CODEX_LAUNCHER"):
+        launcher = "subrouter"
+    else:
+        launcher = fallback
+    route = "subrouter" if subrouter else "direct" if argv else fallback
+    return {"launcher": launcher, "route": route}
+
+
 def collect(cfg: dict | None = None, repo: str = "") -> dict:
     explicit_agent = stable_identifier(os.environ.get("WHENCE_AGENT", ""))
     agent = explicit_agent or os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
@@ -772,12 +906,14 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
     if origin_kind in ("automation", "external", "unresolved"):
         agent = origin_kind
     agent = stable_identifier(agent, "unresolved")
-    surface = os.environ.get("CMUX_SURFACE_ID", "")
+    ancestry = _process_ancestry()
+    env = _launch_env(ancestry)
+    surface = env.get("CMUX_SURFACE_ID", "")
     p = {f: "" for f in FIELDS}
     p["_redacted"] = []
     p["agent"] = agent
     p["host"] = host_label()
-    p["workspace"] = cmux_workspace(os.environ.get("CMUX_WORKSPACE_ID", ""), surface)
+    p["workspace"] = cmux_workspace(env.get("CMUX_WORKSPACE_ID", ""), surface)
     tab, ref = cmux_tab_title(surface)
     if tab:
         p["tab"] = f"{tab} ({ref})" if ref else tab
@@ -802,10 +938,11 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
     p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
     context = configured_provenance(cfg or {}, repo)
+    derived = derive_launch(env, agent, origin_kind, ancestry)
     p["workstream"] = _context_value(
         "WHENCE_WORKSTREAM_ID", context.get("workstream", ""))
     p["launcher"] = _context_value(
-        "WHENCE_LAUNCHER", context.get("launcher", ""), "unresolved")
+        "WHENCE_LAUNCHER", context.get("launcher") or derived["launcher"], "unresolved")
     p["terminal"] = (terminal_runtime(os.environ.get("WHENCE_TERMINAL_RUNTIME", ""))
                      if "WHENCE_TERMINAL_RUNTIME" in os.environ
                      else "cmux" if surface else "")
@@ -815,7 +952,7 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         os.environ.get("WHENCE_TERMINAL_INSTANCE", ""))
         if "WHENCE_TERMINAL_INSTANCE" in os.environ else "")
     p["route"] = _context_value(
-        "WHENCE_ROUTE", context.get("route", ""), "unresolved")
+        "WHENCE_ROUTE", context.get("route") or derived["route"], "unresolved")
     p["router"] = _context_value("WHENCE_ROUTER", context.get("router", ""))
 
     restore = ""
@@ -1037,32 +1174,11 @@ def _hook_file_text() -> tuple[str, list]:
         "# executable is resolved lazily behind its same-named function (no recursion).",
         "# NB: `command whence` — plain `whence` is a zsh BUILTIN (like `which`), so",
         "# `command` is required to reach this script rather than the builtin.",
-        '# Launcher and route provenance are DERIVED from the launch, never guessed.',
-        '# cmux records the exact agent launch argv in CMUX_AGENT_LAUNCH_ARGV_B64, so its',
-        '# presence proves cmux started this agent, and a subrouter-routed session carries',
-        '# the subrouter marker inside it: claude as',
-        '# `--settings .../subrouter-claude-settings-*/settings.json`, codex as',
-        '# `-c model_provider="subrouter"`. Both forms point at the same local subrouter',
-        '# proxy, so that one variable answers "how was this launched and routed" and the',
-        "# PR chip stops reading `unresolved`. Precedence matches whence's own resolution",
-        '# order, so an explicit value from a launcher always wins. A session cmux did not',
-        '# start (ssh, cron, a bare shell) exports nothing and stays honestly unresolved',
-        '# rather than being stamped with a fleet default that may be false -- a wrong',
-        '# route published on every PR is worse than an absent one. Exporting once per',
-        '# session is self-caching: child shells inherit it and never re-decode.',
-        'if [ -n "${CMUX_AGENT_LAUNCH_ARGV_B64:-}" ]; then',
-        '  __whence_argv="$(printf %s "${CMUX_AGENT_LAUNCH_ARGV_B64}" | base64 -d 2>/dev/null | tr \'\\0\' \' \')"',
-        '  case "$__whence_argv" in',
-        '    ?*) [ -n "${WHENCE_LAUNCHER+x}" ] || { WHENCE_LAUNCHER=cmux; export WHENCE_LAUNCHER; } ;;',
-        '  esac',
-        '  if [ -z "${WHENCE_ROUTE+x}" ]; then',
-        '    case "$__whence_argv" in',
-        '      *subrouter*) WHENCE_ROUTE=subrouter; export WHENCE_ROUTE ;;',
-        '      ?*)          WHENCE_ROUTE=direct;    export WHENCE_ROUTE ;;',
-        '    esac',
-        '  fi',
-        '  unset __whence_argv',
-        'fi',
+        '# Launcher and route are derived inside whence itself (derive_launch), from the',
+        "# process ancestry and cmux's recorded launch argv, so every path -- this shell",
+        '# wrapper, an agent PostToolUse hook, a Codex hook under a launcher that scrubs',
+        '# the environment -- resolves them the same way. Nothing is exported here: an',
+        '# exported value would count as an explicit launcher claim and override that.',
         "__whence_real() { if [ -n \"${ZSH_VERSION:-}\" ]; then whence -p \"$1\"; "
         "else type -P \"$1\"; fi 2>/dev/null; }",
         "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
@@ -1646,6 +1762,16 @@ LEDGER = CFG_DIR / "branch-ledger.json"
 DEFAULT_BRANCHES = {"main", "master", "trunk", "develop"}
 SWEEP_MAX_ITEMS = 20
 SWEEP_MAX_SECONDS = 60.0
+# A captured commit can be rewritten before its PR opens: `shipyard pr` amends
+# the captured HEAD to add a `Skill-Update:`/`Version-Bump:` trailer, and an
+# agent may amend or rebase onto a newer base. Such a PR is still matched to
+# the capture (see _extended_capture_matches), but only when it was opened
+# within this window after a recorded head was first captured.
+CAPTURE_MATCH_WINDOW = 24 * 3600
+# Recent heads remembered per branch record, oldest dropped first.
+LEDGER_HEADS_MAX = 8
+# Upper bound on PR commits walked when proving a patch-id match.
+PATCH_ID_MAX_COMMITS = 256
 
 
 def _git(cwd, *a):
@@ -2083,19 +2209,34 @@ def _recent_prs(raw: str, rec: dict) -> list[dict]:
               and pr.get("headRefOid") == captured_head]
     if recent:
         return recent
-    return [pr for pr in prs if _created_since(pr, not_before)
-            and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+    recent = [pr for pr in prs if _created_since(pr, not_before)
+              and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+    return recent or _extended_capture_matches(prs, rec)
+
+
+def _created_at(pr: dict) -> int | None:
+    try:
+        return int(datetime.datetime.fromisoformat(
+            pr.get("createdAt", "").replace("Z", "+00:00")
+        ).timestamp())
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _created_since(pr: dict, not_before: int) -> bool:
     """Whether a PR was opened by this capture (five seconds of clock skew)."""
-    try:
-        created = int(datetime.datetime.fromisoformat(
-            pr.get("createdAt", "").replace("Z", "+00:00")
-        ).timestamp())
-    except (AttributeError, TypeError, ValueError):
+    created = _created_at(pr)
+    return created is not None and created >= not_before - 5
+
+
+def _is_ancestor(git_dir: str, ancestor: str, head: str) -> bool:
+    if not ancestor or not head or not git_dir or not os.path.isdir(git_dir):
         return False
-    return created >= not_before - 5
+    if ancestor == head:
+        return True
+    res = sh("git", "--git-dir", git_dir, "merge-base", "--is-ancestor",
+             ancestor, head, timeout=5)
+    return res.returncode == 0
 
 
 def _descends_from_capture(rec: dict, pr_head: str) -> bool:
@@ -2110,14 +2251,113 @@ def _descends_from_capture(rec: dict, pr_head: str) -> bool:
     while admitting commits the orchestrator appended. The check is local
     (the repository the capture ran in, via its common git dir, which survives
     removal of a linked worktree), so it needs no GitHub call and no network."""
-    captured, git_dir = rec.get("head", ""), rec.get("git_dir", "")
+    return _is_ancestor(rec.get("git_dir", ""), rec.get("head", ""), pr_head)
+
+
+def _record_heads(rec: dict) -> list[dict]:
+    """Every head this record's claimant captured, each with its first capture time.
+
+    Records written before head history existed carry only ``head``/``ts``."""
+    heads = [h for h in rec.get("heads") or []
+             if isinstance(h, dict) and h.get("head")]
+    if not heads and rec.get("head"):
+        heads = [{"head": rec["head"], "ts": int(rec.get("ts", 0))}]
+    return heads
+
+
+def _record_claimants(rec: dict) -> list[str]:
+    """Distinct native sessions that have captured this branch."""
+    claimants = [c for c in rec.get("claimants") or [] if c]
+    if not claimants and (rec.get("p") or {}).get("session"):
+        claimants = [rec["p"]["session"]]
+    return claimants
+
+
+_GIT_LOG_PATCH = ("log", "-p", "--no-color", "--no-ext-diff", "--no-textconv",
+                  "--no-merges", "--format=commit %H")
+
+
+def _patch_ids(git_dir: str, *rev_args: str) -> dict[str, str]:
+    """Map commit -> stable patch-id for the non-merge commits ``rev_args`` names."""
+    log = sh("git", "--git-dir", git_dir, *_GIT_LOG_PATCH, *rev_args, timeout=10)
+    if log.returncode != 0 or not log.stdout.strip():
+        return {}
+    ids = sh("git", "--git-dir", git_dir, "patch-id", "--stable",
+             input=log.stdout, timeout=10)
+    out = {}
+    for line in ids.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def _author(git_dir: str, commit: str) -> str:
+    res = sh("git", "--git-dir", git_dir, "log", "-1", "--format=%an%x00%ae%x00%at",
+             commit, timeout=5)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _rewritten_into(git_dir: str, captured: str, pr_head: str) -> bool:
+    """Whether the PR carries the captured commit rewritten (amended or rebased).
+
+    ``shipyard pr`` amends the captured HEAD to add a skip trailer before its
+    version-bump commit (danielraffel/Shipyard#621); an agent may amend or rebase
+    onto a newer base. The captured commit is then no longer an ancestor of the
+    PR head, but its change survives: a PR commit with the same
+    ``git patch-id --stable`` (same diff, message ignored) and the same author
+    name, email and author date — which amend and rebase both preserve. Only
+    commits the PR adds are compared: from the merge base with the capture,
+    excluding every remote default branch this repository knows about, so a
+    commit that reached main through other work is not mistaken for this one.
+    Local only; a PR head this repository has never seen does not match."""
     if not captured or not pr_head or not git_dir or not os.path.isdir(git_dir):
         return False
-    if captured == pr_head:
-        return True
-    res = sh("git", "--git-dir", git_dir, "merge-base", "--is-ancestor",
-             captured, pr_head, timeout=5)
-    return res.returncode == 0
+    base = sh("git", "--git-dir", git_dir, "merge-base", captured, pr_head, timeout=5)
+    mb = base.stdout.strip()
+    if base.returncode != 0 or not mb:
+        return False
+    target = _patch_ids(git_dir, "-1", captured).get(captured, "")
+    author = _author(git_dir, captured)
+    if not target or not author:
+        return False
+    refs = sh("git", "--git-dir", git_dir, "for-each-ref", "--format=%(refname)",
+              *[f"refs/remotes/*/{b}" for b in sorted(DEFAULT_BRANCHES)], timeout=5)
+    exclude = [f"^{r}" for r in refs.stdout.split() if r]
+    candidates = _patch_ids(git_dir, f"--max-count={PATCH_ID_MAX_COMMITS}",
+                            pr_head, f"^{mb}", *exclude)
+    return any(pid == target and _author(git_dir, commit) == author
+               for commit, pid in candidates.items())
+
+
+def _extended_capture_matches(prs: list[dict], rec: dict) -> list[dict]:
+    """PRs carrying this capture's work after its commits were rewritten.
+
+    Consulted only when neither the exact head nor a descendant of the current
+    head matched, so an exact match always wins. A PR matches when, for some
+    head this record's claimant captured, the PR was opened no earlier than that
+    head's first capture and within CAPTURE_MATCH_WINDOW of it, and its head
+    descends from that head or carries it amended/rebased (_rewritten_into).
+    A branch captured by two different native sessions is ambiguous: this rule
+    refuses it outright rather than guess which session opened the PR."""
+    if len(_record_claimants(rec)) > 1:
+        return []
+    git_dir = rec.get("git_dir", "")
+    matched = []
+    for pr in prs:
+        created = _created_at(pr)
+        pr_head = pr.get("headRefOid", "")
+        if created is None or not pr_head:
+            continue
+        for h in reversed(_record_heads(rec)):
+            first = int(h.get("ts", 0))
+            if not (first - 5 <= created <= first + CAPTURE_MATCH_WINDOW):
+                continue
+            if (_is_ancestor(git_dir, h["head"], pr_head)
+                    or _rewritten_into(git_dir, h["head"], pr_head)):
+                matched.append(pr)
+                break
+    return matched
 
 
 def _locked_value_known(field: str, value: str) -> bool:
@@ -2181,9 +2421,20 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
         # pre-exec snapshot. An older unlocked push observation must not outrank
         # the actual launcher handoff, so it remains replaceable until pre-exec
         # takes the lock.
-        prior_locked = bool(head and prior.get("head") == head
-                            and prior.get("provenance_locked"))
+        #
+        # What "locked" means: the lock protects the IDENTITY fields (FIELDS:
+        # agent, tab, session, terminal address, ...), never the head. A
+        # locked record accepts a new head — every capture below records the
+        # head it saw and appends it to `heads` — but a later observation from
+        # the same claimant cannot degrade the identity the lock holds. The
+        # lock carries across a head change only for the same native session;
+        # a capture from another (or no) session starts a fresh claim.
         old = prior.get("p", {})
+        new_session = captured.get("session", "")
+        old_session = old.get("session", "")
+        same_claimant = bool(new_session and new_session == old_session)
+        prior_locked = bool(head and prior.get("provenance_locked")
+                            and (prior.get("head") == head or same_claimant))
         replace_locked = bool(prior_locked and lock_provenance
                               and _complete_locked_capture(captured))
         if prior_locked and not replace_locked:
@@ -2216,8 +2467,24 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                 for field in ("workspace", "terminal_instance", "resume", "relaunch"):
                     if not captured.get(field) and old.get(field):
                         captured[field] = old[field]
+        now = _now_epoch()
+        # Head history for the retry/sweep's amend/rebase rule. It continues
+        # only while the claim does: the same native session, or the same head
+        # seen without a conflicting session. Another session's capture of this
+        # branch name starts a fresh history, so its heads can never vouch for
+        # the earlier claimant's PR (or the reverse).
+        conflicting = bool(new_session and old_session and new_session != old_session)
+        continuing = same_claimant or (prior.get("head") == head and not conflicting)
+        heads = _record_heads(prior) if (prior and continuing) else []
+        if head and not any(h["head"] == head for h in heads):
+            heads.append({"head": head, "ts": now})
+        claimants = _record_claimants(prior) if prior else []
+        if new_session and new_session not in claimants:
+            claimants.append(new_session)
         led[key] = {"p": captured,
-                    "ts": _now_epoch(), "head": head,
+                    "ts": now, "head": head,
+                    "heads": heads[-LEDGER_HEADS_MAX:],
+                    "claimants": claimants[-LEDGER_HEADS_MAX:],
                     "provenance_locked": prior_locked or lock_provenance,
                     "revision": int(prior.get("revision", 0)) + 1}
         if git_dir and os.path.isdir(git_dir):
@@ -2259,7 +2526,10 @@ def _prov_better(best: dict, cur: dict, cfg: dict) -> bool:
     best_goals = (set(normalize_goals(best.get("goals", "")).splitlines())
                   if "goals" not in hidden else set())
     cur_goals = set(normalize_goals(cur.get("goals", "")).splitlines())
-    def missing(value): return (value or "") in ("", "unknown", "unresolved")
+    def missing(value):
+        # A named fallback (`codex-cli`, `shell`) says only what is known; a
+        # later capture that proves the real launcher/route should replace it.
+        return is_fallback_context(value)
     explicit = tuple(f for f in ("workstream", "launcher", "route", "router")
                      if f not in hidden)
     state_rank = {"": 0, "unresolved": 0, "unnamed": 1, "lookup_failed": 1,
@@ -2499,6 +2769,10 @@ def _sweep_serialized(cfg: dict, max_items: int,
                 matched = [pr for pr in prs
                            if _created_since(pr, int(rec.get("ts", 0)))
                            and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+            if not matched:
+                # The captured commit was rewritten (amend, rebase) or the PR
+                # descends from an earlier head this claimant captured.
+                matched = _extended_capture_matches(prs, rec)
             for pr in matched:
                 source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
                 try:

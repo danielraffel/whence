@@ -9,6 +9,7 @@ real-world output shapes are pinned here.
 
 Run: python3 test_whence.py
 """
+import datetime
 import importlib.util
 import json
 import os
@@ -795,11 +796,11 @@ def main() -> int:
          mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
         invalid_inherited = w.collect(provenance_cfg, "Generous-Corp/pulp")
     context_ok = (
-        absent["workstream"] == "" and absent["launcher"] == "unresolved"
-        and absent["route"] == "unresolved"
+        absent["workstream"] == "" and absent["launcher"] == "shell"
+        and absent["route"] == "shell"
         and configured["workstream"] == "SY-LF-2026-08-20"
         and configured["launcher"] == "cmux" and configured["route"] == "shipyard-daemon"
-        and malformed["launcher"] == "cmux" and malformed["route"] == "unresolved"
+        and malformed["launcher"] == "cmux" and malformed["route"] == "shell"
         and inherited["workstream"] == "SY-LF-P3"
         and inherited["launcher"] == "cmux-continue-session"
         and inherited["route"] == "subrouter" and inherited["router"] == "m5"
@@ -1767,6 +1768,305 @@ def main() -> int:
     else:
         print("ok    orchestrator bump commit: PR descending from the capture is stamped; "
               "unrelated, older, and non-exact-when-exact-exists are not")
+
+    # ── Regression: the captured commit is rewritten before the PR opens ──
+    # `shipyard pr --skip-skill-update ...` AMENDS the captured HEAD to add a
+    # `Skill-Update:` trailer, then commits `chore: bump versions` and opens the
+    # PR there (danielraffel/Shipyard#621). The captured commit is no longer an
+    # ancestor of the PR head, so the descent rule above cannot match; neither
+    # can it after an agent rebases onto a newer base. Real git, fake GitHub.
+    T0 = 1_790_000_000                       # 2026-09-21T14:13:20Z
+    def iso(epoch):
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc) \
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+    rw_cfg = {"labels": True, "footer": True, "hide": set(),
+              "colors": dict(w.DEFAULT_COLORS), "label_maxlen": 24,
+              "denylist": [], "redact_placeholder": "(redacted)"}
+    def rw_prov(session, tab="T"):
+        p = {f: "" for f in w.FIELDS}
+        p.update({"agent": "claude", "host": "m3", "tab": tab, "origin_state": "known",
+                  "launcher": "cmux", "route": "direct", "session": session})
+        return p
+    real_sh_rw = w.sh
+    def rw_run(ledger, key, prs, runner):
+        stamped = []
+        rec = json.loads(ledger.read_text())[key]
+        def fake_sh(*args, **kwargs):
+            if args and args[0] == "fakegh":
+                return subprocess.CompletedProcess(args, 0, json.dumps(prs), "")
+            return real_sh_rw(*args, **kwargs)
+        saved = ledger.read_text()
+        with mock.patch.object(w, "LEDGER", ledger), \
+             mock.patch.object(w, "_now_epoch", return_value=T0 + 100), \
+             mock.patch.object(w, "github_client_for_repo", return_value="fakegh"), \
+             mock.patch.object(w, "sh", side_effect=fake_sh), \
+             mock.patch.object(w, "_best_provenance", side_effect=lambda r, c, b="": (r["p"], "")), \
+             mock.patch.object(w, "apply_stamp",
+                               side_effect=lambda pr, p, *a, **k: stamped.append(pr)), \
+             mock.patch.object(w.time, "sleep"):
+            if runner == "retry":
+                w.retry_pending_pr(key, rw_cfg, attempts=1, delay=0)
+            else:
+                w.sweep(rw_cfg)
+        ledger.write_text(saved)
+        return stamped
+    def both(ledger, key, prs):
+        return {r: rw_run(ledger, key, prs, r) for r in ("retry", "sweep")}
+    def rw_pr(n, head, created):
+        return {"number": n, "body": "", "headRefOid": head, "createdAt": iso(created)}
+    rw = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = pathlib.Path(tmp) / "repo"
+        repo.mkdir()
+        def git(*a):
+            return subprocess.run(["git", "-C", str(repo), *a], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+        def change(name, text, msg):
+            (repo / name).write_text(text)
+            git("add", name)
+            git("commit", "-q", "-m", msg)
+            return git("rev-parse", "HEAD")
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.com"); git("config", "user.name", "t")
+        git("remote", "add", "origin", "https://github.com/example/repo.git")
+        base = change("base.txt", "base\n", "base")
+        git("update-ref", "refs/remotes/origin/main", base)
+        ledger = pathlib.Path(tmp) / "ledger.json"
+        def capture(branch_key_branch, session, lock=True, now=T0, tab="T"):
+            with mock.patch.object(w, "LEDGER", ledger), \
+                 mock.patch.object(w, "_now_epoch", return_value=now):
+                return w.ledger_record("", rw_prov(session, tab), "", "", "HEAD",
+                                       str(repo), lock_provenance=lock)
+
+        # 1. The #621 shape: capture, amend (trailer only), bump, open.
+        git("checkout", "-q", "-b", "fix/amend", base)
+        captured = change("fix.txt", "fix\n", "fix: the thing")
+        ledger.write_text("{}")
+        k_amend = capture("fix/amend", "s-1")
+        git("commit", "-q", "--amend", "-m", "fix: the thing\n\nSkill-Update: skip skill=ci")
+        amended = git("rev-parse", "HEAD")
+        bumped = change("VERSION", "2\n", "chore: bump versions")
+        rw["amend"] = both(ledger, k_amend, [rw_pr(621, bumped, T0 + 60)])
+        # 1b. The same amended PR opened BEFORE the capture is older work.
+        rw["older"] = both(ledger, k_amend, [rw_pr(620, bumped, T0 - 3600)])
+        # 1c. ... and one opened long after the capture is out of the window.
+        rw["late"] = both(ledger, k_amend,
+                          [rw_pr(622, bumped, T0 + getattr(w, "CAPTURE_MATCH_WINDOW", 86400) + 60)])
+        # 1d. An exact-head PR still wins over the rewritten one.
+        rw["exact"] = both(ledger, k_amend, [rw_pr(901, bumped, T0 + 60),
+                                             rw_pr(902, captured, T0 + 60)])
+        # 1e. Same branch name, different change: patch-ids differ.
+        git("checkout", "-q", "-b", "reuse", base)
+        other = change("fix.txt", "something else\n", "fix: the thing")
+        rw["unrelated"] = both(ledger, k_amend, [rw_pr(700, other, T0 + 60)])
+
+        # 1f. Same diff, different author date (an independent commit of the
+        #     same change), is not this capture's commit.
+        git("checkout", "-q", "-b", "reuse2", base)
+        (repo / "fix.txt").write_text("fix\n"); git("add", "fix.txt")
+        subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "fix: the thing"],
+                       check=True, capture_output=True,
+                       env={**os.environ, "GIT_AUTHOR_DATE": "2001-01-01T00:00:00Z"})
+        same_diff = git("rev-parse", "HEAD")
+        rw["other-author"] = both(ledger, k_amend, [rw_pr(701, same_diff, T0 + 60)])
+        # 1g. The captured change reached main through other work; a later PR
+        #     rebased onto that main carries it only as main history.
+        git("checkout", "-q", "-b", "landed", base)
+        git("cherry-pick", captured)
+        landed_main = git("rev-parse", "HEAD")
+        saved_main = git("rev-parse", "refs/remotes/origin/main")
+        git("update-ref", "refs/remotes/origin/main", landed_main)
+        later = change("later.txt", "later\n", "feat: later work")
+        rw["via-main"] = both(ledger, k_amend, [rw_pr(702, later, T0 + 60)])
+        git("update-ref", "refs/remotes/origin/main", saved_main)
+
+        # 2. Rebase onto a newer main (origin/main moved, and it is excluded).
+        git("checkout", "-q", "main")
+        new_main = change("main2.txt", "main moved\n", "main: unrelated work")
+        git("update-ref", "refs/remotes/origin/main", new_main)
+        git("checkout", "-q", "-b", "fix/rebase", base)
+        change("r.txt", "rebased\n", "fix: rebased work")
+        ledger.write_text("{}")
+        k_rebase = capture("fix/rebase", "s-1")
+        git("rebase", "-q", "main")
+        rebased = change("VERSION", "3\n", "chore: bump versions")
+        rw["rebase"] = both(ledger, k_rebase, [rw_pr(631, rebased, T0 + 60)])
+
+        # 3. Another session captures the SAME head of this branch name: two
+        #    provenances claim it, so the rewritten PR is refused, not guessed.
+        git("checkout", "-q", "-b", "fix/claimed", base)
+        change("c.txt", "claimed\n", "fix: claimed")
+        ledger.write_text("{}")
+        k_claim = capture("fix/claimed", "s-1")
+        capture("fix/claimed", "s-2", now=T0 + 1)
+        claim_rec = json.loads(ledger.read_text())[k_claim]
+        git("commit", "-q", "--amend", "-m", "fix: claimed\n\nSkill-Update: skip")
+        claimed_pr = change("VERSION", "4\n", "chore: bump versions")
+        rw["two-sessions"] = both(ledger, k_claim, [rw_pr(641, claimed_pr, T0 + 60)])
+
+        # 4. A capture with NO session at a different head starts a fresh
+        #    claim: the earlier head it replaced cannot vouch for a PR.
+        git("checkout", "-q", "-b", "fix/replaced", base)
+        change("d.txt", "first\n", "fix: first claim")
+        ledger.write_text("{}")
+        k_repl = capture("fix/replaced", "s-1")
+        git("commit", "-q", "--amend", "-m", "fix: first claim\n\nSkill-Update: skip")
+        replaced_pr = change("VERSION", "5\n", "chore: bump versions")
+        git("checkout", "-q", "-b", "elsewhere", base)
+        change("e.txt", "other work\n", "other work")
+        git("branch", "-f", "fix/replaced", "HEAD")
+        git("checkout", "-q", "fix/replaced")
+        capture("fix/replaced", "", lock=False, now=T0 + 2)
+        rw["replaced"] = both(ledger, k_repl, [rw_pr(651, replaced_pr, T0 + 60)])
+
+        # 5. The same session re-captures at a NEW head: the head moves, the
+        #    lock keeps identity, and a PR built on the EARLIER head still
+        #    matches because it descends from a recorded head.
+        git("checkout", "-q", "-b", "fix/moving", base)
+        first_head = change("m.txt", "one\n", "fix: step one")
+        ledger.write_text("{}")
+        k_move = capture("fix/moving", "s-1", tab="Named tab")
+        second_head = change("m2.txt", "two\n", "fix: step two")
+        capture("fix/moving", "s-1", lock=False, now=T0 + 5, tab="surface:9")
+        move_rec = json.loads(ledger.read_text())[k_move]
+        git("checkout", "-q", "-b", "side", first_head)
+        side_pr = change("VERSION", "6\n", "chore: bump versions")
+        rw["earlier-head"] = both(ledger, k_move, [rw_pr(661, side_pr, T0 + 60)])
+
+    want = {
+        "amend": ["621"], "older": [], "late": [], "exact": ["902"], "unrelated": [],
+        "other-author": [], "via-main": [],
+        "rebase": ["631"], "two-sessions": [], "replaced": [], "earlier-head": ["661"],
+    }
+    rw_bad = {case: got for case, got in rw.items()
+              if got != {"retry": want[case], "sweep": want[case]}}
+    move_ok = (move_rec.get("head") == second_head
+               and [h["head"] for h in move_rec.get("heads", [])] == [first_head, second_head]
+               and move_rec.get("provenance_locked") is True
+               and move_rec["p"].get("tab") == "Named tab")
+    claim_ok = claim_rec.get("claimants") == ["s-1", "s-2"]
+    if rw_bad or not move_ok or not claim_ok or amended == captured:
+        failed += 1
+        print(f"FAIL  rewritten capture: bad={rw_bad} move_rec={move_rec if not move_ok else 'ok'} "
+              f"claimants={claim_rec.get('claimants')}")
+    else:
+        print("ok    rewritten capture: amend and rebase stamp via patch-id; a new head "
+              "keeps the lock and its history; two sessions, a replaced claim, an older "
+              "or late PR, and a different change do not; exact still wins")
+
+    # ── Launcher/route resolution: no `5·unresolved` from a real session ──
+    # `subrouter codex` scrubs CMUX_* from Codex's environment, so on m5 every
+    # Codex PR stamped launcher/route `unresolved` and no tab. And the route was
+    # derived only by hook.sh, so the Python agent-hook path stamped
+    # `unresolved` over a correct `5·direct` (danielraffel/tartci#260) -- and
+    # `direct` itself was false for `sr claude`, whose cmux launch argv carries
+    # no subrouter marker. Derivation now lives in collect(), from the process
+    # ancestry, and recovers the stripped cmux variables from an ancestor.
+    SURF = "BF748855-B51E-4E48-9F43-EED652E88D07"
+    WS = "16963A89-DE79-43ED-A22F-4885AB7E999A"
+    OTHER = "AAAAAAAA-B51E-4E48-9F43-EED652E88D07"
+    subrouter_codex = [
+        (900, "/bin/zsh -lc gh pr create --fill"),
+        (901, '/Users/u/.local/bin/codex -c model_provider="subrouter" -c x=1'),
+        (902, "/Users/u/bin/subrouter codex -c model_providers.subrouter.supports_websockets=false"),
+        (903, "-/bin/zsh"), (904, "/usr/bin/login -flp u /bin/zsh"),
+        (905, "/Applications/cmux.app/Contents/MacOS/cmux"),
+    ]
+    ancestor_env = {903: {"CMUX_SURFACE_ID": SURF, "CMUX_WORKSPACE_ID": WS},
+                    902: {"CMUX_SURFACE_ID": SURF, "CMUX_WORKSPACE_ID": WS},
+                    904: {"CMUX_SURFACE_ID": OTHER, "CMUX_WORKSPACE_ID": OTHER}}
+    tab_calls = []
+    def launch_collect(env, ancestry, envs=None):
+        tab_calls.clear()
+        def fake_env(pid, names):
+            return {k: v for k, v in (envs or {}).get(pid, {}).items() if k in names}
+        with mock.patch.dict(_os.environ, env, clear=True), \
+             mock.patch.object(w, "_process_ancestry", return_value=ancestry), \
+             mock.patch.object(w, "_process_env", side_effect=fake_env), \
+             mock.patch.object(w, "host_label", return_value="m5"), \
+             mock.patch.object(w, "cmux_workspace", side_effect=lambda ws, s="": ws[:4]), \
+             mock.patch.object(w, "cmux_tab_title",
+                               side_effect=lambda s: (tab_calls.append(s) or ("Fix queue", "") if s else ("", ""))), \
+             mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+            return w.collect({"denylist": [], "hide": set()}, "Generous-Corp/pulp")
+    codex_env = {"CODEX_SESSION_ID": "019a-codex", "SUBROUTER_CODEX_LAUNCHER": "subrouter",
+                 "__CFBundleIdentifier": "com.cmuxterm.app"}
+    lc = {}
+    lc["m5-codex"] = launch_collect(codex_env, subrouter_codex, ancestor_env)
+    with tempfile.TemporaryDirectory() as tmp:
+        bindir = pathlib.Path(tmp)
+        real = bindir / "subrouter"; real.write_text("#!/bin/sh\n"); real.chmod(0o755)
+        (bindir / "sr").symlink_to(real)
+        argv_b64 = __import__("base64").b64encode(b"/Users/u/.local/bin/claude\0").decode()
+        claude_env = {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "cl-1",
+                      "CMUX_SURFACE_ID": SURF, "CMUX_AGENT_LAUNCH_ARGV_B64": argv_b64,
+                      "PATH": str(bindir)}
+        sr_chain = [(800, "/bin/zsh -c git push"),
+                    (801, "/Users/u/.local/bin/claude --session-id cl-1 --settings /tmp/cmux-claude-settings.x"),
+                    (802, "sr claude"), (803, "-/bin/zsh")]
+        lc["m3-sr-claude"] = launch_collect(claude_env, sr_chain)
+        lc["cmux-direct"] = launch_collect(claude_env, sr_chain[:2] + [(803, "-/bin/zsh")])
+        lc["explicit"] = launch_collect({**claude_env, "WHENCE_ROUTE": "shipyard-daemon",
+                                         "WHENCE_LAUNCHER": "herdr"}, sr_chain)
+    lc["bare-codex"] = launch_collect({"CODEX_SESSION_ID": "c2"},
+                                      [(700, "/bin/zsh -lc x"), (701, "/usr/local/bin/codex")])
+    lc["no-agent"] = launch_collect({}, [(600, "/bin/bash")])
+    got = {k: (v["launcher"], v["route"]) for k, v in lc.items()}
+    want = {"m5-codex": ("subrouter", "subrouter"), "m3-sr-claude": ("cmux", "subrouter"),
+            "cmux-direct": ("cmux", "direct"), "explicit": ("herdr", "shipyard-daemon"),
+            "bare-codex": ("codex-cli", "codex-cli"), "no-agent": ("shell", "shell")}
+    m5 = lc["m5-codex"]
+    recovered = (m5["agent"] == "codex" and m5["terminal"] == "cmux"
+                 and m5["terminal_address"] == SURF and m5["tab"] == "Fix queue"
+                 and m5["origin_state"] == "known" and m5["workspace"] == WS[:4])
+    unresolved_labels = [k for k, v in lc.items()
+                         if any(n.startswith("5·") and n.endswith("unresolved")
+                                for n, _ in w.labels_for(
+                             v, {"hide": set(), "colors": dict(w.DEFAULT_COLORS),
+                                 "label_maxlen": 24, "denylist": [],
+                                 "redact_placeholder": "(redacted)"}))]
+    heal = (w._prov_better({"route": "subrouter", "launcher": "cmux"},
+                           {"route": "codex-cli", "launcher": "codex-cli"}, {"hide": set()})
+            and not w._prov_better({"route": "codex-cli", "launcher": "codex-cli"},
+                                   {"route": "subrouter", "launcher": "cmux"}, {"hide": set()}))
+    hook_text = w._hook_file_text()[0]
+    no_export = "WHENCE_ROUTE=" not in hook_text and "WHENCE_LAUNCHER=" not in hook_text
+    if got != want or not recovered or unresolved_labels or not heal or not no_export:
+        failed += 1
+        print(f"FAIL  launch derivation: got={got} recovered={recovered} m5={ {k: m5[k] for k in ('agent','terminal','terminal_address','tab','origin_state','workspace')} } "
+              f"unresolved={unresolved_labels} heal={heal} no_export={no_export}")
+    else:
+        print("ok    launch derivation: subrouter codex (scrubbed env) and sr claude route "
+              "subrouter, nearest ancestor restores the cmux surface, explicit wins, "
+              "fallbacks are named, and no label reads unresolved")
+
+    # The two process readers against real processes, not mocks.
+    # macOS hides the environment of platform (SIP) binaries such as /bin/zsh or
+    # /usr/bin/python3 from `ps eww`; user-installed ones (subrouter, codex, a
+    # framework Python) are readable. PATH= in the output is the control that
+    # this interpreter is readable at all.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             env={**os.environ, "CMUX_SURFACE_ID": SURF,
+                                  "CMUX_WORKSPACE_ID": "not-a-uuid"})
+    try:
+        time.sleep(0.3)
+        readable = (pathlib.Path(f"/proc/{child.pid}/environ").exists()
+                    or "PATH=" in w.sh("ps", "eww", "-o", "command=", "-p",
+                                       str(child.pid)).stdout)
+        read = w._process_env(child.pid, ["CMUX_SURFACE_ID", "CMUX_WORKSPACE_ID"])
+    finally:
+        child.kill(); child.wait()
+    chain = w._process_ancestry()
+    if not readable:
+        print(f"SKIP  process env reader: {sys.executable} is a platform binary whose "
+              "environment ps does not show")
+        read = {"CMUX_SURFACE_ID": SURF}
+    if read != {"CMUX_SURFACE_ID": SURF} or not chain or chain[0][0] != os.getppid():
+        failed += 1
+        print(f"FAIL  process readers: env={read} chain_head={chain[:1]} ppid={os.getppid()}")
+    else:
+        print("ok    process readers: another process's env is read shape-checked; "
+              "the ancestry starts at our parent")
 
     # ── Launchers hide the PR command from a function wrapper ──
     # `timeout 900 shipyard pr` (how agents, subagents especially, bound a long
