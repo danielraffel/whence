@@ -194,13 +194,17 @@ def self_heal_checks() -> int:
         r_off, _ = run(claude(d3), top=str(repo))
         r_env, _ = run(claude(d3, WHENCE_AUTOINSTALL="0"))
         r_cfg, _ = run(claude(d3), cfg={"agent_hook_autoinstall": False})
+        d3b = proxy("nohooks", json.dumps({"disableAllHooks": True}))
+        sig3b = w._file_sig(d3b / "settings.json")
+        r_dis, _ = run(claude(d3b))
         pr_hook.rename(cfgdir / "pr-hook.off")
         r_noopt, _ = run(claude(d3))
         (cfgdir / "pr-hook.off").rename(pr_hook)
-        check("skipped outside an agent, without opt-in, in a .whence-off repo, when opted out",
+        check("skipped outside an agent, without opt-in, in a .whence-off repo, when opted out or hooks are disabled",
               r_shell == [] and r_off == [] and r_noopt == []
               and r_env[0]["verdict"] == r_cfg[0]["verdict"] == "opted-out"
-              and w._file_sig(f3) == sig3, f"{r_shell} {r_off} {r_env} {r_cfg} {r_noopt}")
+              and r_dis[0]["verdict"] == "opted-out" and w._file_sig(d3b / "settings.json") == sig3b
+              and w._file_sig(f3) == sig3, f"{r_shell} {r_off} {r_env} {r_cfg} {r_noopt} {r_dis}")
 
         # 4. malformed settings: never overwritten, one note, then silent.
         d4 = proxy("broken", '{"model": "x", ')
