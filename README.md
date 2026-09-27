@@ -316,6 +316,18 @@ of your own: none of them can push code without saying where it went.
    head provably *descends* from the captured commit, checked locally against the
    repository the capture ran in. An exact match still wins; a reused branch name
    whose history does not contain the captured commit never matches.
+
+   The captured commit may also be *rewritten* before the PR opens: `shipyard pr
+   --skip-skill-update` amends it to add a trailer, and an agent may amend or
+   rebase onto a newer base. When neither rule above matches, whence accepts a PR
+   opened within 24 hours after a recorded head was first captured when its head
+   descends from that head, or carries it rewritten — a commit the PR adds (not
+   one on a remote default branch) with the same `git patch-id --stable` and the
+   same author name, email and date. A record keeps every head its claimant
+   captured: a re-capture by the same native session moves the head and extends
+   that history, and a provenance lock protects the identity fields, never the
+   head. A capture from another session starts a fresh history, and a branch two
+   sessions have claimed is refused by this rule rather than guessed.
 3. **Sweep.** `whence --sweep` stamps any PR whose head branch is in the ledger
    but isn't stamped yet, using the *ledger's* provenance (the tab that made the
    branch) — never the sweeping machine's. It covers **merged and closed** PRs,

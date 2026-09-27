@@ -191,6 +191,7 @@ def sh(*a, **k):
     # Bounded + graceful: a missing binary (e.g. no cmux) or a slow network call
     # degrades to an empty result instead of crashing or hanging the caller.
     timeout = float(k.pop("timeout", PROCESS_TIMEOUT))
+    stdin_text = k.pop("input", None)
     if _PROCESS_DEADLINE is not None:
         remaining = _PROCESS_DEADLINE - time.monotonic()
         if remaining <= PROCESS_TERM_GRACE * 2:
@@ -199,11 +200,12 @@ def sh(*a, **k):
     try:
         proc = subprocess.Popen(
             a, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             start_new_session=True, **k)
     except (FileNotFoundError, OSError) as e:
         return subprocess.CompletedProcess(a, 1, "", str(e))
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=stdin_text, timeout=timeout)
         return subprocess.CompletedProcess(a, proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
         stdout, stderr = _stop_process_group(proc, PROCESS_TERM_GRACE)
@@ -1646,6 +1648,16 @@ LEDGER = CFG_DIR / "branch-ledger.json"
 DEFAULT_BRANCHES = {"main", "master", "trunk", "develop"}
 SWEEP_MAX_ITEMS = 20
 SWEEP_MAX_SECONDS = 60.0
+# A captured commit can be rewritten before its PR opens: `shipyard pr` amends
+# the captured HEAD to add a `Skill-Update:`/`Version-Bump:` trailer, and an
+# agent may amend or rebase onto a newer base. Such a PR is still matched to
+# the capture (see _extended_capture_matches), but only when it was opened
+# within this window after a recorded head was first captured.
+CAPTURE_MATCH_WINDOW = 24 * 3600
+# Recent heads remembered per branch record, oldest dropped first.
+LEDGER_HEADS_MAX = 8
+# Upper bound on PR commits walked when proving a patch-id match.
+PATCH_ID_MAX_COMMITS = 256
 
 
 def _git(cwd, *a):
@@ -2083,19 +2095,34 @@ def _recent_prs(raw: str, rec: dict) -> list[dict]:
               and pr.get("headRefOid") == captured_head]
     if recent:
         return recent
-    return [pr for pr in prs if _created_since(pr, not_before)
-            and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+    recent = [pr for pr in prs if _created_since(pr, not_before)
+              and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+    return recent or _extended_capture_matches(prs, rec)
+
+
+def _created_at(pr: dict) -> int | None:
+    try:
+        return int(datetime.datetime.fromisoformat(
+            pr.get("createdAt", "").replace("Z", "+00:00")
+        ).timestamp())
+    except (AttributeError, TypeError, ValueError):
+        return None
 
 
 def _created_since(pr: dict, not_before: int) -> bool:
     """Whether a PR was opened by this capture (five seconds of clock skew)."""
-    try:
-        created = int(datetime.datetime.fromisoformat(
-            pr.get("createdAt", "").replace("Z", "+00:00")
-        ).timestamp())
-    except (AttributeError, TypeError, ValueError):
+    created = _created_at(pr)
+    return created is not None and created >= not_before - 5
+
+
+def _is_ancestor(git_dir: str, ancestor: str, head: str) -> bool:
+    if not ancestor or not head or not git_dir or not os.path.isdir(git_dir):
         return False
-    return created >= not_before - 5
+    if ancestor == head:
+        return True
+    res = sh("git", "--git-dir", git_dir, "merge-base", "--is-ancestor",
+             ancestor, head, timeout=5)
+    return res.returncode == 0
 
 
 def _descends_from_capture(rec: dict, pr_head: str) -> bool:
@@ -2110,14 +2137,113 @@ def _descends_from_capture(rec: dict, pr_head: str) -> bool:
     while admitting commits the orchestrator appended. The check is local
     (the repository the capture ran in, via its common git dir, which survives
     removal of a linked worktree), so it needs no GitHub call and no network."""
-    captured, git_dir = rec.get("head", ""), rec.get("git_dir", "")
+    return _is_ancestor(rec.get("git_dir", ""), rec.get("head", ""), pr_head)
+
+
+def _record_heads(rec: dict) -> list[dict]:
+    """Every head this record's claimant captured, each with its first capture time.
+
+    Records written before head history existed carry only ``head``/``ts``."""
+    heads = [h for h in rec.get("heads") or []
+             if isinstance(h, dict) and h.get("head")]
+    if not heads and rec.get("head"):
+        heads = [{"head": rec["head"], "ts": int(rec.get("ts", 0))}]
+    return heads
+
+
+def _record_claimants(rec: dict) -> list[str]:
+    """Distinct native sessions that have captured this branch."""
+    claimants = [c for c in rec.get("claimants") or [] if c]
+    if not claimants and (rec.get("p") or {}).get("session"):
+        claimants = [rec["p"]["session"]]
+    return claimants
+
+
+_GIT_LOG_PATCH = ("log", "-p", "--no-color", "--no-ext-diff", "--no-textconv",
+                  "--no-merges", "--format=commit %H")
+
+
+def _patch_ids(git_dir: str, *rev_args: str) -> dict[str, str]:
+    """Map commit -> stable patch-id for the non-merge commits ``rev_args`` names."""
+    log = sh("git", "--git-dir", git_dir, *_GIT_LOG_PATCH, *rev_args, timeout=10)
+    if log.returncode != 0 or not log.stdout.strip():
+        return {}
+    ids = sh("git", "--git-dir", git_dir, "patch-id", "--stable",
+             input=log.stdout, timeout=10)
+    out = {}
+    for line in ids.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def _author(git_dir: str, commit: str) -> str:
+    res = sh("git", "--git-dir", git_dir, "log", "-1", "--format=%an%x00%ae%x00%at",
+             commit, timeout=5)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _rewritten_into(git_dir: str, captured: str, pr_head: str) -> bool:
+    """Whether the PR carries the captured commit rewritten (amended or rebased).
+
+    ``shipyard pr`` amends the captured HEAD to add a skip trailer before its
+    version-bump commit (danielraffel/Shipyard#621); an agent may amend or rebase
+    onto a newer base. The captured commit is then no longer an ancestor of the
+    PR head, but its change survives: a PR commit with the same
+    ``git patch-id --stable`` (same diff, message ignored) and the same author
+    name, email and author date — which amend and rebase both preserve. Only
+    commits the PR adds are compared: from the merge base with the capture,
+    excluding every remote default branch this repository knows about, so a
+    commit that reached main through other work is not mistaken for this one.
+    Local only; a PR head this repository has never seen does not match."""
     if not captured or not pr_head or not git_dir or not os.path.isdir(git_dir):
         return False
-    if captured == pr_head:
-        return True
-    res = sh("git", "--git-dir", git_dir, "merge-base", "--is-ancestor",
-             captured, pr_head, timeout=5)
-    return res.returncode == 0
+    base = sh("git", "--git-dir", git_dir, "merge-base", captured, pr_head, timeout=5)
+    mb = base.stdout.strip()
+    if base.returncode != 0 or not mb:
+        return False
+    target = _patch_ids(git_dir, "-1", captured).get(captured, "")
+    author = _author(git_dir, captured)
+    if not target or not author:
+        return False
+    refs = sh("git", "--git-dir", git_dir, "for-each-ref", "--format=%(refname)",
+              *[f"refs/remotes/*/{b}" for b in sorted(DEFAULT_BRANCHES)], timeout=5)
+    exclude = [f"^{r}" for r in refs.stdout.split() if r]
+    candidates = _patch_ids(git_dir, f"--max-count={PATCH_ID_MAX_COMMITS}",
+                            pr_head, f"^{mb}", *exclude)
+    return any(pid == target and _author(git_dir, commit) == author
+               for commit, pid in candidates.items())
+
+
+def _extended_capture_matches(prs: list[dict], rec: dict) -> list[dict]:
+    """PRs carrying this capture's work after its commits were rewritten.
+
+    Consulted only when neither the exact head nor a descendant of the current
+    head matched, so an exact match always wins. A PR matches when, for some
+    head this record's claimant captured, the PR was opened no earlier than that
+    head's first capture and within CAPTURE_MATCH_WINDOW of it, and its head
+    descends from that head or carries it amended/rebased (_rewritten_into).
+    A branch captured by two different native sessions is ambiguous: this rule
+    refuses it outright rather than guess which session opened the PR."""
+    if len(_record_claimants(rec)) > 1:
+        return []
+    git_dir = rec.get("git_dir", "")
+    matched = []
+    for pr in prs:
+        created = _created_at(pr)
+        pr_head = pr.get("headRefOid", "")
+        if created is None or not pr_head:
+            continue
+        for h in reversed(_record_heads(rec)):
+            first = int(h.get("ts", 0))
+            if not (first - 5 <= created <= first + CAPTURE_MATCH_WINDOW):
+                continue
+            if (_is_ancestor(git_dir, h["head"], pr_head)
+                    or _rewritten_into(git_dir, h["head"], pr_head)):
+                matched.append(pr)
+                break
+    return matched
 
 
 def _locked_value_known(field: str, value: str) -> bool:
@@ -2181,9 +2307,20 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
         # pre-exec snapshot. An older unlocked push observation must not outrank
         # the actual launcher handoff, so it remains replaceable until pre-exec
         # takes the lock.
-        prior_locked = bool(head and prior.get("head") == head
-                            and prior.get("provenance_locked"))
+        #
+        # What "locked" means: the lock protects the IDENTITY fields (FIELDS:
+        # agent, tab, session, terminal address, ...), never the head. A
+        # locked record accepts a new head — every capture below records the
+        # head it saw and appends it to `heads` — but a later observation from
+        # the same claimant cannot degrade the identity the lock holds. The
+        # lock carries across a head change only for the same native session;
+        # a capture from another (or no) session starts a fresh claim.
         old = prior.get("p", {})
+        new_session = captured.get("session", "")
+        old_session = old.get("session", "")
+        same_claimant = bool(new_session and new_session == old_session)
+        prior_locked = bool(head and prior.get("provenance_locked")
+                            and (prior.get("head") == head or same_claimant))
         replace_locked = bool(prior_locked and lock_provenance
                               and _complete_locked_capture(captured))
         if prior_locked and not replace_locked:
@@ -2216,8 +2353,24 @@ def ledger_record(cmd: str, p: dict, slug: str = "", br: str = "",
                 for field in ("workspace", "terminal_instance", "resume", "relaunch"):
                     if not captured.get(field) and old.get(field):
                         captured[field] = old[field]
+        now = _now_epoch()
+        # Head history for the retry/sweep's amend/rebase rule. It continues
+        # only while the claim does: the same native session, or the same head
+        # seen without a conflicting session. Another session's capture of this
+        # branch name starts a fresh history, so its heads can never vouch for
+        # the earlier claimant's PR (or the reverse).
+        conflicting = bool(new_session and old_session and new_session != old_session)
+        continuing = same_claimant or (prior.get("head") == head and not conflicting)
+        heads = _record_heads(prior) if (prior and continuing) else []
+        if head and not any(h["head"] == head for h in heads):
+            heads.append({"head": head, "ts": now})
+        claimants = _record_claimants(prior) if prior else []
+        if new_session and new_session not in claimants:
+            claimants.append(new_session)
         led[key] = {"p": captured,
-                    "ts": _now_epoch(), "head": head,
+                    "ts": now, "head": head,
+                    "heads": heads[-LEDGER_HEADS_MAX:],
+                    "claimants": claimants[-LEDGER_HEADS_MAX:],
                     "provenance_locked": prior_locked or lock_provenance,
                     "revision": int(prior.get("revision", 0)) + 1}
         if git_dir and os.path.isdir(git_dir):
@@ -2499,6 +2652,10 @@ def _sweep_serialized(cfg: dict, max_items: int,
                 matched = [pr for pr in prs
                            if _created_since(pr, int(rec.get("ts", 0)))
                            and _descends_from_capture(rec, pr.get("headRefOid", ""))]
+            if not matched:
+                # The captured commit was rewritten (amend, rebase) or the PR
+                # descends from an earlier head this claimant captured.
+                matched = _extended_capture_matches(prs, rec)
             for pr in matched:
                 source = "sweep:heal" if is_stamped(pr.get("body", "")) else "sweep:new"
                 try:
