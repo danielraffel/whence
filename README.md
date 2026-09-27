@@ -188,7 +188,7 @@ It writes a small `pr-hook.sh` and registers a `PostToolUse` hook that runs
 `whence --hook` — which reads the tool call and stamps only when the command
 actually opened a PR (`gh`/`ghapp pr create`, `shipyard pr`, `pulp pr`). Both are
 **global, once per machine**: Claude via `~/.claude/settings.json`, Codex via
-`~/.codex/hooks.json` — no per-repo install. Codex gates hooks behind trust, so
+`~/.codex/hooks.json` (or `$CODEX_HOME/hooks.json`) — no per-repo install. Codex gates hooks behind trust, so
 it asks you to trust the whence hook once on its next run. (cmux also wires
 Claude's hooks automatically.) See
 [`examples/claude-code-hook.md`](examples/claude-code-hook.md) for the manual form.
@@ -196,6 +196,41 @@ The parser follows real command wrappers too: `timeout`/`setsid`/`nohup`/`exec`,
 variables such as `$GHAPP`, and nested `bash|zsh|sh -c '…'` payloads. A detached
 `nohup bash -lc 'cd /worktree && shipyard pr'` therefore still records the exact
 worktree before the background command can open its PR.
+
+**Self-heal for sessions with their own config dir.** Once you have run
+`--install-agent-hook` (so `~/.config/whence/pr-hook.sh` exists), whence also
+checks, each time the shell wrapper or the agent hook runs it, whether the agent
+session it is running inside reads a config dir that lacks the hook: Claude's
+`$CLAUDE_CONFIG_DIR` (else `~/.claude`) when `CLAUDECODE=1`, Codex's
+`$CODEX_HOME` (else `~/.codex`) when `CODEX_THREAD_ID` is set. If it does, whence
+adds the same entry `--install-agent-hook` would and prints one line to the
+command's stderr. The rules:
+
+- **Only where you opted in.** No `pr-hook.sh`, no action. A repo with
+  `.whence-off` or outside your `repos` scope is skipped.
+- **Only a recognized dir.** The dir must be yours, not a symlink, under `$HOME`
+  (or matched by `WHENCE_CLAUDE_CONFIG_DIRS`), and already hold that agent's files
+  (`settings.json`/`.claude.json`/`projects`, or Codex's `config.toml`). A
+  symlinked `settings.json` is never replaced.
+- **Never destructive.** The write is atomic (temp file + rename, permissions
+  kept, every other key preserved). A malformed file is left untouched and
+  reported once. If the agent saves the file while whence is writing, whence drops
+  its write and tries again on a later run.
+- **Opt-outs are respected.** `WHENCE_AUTOINSTALL=0` in the environment, or
+  `"agent_hook_autoinstall": false` in the config, turns it off. A file with
+  `"disableAllHooks": true` is left alone. If you remove the hook from a file
+  whence has seen wired, whence treats that as your choice and leaves it out
+  until you run `--install-agent-hook` again.
+- **Cheap.** The verdict is cached in `~/.config/whence/self-heal.json`, keyed on
+  the file's inode, size and mtime. When nothing changed it costs a few `stat`s and
+  one small read: no process, no network, no write. Installs and refusals are logged
+  to `~/.config/whence/self-heal.jsonl`.
+- **Counts on the next session, not this one.** whence does not rely on the running
+  agent reloading its settings (Claude Code may only apply hook changes at its
+  next session start); the current PR is stamped by the wrapper that noticed the
+  gap. Codex asks you to trust the hook once.
+
+`whence --self-heal <dir>` runs the same check and prints what it did as JSON.
 
 **Best-effort, zero per-agent config — the shell hook.**
 

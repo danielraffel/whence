@@ -101,6 +101,309 @@ def cwd_cases(tmp):
     ]
 
 
+def self_heal_checks() -> int:
+    """Each check drives self_heal_agent_hooks against real temp dirs."""
+    import io, threading
+    bad = []
+
+    def check(name, ok, detail=""):
+        if ok:
+            print(f"ok    self-heal: {name}")
+        else:
+            bad.append(name)
+            print(f"FAIL  self-heal: {name} {detail}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(os.path.realpath(tmp))
+        home, cfgdir = root / "home", root / "home" / ".config" / "whence"
+        cfgdir.mkdir(parents=True)
+        (home / ".claude").mkdir()
+        pr_hook = cfgdir / "pr-hook.sh"
+        pr_hook.write_text("#!/bin/sh\n")
+
+        def proxy(name, settings=None, marker=".claude.json"):
+            d = home / ".router" / "claude-proxy" / name
+            d.mkdir(parents=True)
+            (d / marker).write_text("{}")
+            if settings is not None:
+                (d / "settings.json").write_text(settings)
+            return d
+
+        def run(env, cfg=None, top=""):
+            notes = io.StringIO()
+            full = {"HOME": str(home), **env}
+            patches = [mock.patch.object(w, "CFG_DIR", cfgdir),
+                       mock.patch.object(w, "PR_HOOK", pr_hook),
+                       mock.patch.object(w, "SELF_HEAL_STATE", cfgdir / "self-heal.json"),
+                       mock.patch.object(w, "SELF_HEAL_LOG", cfgdir / "self-heal.jsonl"),
+                       mock.patch.dict(os.environ, full, clear=True),
+                       mock.patch("sys.stderr", notes)]
+            for pt in patches: pt.start()
+            try:
+                return w.self_heal_agent_hooks(cfg or {}, top), notes.getvalue()
+            finally:
+                for pt in reversed(patches): pt.stop()
+
+        def claude(d, **extra):
+            return {"CLAUDECODE": "1", "CLAUDE_CONFIG_DIR": str(d), **extra}
+
+        def wired(f):
+            return w._hook_wired(json.loads(f.read_text()))
+
+        # 1. unwired dir: installed once, unknown keys + mode kept; second run is a
+        #    pure cache hit: no write, no process spawn.
+        d = proxy("fresh", json.dumps({"model": "x", "permissions": {"allow": ["Bash(ls)"]},
+                                       "hooks": {"Stop": [{"hooks": []}]}}))
+        f = d / "settings.json"
+        f.chmod(0o600)
+        r1, n1 = run(claude(d))
+        doc = json.loads(f.read_text())
+        check("unwired dir is wired once, keys and mode kept",
+              r1[0]["action"] == "installed" and wired(f) and doc["model"] == "x"
+              and doc["permissions"] == {"allow": ["Bash(ls)"]} and "Stop" in doc["hooks"]
+              and (f.stat().st_mode & 0o777) == 0o600 and n1.count("\n") == 1
+              and "wired the claude PR hook" in n1
+              and not list(d.glob(".settings.json.whence-*")), f"{r1} {n1!r}")
+        sig = w._file_sig(f)
+        spawned = []
+        real_popen = subprocess.Popen
+        def popen(*a, **k):
+            spawned.append(a)
+            return real_popen(*a, **k)
+        t0 = time.perf_counter()
+        with mock.patch.object(subprocess, "Popen", popen):
+            hits = [run(claude(d)) for _ in range(50)]
+        per_run = (time.perf_counter() - t0) / 50
+        check(f"steady state is a cache hit: no write, no spawn ({per_run*1e3:.2f} ms/run)",
+              all(r[0]["cache_hit"] and r[0]["action"] == "none" and not n for r, n in hits)
+              and w._file_sig(f) == sig and not spawned, f"{hits[0]} spawned={spawned}")
+
+        # 2. a dir that is already wired is never written.
+        d2 = proxy("wired", json.dumps({"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/elsewhere/pr-hook.sh"}]}]}}))
+        sig2 = w._file_sig(d2 / "settings.json")
+        r2, n2 = run(claude(d2))
+        check("wired dir untouched", r2[0]["verdict"] == "wired" and not n2
+              and w._file_sig(d2 / "settings.json") == sig2, f"{r2}")
+
+        # 3. skipped: not an agent session, never opted in, .whence-off, opt-outs.
+        d3 = proxy("skips", "{}")
+        f3, sig3 = d3 / "settings.json", w._file_sig(d3 / "settings.json")
+        repo = root / "repo"; repo.mkdir(); (repo / ".whence-off").write_text("")
+        r_shell, _ = run({"CLAUDE_CONFIG_DIR": str(d3)})
+        r_off, _ = run(claude(d3), top=str(repo))
+        r_env, _ = run(claude(d3, WHENCE_AUTOINSTALL="0"))
+        r_cfg, _ = run(claude(d3), cfg={"agent_hook_autoinstall": False})
+        pr_hook.rename(cfgdir / "pr-hook.off")
+        r_noopt, _ = run(claude(d3))
+        (cfgdir / "pr-hook.off").rename(pr_hook)
+        check("skipped outside an agent, without opt-in, in a .whence-off repo, when opted out",
+              r_shell == [] and r_off == [] and r_noopt == []
+              and r_env[0]["verdict"] == r_cfg[0]["verdict"] == "opted-out"
+              and w._file_sig(f3) == sig3, f"{r_shell} {r_off} {r_env} {r_cfg} {r_noopt}")
+
+        # 4. malformed settings: never overwritten, one note, then silent.
+        d4 = proxy("broken", '{"model": "x", ')
+        before = (d4 / "settings.json").read_bytes()
+        r4, n4 = run(claude(d4))
+        r4b, n4b = run(claude(d4))
+        check("malformed settings.json left untouched with one note",
+              r4[0]["verdict"] == "malformed" and (d4 / "settings.json").read_bytes() == before
+              and n4.count("\n") == 1 and "malformed" in n4 and r4b[0]["cache_hit"] and not n4b,
+              f"{r4} {n4!r} {r4b} {n4b!r}")
+
+        # 5. owner saves between whence's read and its rename: whence drops its write.
+        d5 = proxy("race", json.dumps({"model": "x"}))
+        f5 = d5 / "settings.json"
+        real_doc = w._hook_doc
+        def racing(target):
+            out = real_doc(target)
+            if pathlib.Path(target) == f5:
+                f5.write_text(json.dumps({"model": "owner-saved", "extra": 1}))
+            return out
+        with mock.patch.object(w, "_hook_doc", racing):
+            r5, _ = run(claude(d5))
+        check("a save made during the write wins; whence retries later",
+              r5[0]["verdict"] == "changed"
+              and json.loads(f5.read_text()) == {"model": "owner-saved", "extra": 1}
+              and not list(d5.glob(".settings.json.whence-*")), f"{r5}")
+        r5b, _ = run(claude(d5))
+        check("the retry then wires it", r5b[0]["action"] == "installed" and wired(f5)
+              and json.loads(f5.read_text())["extra"] == 1, f"{r5b}")
+
+        # 6. concurrent whence runs + the owner rewriting: the file always parses.
+        d6 = proxy("hammer", json.dumps({"n": 0}))
+        f6 = d6 / "settings.json"
+        stop, errors = threading.Event(), []
+        def owner():
+            i = 0
+            while not stop.is_set():
+                i += 1
+                cur = json.loads(f6.read_text())
+                cur["n"] = i
+                tmpf = d6 / f".owner-{i}"
+                tmpf.write_text(json.dumps(cur)); os.replace(tmpf, f6)
+        def healer():
+            for _ in range(40):
+                try:
+                    w._wire_posttooluse(f6, "Bash", {}, only_if_missing=True,
+                                        follow_symlinks=False)
+                except w.HookFileError as e:
+                    if e.kind != "changed": errors.append(e.kind)
+                except Exception as e:
+                    errors.append(repr(e))
+        with mock.patch.object(w, "PR_HOOK", pr_hook):
+            th = [threading.Thread(target=owner)] + [threading.Thread(target=healer) for _ in range(6)]
+            for t in th: t.start()
+            for t in th[1:]: t.join()
+            stop.set(); th[0].join()
+        final = json.loads(f6.read_text())
+        entries = [x for e in final.get("hooks", {}).get("PostToolUse", [])
+                   for x in e["hooks"] if x["command"].endswith("pr-hook.sh")]
+        check("concurrent writers never corrupt the file",
+              not errors and isinstance(final.get("n"), int) and len(entries) <= 1
+              and not list(d6.glob(".settings.json.whence-*")), f"{errors} {final}")
+
+        # 7. safety: symlinked file, symlinked dir, outside $HOME, no agent files.
+        target = root / "dotfiles-settings.json"; target.write_text("{}")
+        d7 = proxy("linkfile")
+        (d7 / "settings.json").symlink_to(target)
+        r7, _ = run(claude(d7))
+        linkdir = home / ".router" / "claude-proxy" / "linkdir"
+        linkdir.symlink_to(d3)
+        r7b, _ = run(claude(linkdir))
+        outside = root / "outside"; outside.mkdir(); (outside / ".claude.json").write_text("{}")
+        r7c, _ = run(claude(outside))
+        outside_untouched = not (outside / "settings.json").exists()
+        r7d, _ = run(claude(outside, WHENCE_CLAUDE_CONFIG_DIRS=str(root / "out*")))
+        bare = home / "not-a-config"; bare.mkdir()
+        r7e, _ = run(claude(bare))
+        check("never writes through a symlink, outside a recognized dir, or into a non-config dir",
+              r7[0]["verdict"] == "refused" and (d7 / "settings.json").is_symlink()
+              and target.read_text() == "{}"
+              and r7b[0].get("why") == "symlinked dir" and w._file_sig(f3) == sig3
+              and r7c[0].get("why", "").startswith("outside") and outside_untouched
+              and r7d[0]["action"] == "installed"
+              and r7e[0].get("why") == "no claude config files" and not (bare / "settings.json").exists(),
+              f"{r7} {r7b} {r7c} {r7d} {r7e}")
+
+        # 8. a hook the user removed stays removed until an explicit install.
+        doc = json.loads(f.read_text()); doc["hooks"].pop("PostToolUse"); f.write_text(json.dumps(doc))
+        r8, n8 = run(claude(d))
+        r8b, n8b = run(claude(d))
+        with mock.patch.object(w, "CFG_DIR", cfgdir), mock.patch.object(w, "PR_HOOK", pr_hook), \
+             mock.patch.object(w, "SELF_HEAL_STATE", cfgdir / "self-heal.json"), \
+             mock.patch.object(w, "_write_pr_hook", lambda: pr_hook), \
+             mock.patch.object(w, "claude_settings_files", lambda: [f]), \
+             mock.patch("sys.stdout", io.StringIO()):
+            w.install_agent_hook("claude")
+        r8c, _ = run(claude(d))
+        check("a removed hook is an opt-out until --install-agent-hook",
+              r8[0]["verdict"] == "removed" and "removed" in n8 and r8b[0]["cache_hit"] and not n8b
+              and r8c[0]["verdict"] == "wired", f"{r8} {r8b} {r8c}")
+
+        # 9. read-only config dir: one note, no retry storm, file unchanged.
+        d9 = proxy("readonly", "{}")
+        d9.chmod(0o555)
+        try:
+            r9, n9 = run(claude(d9))
+            r9b, n9b = run(claude(d9))
+        finally:
+            d9.chmod(0o755)
+        check("read-only dir fails once with a note, then backs off",
+              r9[0]["verdict"] == "failed" and n9.count("\n") == 1 and r9b[0]["cache_hit"]
+              and not n9b and (d9 / "settings.json").read_text() == "{}", f"{r9} {n9!r} {r9b}")
+
+        # 10. Codex: its own home, matcher and timeout.
+        ch = home / "codex-alt"; ch.mkdir(); (ch / "config.toml").write_text("")
+        r10, _ = run({"CODEX_THREAD_ID": "t1", "CODEX_HOME": str(ch)})
+        hj = json.loads((ch / "hooks.json").read_text()) if (ch / "hooks.json").exists() else {}
+        e10 = (hj.get("hooks", {}).get("PostToolUse") or [{}])[0]
+        check("codex session wires $CODEX_HOME/hooks.json",
+              r10[0]["action"] == "installed" and e10.get("matcher", "").startswith("Bash|Shell")
+              and e10["hooks"][0].get("timeout") == 20000, f"{r10} {hj}")
+
+        # 11. an internal error becomes one note; nothing propagates.
+        with mock.patch.object(w, "_session_agent_dirs", side_effect=RuntimeError("boom")):
+            r11, n11 = run(claude(d))
+        check("internal error is swallowed with one note",
+              r11[0]["verdict"] == "error" and n11.count("\n") == 1 and "boom" in n11, f"{r11} {n11!r}")
+
+        # 12. the explicit install refuses a malformed file too (it used to clobber it).
+        before = (d4 / "settings.json").read_bytes()
+        out = io.StringIO()
+        with mock.patch.object(w, "CFG_DIR", cfgdir), mock.patch.object(w, "PR_HOOK", pr_hook), \
+             mock.patch.object(w, "SELF_HEAL_STATE", cfgdir / "self-heal.json"), \
+             mock.patch.object(w, "_write_pr_hook", lambda: pr_hook), \
+             mock.patch.object(w, "claude_settings_files", lambda: [d4 / "settings.json"]), \
+             mock.patch("sys.stdout", out):
+            rc12 = w.install_agent_hook("claude")
+        check("--install-agent-hook never overwrites a malformed file",
+              rc12 == 1 and (d4 / "settings.json").read_bytes() == before
+              and "NOT wired" in out.getvalue(), f"rc={rc12} {out.getvalue()!r}")
+
+    # 14. the real entry points reach it: --pre-exec (via preexec_capture) and the
+    #     CLI diagnostic, run as a fresh process with its own HOME.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(os.path.realpath(tmp))
+        repo = root / "repo"; repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin",
+                        "https://github.com/o/r.git"], check=True)
+        calls = []
+        with mock.patch.object(w, "self_heal_agent_hooks", lambda cfg, top="": calls.append(top)), \
+             mock.patch.object(w, "collect", return_value={}), \
+             mock.patch.object(w, "sanitize_path", return_value=""), \
+             mock.patch.object(w, "ledger_record", return_value=""):
+            w.preexec_capture(str(repo), {"repos": {}}, True, True)
+        home = root / "home"; (home / ".config" / "whence").mkdir(parents=True)
+        (home / ".config" / "whence" / "pr-hook.sh").write_text("#!/bin/sh\n")
+        cdir = home / ".claude"; cdir.mkdir(); (cdir / "projects").mkdir()
+        env = {"HOME": str(home), "PATH": os.environ["PATH"], "CLAUDECODE": "1"}
+        script = pathlib.Path(__file__).parent / "whence"
+        outs = [subprocess.run([sys.executable, str(script), "--self-heal", str(repo)], env=env,
+                               capture_output=True, text=True, timeout=30) for _ in range(2)]
+        res = [json.loads(o.stdout or "[]") for o in outs]
+        # --auto (the post-command wrapper and the agent hook) heals too, and a
+        # PR lookup that finds nothing still exits 0.
+        cdir2 = home / "proxy-b"; cdir2.mkdir(); (cdir2 / ".claude.json").write_text("{}")
+        fake_gh = root / "fake-gh"; fake_gh.write_text("#!/bin/sh\nexit 1\n"); fake_gh.chmod(0o755)
+        auto = subprocess.run([sys.executable, str(script), "--auto"], cwd=str(repo),
+                              env={**env, "CLAUDE_CONFIG_DIR": str(cdir2), "WHENCE_GH": str(fake_gh)},
+                              capture_output=True, text=True, timeout=60)
+        auto_ok = (auto.returncode == 0 and (cdir2 / "settings.json").exists()
+                   and w._hook_wired(json.loads((cdir2 / "settings.json").read_text())))
+        check("--pre-exec, --auto and the CLI run the self-heal (install, then cache hit)",
+              calls == [os.path.realpath(repo)]
+              and res[0] and res[0][0]["action"] == "installed" and "wired the claude" in outs[0].stderr
+              and res[1] and res[1][0]["cache_hit"] and not outs[1].stderr
+              and w._hook_wired(json.loads((cdir / "settings.json").read_text())) and auto_ok,
+              f"calls={calls} res={res} err={[o.stderr for o in outs]} auto={auto.returncode} {auto.stderr[-300:]!r}")
+
+    # 13. the shell wrapper: the notice reaches the caller's stderr, whence's own
+    #     noise does not, and the wrapped command's exit status survives a failing whence.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        bindir = root / "bin"; bindir.mkdir()
+        (bindir / "whence").write_text(
+            '#!/bin/sh\n[ -n "$WHENCE_NOTICE_FD" ] && eval "echo NOTICE >&$WHENCE_NOTICE_FD"\n'
+            'echo noise >&2\nexit 3\n')
+        (bindir / "gh").write_text('#!/bin/sh\nexit "${FAKE_RC:-0}"\n')
+        (bindir / "git").write_text('#!/bin/sh\nexit "${FAKE_RC:-0}"\n')
+        for f in bindir.iterdir(): f.chmod(0o755)
+        hook_file = root / "hook.sh"; hook_file.write_text(w._hook_file_text()[0])
+        env = {**os.environ, "ZDOTDIR": str(root), "PATH": f"{bindir}:/usr/bin:/bin", "FAKE_RC": "7"}
+        runs = []
+        for shell in (["zsh", "-fc"], ["bash", "--noprofile", "--norc", "-c"]):
+            for cmd in ("gh pr create --fill", "git push"):
+                r = subprocess.run([*shell, f'. "{hook_file}"; {cmd}'], env=env,
+                                   capture_output=True, text=True, timeout=10)
+                runs.append((shell[0], cmd, r.returncode, r.stderr))
+        check("wrapper keeps the exit status and shows only the notice line",
+              all(rc == 7 and err.strip() == "NOTICE" for _, _, rc, err in runs), f"{runs}")
+    return 1 if bad else 0
+
+
 def main() -> int:
     failed = 0
 
@@ -2149,6 +2452,9 @@ def main() -> int:
         print(f"FAIL  claude config dirs: files={files} wired={wired}")
     else:
         print("ok    agent hook: wired into ~/.claude, CLAUDE_CONFIG_DIR, and configured dirs once each")
+
+    # ── Self-heal: wire the hook into the config dir the session actually reads ──
+    failed += self_heal_checks()
 
     # ── A missed stamp is detectable ──
     listing = json.dumps([
