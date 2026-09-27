@@ -78,3 +78,9 @@ as `codex-cli` or `shell`. Malformed explicit values remain unresolved.
 - If the repo authenticates with a GitHub App token, set
   `WHENCE_GH=ghapp` (or the appropriate CLI) before running.
 - Preview first with no `--apply` to see the labels and footer it would add.
+- A session launched with its own `CLAUDE_CONFIG_DIR` or `CODEX_HOME` gets the
+  agent hook wired automatically the first time whence runs inside it (only
+  after `--install-agent-hook` was run once on the machine). It prints one line,
+  never rewrites a malformed or symlinked file, and respects
+  `WHENCE_AUTOINSTALL=0`, `"agent_hook_autoinstall": false`, and a hook you
+  removed by hand. `whence --self-heal <dir>` shows its verdict as JSON.

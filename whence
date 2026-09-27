@@ -20,7 +20,7 @@ Config (all optional, ~/.config/whence/config.json):
 Quick per-run override:  WHENCE_HIDE=url,session   or  --hide url,session
 """
 from __future__ import annotations
-import argparse, base64, contextlib, fcntl, glob, hashlib, json, os, re, shlex, shutil, signal, socket, subprocess, sys, datetime, pathlib, tempfile, time
+import argparse, base64, contextlib, fcntl, fnmatch, glob, hashlib, json, os, re, shlex, shutil, signal, socket, stat, subprocess, sys, datetime, pathlib, tempfile, time
 import urllib.parse
 
 GH = "gh"                                          # resolved in main: WHENCE_GH env > config "gh" > "gh"
@@ -1181,15 +1181,15 @@ def _hook_file_text() -> tuple[str, list]:
         '# exported value would count as an explicit launcher claim and override that.',
         "__whence_real() { if [ -n \"${ZSH_VERSION:-}\" ]; then whence -p \"$1\"; "
         "else type -P \"$1\"; fi 2>/dev/null; }",
-        "__whence_stamp() { command whence --auto >/dev/null 2>&1 || true; }",
+        "__whence_stamp() { WHENCE_NOTICE_FD=3 command whence --auto 3>&2 >/dev/null 2>&1 || true; }",
         "__whence_preexec() { "
         "__whence_workstream=; while [ \"$#\" -gt 0 ]; do case \"$1\" in "
         "--workstream-id=*) __whence_workstream=${1#*=} ;; "
         "--workstream-id) shift; [ \"$#\" -gt 0 ] && __whence_workstream=$1 ;; "
         "esac; shift; done; "
         "if [ -n \"$__whence_workstream\" ]; then "
-        "WHENCE_WORKSTREAM_ID=\"$__whence_workstream\" command whence --pre-exec \"$PWD\"; "
-        "else command whence --pre-exec \"$PWD\"; fi >/dev/null 2>&1 || true; }",
+        "WHENCE_NOTICE_FD=3 WHENCE_WORKSTREAM_ID=\"$__whence_workstream\" command whence --pre-exec \"$PWD\"; "
+        "else WHENCE_NOTICE_FD=3 command whence --pre-exec \"$PWD\"; fi 3>&2 >/dev/null 2>&1 || true; }",
         "__whence_will_act() { for __whence_arg in \"$@\"; do case \"$__whence_arg\" in "
         "-h|--help|--version|--dry-run) return 1;; esac; done; return 0; }",
     ]
@@ -1314,28 +1314,128 @@ def _write_pr_hook() -> pathlib.Path:
     return PR_HOOK
 
 
-def _wire_posttooluse(path: pathlib.Path, matcher: str, extra: dict) -> None:
-    """Idempotently add a PostToolUse entry pointing at pr-hook.sh to a Claude/
-    Codex-style hooks JSON (they share the schema)."""
-    d = {}
-    if path.exists():
-        try: d = json.loads(path.read_text())
-        except Exception: d = {}
+class HookFileError(Exception):
+    """An agent hook file whence refuses to rewrite. ``kind`` names why:
+    ``malformed`` (not a JSON object, or a hooks table of the wrong shape),
+    ``symlink``, ``not-regular``, ``foreign-owner``, or ``changed`` (another
+    writer replaced the file between whence's read and its rename)."""
+    def __init__(self, kind: str, path):
+        super().__init__(f"{kind}: {path}")
+        self.kind, self.path = kind, str(path)
+
+
+def _file_sig(path) -> list | None:
+    """Identity of a file's current contents without reading it: inode, size and
+    mtime from one lstat. ``None`` when the file does not exist."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    return [st.st_ino, st.st_size, st.st_mtime_ns]
+
+
+def _is_pr_hook(entry: dict) -> bool:
+    return any(isinstance(x, dict) and str(x.get("command", "")).endswith("pr-hook.sh")
+               for x in (entry.get("hooks") or []))
+
+
+def _hook_doc(target: pathlib.Path) -> tuple[dict, list | None]:
+    """Read a Claude/Codex hooks JSON for a read-modify-write, refusing anything
+    whence must not rewrite. A malformed file is NEVER replaced: it may be a
+    half-written save by its owner, and rewriting it would destroy their data."""
+    sig = _file_sig(target)
+    if sig is None:
+        return {}, None
+    st = os.lstat(target)
+    if stat.S_ISLNK(st.st_mode):
+        raise HookFileError("symlink", target)
+    if not stat.S_ISREG(st.st_mode):
+        raise HookFileError("not-regular", target)
+    if st.st_uid != os.getuid():
+        raise HookFileError("foreign-owner", target)
+    raw = target.read_bytes()
+    if not raw.strip():
+        return {}, sig
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        raise HookFileError("malformed", target) from None
+    hooks = d.get("hooks", {}) if isinstance(d, dict) else None
+    if (not isinstance(d, dict) or not isinstance(hooks, dict)
+            or not isinstance(hooks.get("PostToolUse", []), list)
+            or not all(isinstance(e, dict) for e in hooks.get("PostToolUse", []))):
+        raise HookFileError("malformed", target)
+    return d, sig
+
+
+def _hook_wired(d: dict) -> bool:
+    return any(_is_pr_hook(e) for e in (d.get("hooks") or {}).get("PostToolUse", []))
+
+
+def _atomic_write_json(target: pathlib.Path, d: dict, expected_sig: list | None,
+                       mode: int) -> None:
+    """Replace ``target`` with ``d`` so no reader ever sees a partial file.
+
+    The new content goes to a temp file in the same directory, is fsynced, and
+    is renamed over the original, keeping its permission bits. Just before the
+    rename the original is lstat'ed again: if its owner (the agent itself, or
+    another hook) saved it after whence read it, whence drops its write rather
+    than silently discard theirs. The window left between that check and the
+    rename is a single syscall."""
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.whence-",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(d, indent=2) + "\n")
+            fh.flush()
+            os.fchmod(fh.fileno(), mode)
+            os.fsync(fh.fileno())
+        if _file_sig(target) != expected_sig:
+            raise HookFileError("changed", target)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _wire_posttooluse(path: pathlib.Path, matcher: str, extra: dict,
+                      only_if_missing: bool = False, follow_symlinks: bool = True) -> str:
+    """Add a PostToolUse entry pointing at pr-hook.sh to a Claude/Codex-style
+    hooks JSON (they share the schema); the one writer for every install path.
+
+    Returns ``wired`` when ``only_if_missing`` found an entry already present
+    (nothing written) and ``installed`` after a write. Unknown keys are kept,
+    the write is atomic, and a malformed, foreign-owned or concurrently changed
+    file raises :class:`HookFileError` instead of being overwritten. An
+    explicit install follows a symlinked file to its target; the self-heal
+    refuses one."""
+    path = pathlib.Path(path)
+    target = path
+    if os.path.islink(path):
+        if not follow_symlinks:
+            raise HookFileError("symlink", path)
+        target = pathlib.Path(os.path.realpath(path))
+    d, sig = _hook_doc(target)
+    if only_if_missing and _hook_wired(d):
+        return "wired"
     ptu = d.setdefault("hooks", {}).setdefault("PostToolUse", [])
-    cmd = str(PR_HOOK)
-    def has(e): return any(x.get("command", "").endswith("pr-hook.sh") for x in e.get("hooks", []))
-    mine = [e for e in ptu if e.get("matcher") == matcher or has(e)]
-    entry = {"type": "command", "command": cmd, **extra}
-    if any(has(e) for e in ptu):
+    entry = {"type": "command", "command": str(PR_HOOK), **extra}
+    if any(_is_pr_hook(e) for e in ptu):
         for e in ptu:
-            if has(e):
-                e["hooks"] = [x for x in e["hooks"] if not x.get("command", "").endswith("pr-hook.sh")] + [entry]
-    elif mine:
-        mine[0].setdefault("hooks", []).append(entry)
+            if _is_pr_hook(e):
+                e["hooks"] = [x for x in e["hooks"] if not (
+                    isinstance(x, dict) and str(x.get("command", "")).endswith("pr-hook.sh"))] + [entry]
     else:
-        ptu.append({"matcher": matcher, "hooks": [entry]})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(d, indent=2) + "\n")
+        mine = [e for e in ptu if e.get("matcher") == matcher]
+        if mine and isinstance(mine[0].get("hooks", []), list):
+            mine[0].setdefault("hooks", []).append(entry)
+        else:
+            ptu.append({"matcher": matcher, "hooks": [entry]})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(os.lstat(target).st_mode) if sig is not None else 0o644
+    _atomic_write_json(target, d, sig, mode)
+    return "installed"
 
 
 def claude_settings_files() -> list[pathlib.Path]:
@@ -1364,27 +1464,275 @@ def claude_settings_files() -> list[pathlib.Path]:
     return out
 
 
+# The hook file, matcher and extra keys each agent's PostToolUse entry uses.
+AGENT_HOOK_SPECS = {
+    "claude": ("settings.json", "Bash", {}),
+    "codex": ("hooks.json", "Bash|Shell|shell|local_shell|exec", {"timeout": 20000}),
+}
+
+
+def codex_home() -> pathlib.Path:
+    """Codex reads its hooks from ``$CODEX_HOME`` when set, else ``~/.codex``."""
+    return pathlib.Path(os.path.expanduser(os.environ.get("CODEX_HOME") or "~/.codex"))
+
+
 def install_agent_hook(scope: str) -> int:
-    """Wire the reliable in-process agent hooks: Claude globally, Codex per-repo
-    (Codex only reads a repo's own .codex/hooks.json, and gates it behind trust)."""
+    """Wire the reliable in-process agent hooks, Claude and Codex, both global."""
     _write_pr_hook()
-    did = []
+    did, refused = [], []
+    targets = []
     if scope in ("all", "claude"):
-        for settings in claude_settings_files():
-            _wire_posttooluse(settings, "Bash", {})
-            did.append(f"claude ({settings}, global)")
+        targets += [("claude", f, "global") for f in claude_settings_files()]
     if scope in ("all", "codex"):
-        _wire_posttooluse(pathlib.Path(os.path.expanduser("~/.codex/hooks.json")),
-                          "Bash|Shell|shell|local_shell|exec", {"timeout": 20000})
-        did.append("codex (~/.codex/hooks.json, global)")
+        targets.append(("codex", codex_home() / AGENT_HOOK_SPECS["codex"][0], "global"))
+    for agent, settings, where in targets:
+        _name, matcher, extra = AGENT_HOOK_SPECS[agent]
+        try:
+            _wire_posttooluse(settings, matcher, extra)
+        except (HookFileError, OSError) as e:
+            refused.append(f"{agent} ({settings}): {getattr(e, 'kind', e)}")
+            continue
+        did.append(f"{agent} ({settings}, {where})")
     print(f"whence: wrote {PR_HOOK}")
     for d in did:
         print(f"  wired {d}")
+    for r in refused:
+        print(f"  NOT wired {r} — fix or remove that file, then re-run")
     if scope in ("all", "codex"):
         print("\nCodex note: this is Codex's GLOBAL hooks file — it applies to every repo,\n"
               "no per-repo install. Codex gates hooks behind trust, so it will ask you to\n"
               "trust the whence hook once on its next run.")
-    return 0
+    return 1 if refused else 0
+
+
+# ── Self-heal: wire the agent hook into the config dir a session actually uses ──
+#
+# A session launched with its own config dir (CLAUDE_CONFIG_DIR, CODEX_HOME)
+# never reads the dir --install-agent-hook wired, so PRs it opens through a path
+# the shell wrapper cannot see go unstamped. whence already runs inside such a
+# session (the shell wrapper fires on `git push`/`shipyard pr`/`gh pr create`),
+# so it notices the gap there and closes it. It acts only when the user already
+# opted into agent hooks (pr-hook.sh exists), never writes outside a recognized
+# config dir, honours every opt-out, and costs a few stats plus one small read in
+# the steady state: no process spawn, no network.
+SELF_HEAL_STATE = CFG_DIR / "self-heal.json"
+SELF_HEAL_LOG = CFG_DIR / "self-heal.jsonl"
+SELF_HEAL_RETRY = 86400          # a failed write is retried at most daily
+# Files whose presence marks a directory as an agent's config dir.
+_AGENT_DIR_MARKERS = {
+    "claude": ("settings.json", ".claude.json", "projects", "sessions", "history.jsonl"),
+    "codex": ("config.toml",),
+}
+# Verdicts a matching file signature settles without reading the file again.
+_SETTLED = ("wired", "installed", "malformed", "refused", "removed", "opted-out")
+
+
+def _self_heal_key(agent: str, settings) -> str:
+    return f"{agent}:{os.path.abspath(os.path.expanduser(str(settings)))}"
+
+
+def _self_heal_load() -> dict:
+    try:
+        d = json.loads(SELF_HEAL_STATE.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _self_heal_save(state: dict) -> None:
+    SELF_HEAL_STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(SELF_HEAL_STATE.parent), prefix=".self-heal-",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+        os.replace(tmp, SELF_HEAL_STATE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _self_heal_notice(msg: str) -> None:
+    """One line to the user. The shell wrapper discards whence's stdout/stderr
+    so a stamp can never clutter a command's output; it hands over its own
+    stderr as ``WHENCE_NOTICE_FD`` for exactly this line."""
+    line = (msg.rstrip("\n") + "\n").encode()
+    fd = os.environ.get("WHENCE_NOTICE_FD", "")
+    if fd.isdigit():
+        try:
+            os.write(int(fd), line)
+            return
+        except OSError:
+            pass
+    with contextlib.suppress(Exception):
+        sys.stderr.write(line.decode()); sys.stderr.flush()
+
+
+def _autoinstall_opt_out(cfg: dict) -> str:
+    if os.environ.get("WHENCE_AUTOINSTALL", "").strip().lower() in ("0", "false", "no", "off"):
+        return "WHENCE_AUTOINSTALL=0"
+    if (cfg or {}).get("agent_hook_autoinstall") is False:
+        return 'config "agent_hook_autoinstall": false'
+    return ""
+
+
+def _session_agent_dirs(env) -> list[tuple[str, pathlib.Path]]:
+    """(agent, config dir) for each agent this process runs inside, from the
+    variables the agent itself sets in its tools' environment. The config dir
+    comes from the same environment: Claude and Codex pass CLAUDE_CONFIG_DIR and
+    CODEX_HOME down to what they run, so the value here is the dir the running
+    session reads. No process-tree walk: that costs a `ps` per run, and a dir
+    recovered from a scrubbed environment would be a guess, not a fact."""
+    out = []
+    if env.get("CLAUDECODE") == "1":
+        out.append(("claude", pathlib.Path(os.path.expanduser(
+            env.get("CLAUDE_CONFIG_DIR") or "~/.claude"))))
+    if env.get("CODEX_THREAD_ID") or env.get("CODEX_SESSION_ID") or env.get("CODEX_ROLLOUT_ID"):
+        out.append(("codex", pathlib.Path(os.path.expanduser(
+            env.get("CODEX_HOME") or "~/.codex"))))
+    return out
+
+
+def _recognized_config_dir(agent: str, d: pathlib.Path, env) -> str:
+    """Empty when whence may write in ``d``; otherwise why not."""
+    if not d.is_absolute():
+        return "relative path"
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return "missing"
+    if stat.S_ISLNK(st.st_mode):
+        return "symlinked dir"
+    if not stat.S_ISDIR(st.st_mode):
+        return "not a directory"
+    if st.st_uid != os.getuid():
+        return "owned by another user"
+    real = os.path.realpath(d)
+    home = os.path.realpath(os.path.expanduser("~"))
+    under_home = real != home and real.startswith(home + os.sep)
+    patterns = [os.path.realpath(os.path.expanduser(x.strip()))
+                for x in env.get("WHENCE_CLAUDE_CONFIG_DIRS", "").split(":")
+                if x.strip()] if agent == "claude" else []
+    if not under_home and not any(fnmatch.fnmatchcase(real, pat) for pat in patterns):
+        return "outside $HOME and WHENCE_CLAUDE_CONFIG_DIRS"
+    if not any(os.path.lexists(d / m) for m in _AGENT_DIR_MARKERS[agent]):
+        return f"no {agent} config files"
+    return ""
+
+
+@contextlib.contextmanager
+def _self_heal_lock(key: str):
+    """Non-blocking: when another whence run is already healing this file, this
+    one skips instead of waiting, so a wrapper can never stall on it."""
+    CFG_DIR.mkdir(parents=True, exist_ok=True)
+    name = hashlib.sha256(key.encode()).hexdigest()[:16]
+    with (CFG_DIR / f".self-heal-{name}.lock").open("a+") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _self_heal_one(agent: str, d: pathlib.Path, env, state: dict, now: int) -> dict:
+    """Evaluate one (agent, config dir); returns what happened. Mutates ``state``
+    only when the verdict changed, so a cache hit writes nothing."""
+    name, matcher, extra = AGENT_HOOK_SPECS[agent]
+    settings = d / name
+    key = _self_heal_key(agent, settings)
+    rec = state.get(key) if isinstance(state.get(key), dict) else {}
+    sig = _file_sig(settings)
+    res = {"agent": agent, "file": str(settings), "cache_hit": False, "action": "none"}
+    if (rec.get("sig") == sig and rec.get("verdict") in _SETTLED) or (
+            rec.get("verdict") == "failed" and rec.get("sig") == sig
+            and now - int(rec.get("ts") or 0) < SELF_HEAL_RETRY):
+        res.update(cache_hit=True, verdict=rec["verdict"])
+        return res
+    why = _recognized_config_dir(agent, d, env)
+    if why:
+        res["verdict"] = "unrecognized"
+        res["why"] = why
+        return res        # nothing is recorded for a dir whence will not touch
+    note, verdict, ever = "", "", bool(rec.get("ever_wired"))
+    try:
+        d_doc, _ = _hook_doc(settings)
+        if _hook_wired(d_doc):
+            verdict, ever = "wired", True
+        elif ever:
+            # It was wired and is not now: someone took it out. That is an
+            # opt-out for this file; only an explicit install puts it back.
+            verdict = "removed"
+            note = (f"whence: the PR hook was removed from {settings}; leaving it "
+                    "unwired (run `whence --install-agent-hook` to restore it)")
+        elif d_doc.get("disableAllHooks") is True:
+            verdict = "opted-out"
+        else:
+            with _self_heal_lock(key) as got:
+                if not got:
+                    res["verdict"] = "busy"
+                    return res
+                verdict = _wire_posttooluse(settings, matcher, extra,
+                                            only_if_missing=True, follow_symlinks=False)
+            ever = True
+            if verdict == "installed":
+                res["action"] = "installed"
+                when = ("counted on from its next session"
+                        if agent == "claude" else "Codex asks you to trust it once")
+                note = (f"whence: wired the {agent} PR hook into {settings} ({when}; "
+                        "this PR is still stamped by the shell wrapper). "
+                        "Opt out: WHENCE_AUTOINSTALL=0")
+    except HookFileError as e:
+        if e.kind == "changed":
+            res["verdict"] = "changed"       # its owner saved it mid-write; retry next run
+            return res
+        verdict = "malformed" if e.kind == "malformed" else "refused"
+        note = (f"whence: not wiring the PR hook into {settings}: {e.kind}"
+                + (" (left untouched; fix the JSON)" if e.kind == "malformed" else ""))
+    except OSError as e:
+        verdict = "failed"
+        note = f"whence: could not wire the PR hook into {settings}: {e.strerror or e}"
+    res["verdict"] = verdict
+    state[key] = {"sig": _file_sig(settings), "verdict": verdict, "ts": now,
+                  "ever_wired": ever}
+    if note:
+        _self_heal_notice(note)
+        with contextlib.suppress(Exception):
+            with SELF_HEAL_LOG.open("a") as fh:
+                fh.write(json.dumps({"ts": now, "agent": agent, "file": str(settings),
+                                     "verdict": verdict}) + "\n")
+    return res
+
+
+def self_heal_agent_hooks(cfg: dict, repo_top: str = "") -> list[dict]:
+    """Wire the agent hook into the config dir this session reads, if missing.
+
+    Never raises and never changes the caller's result: any failure is one note.
+    Steady state is a few stats and one read of the small state file."""
+    try:
+        if repo_top and os.path.exists(os.path.join(repo_top, ".whence-off")):
+            return []
+        env = os.environ
+        agents = _session_agent_dirs(env)
+        if not agents or not PR_HOOK.exists():     # not an agent, or never opted in
+            return []
+        if _autoinstall_opt_out(cfg):
+            return [{"agent": a, "file": str(d), "cache_hit": False, "action": "none",
+                     "verdict": "opted-out"} for a, d in agents]
+        state = _self_heal_load()
+        before = json.dumps(state, sort_keys=True)
+        now = _now_epoch()
+        results = [_self_heal_one(a, d, env, state, now) for a, d in agents]
+        if json.dumps(state, sort_keys=True) != before:
+            _self_heal_save(state)
+        return results
+    except Exception as e:                           # never break the wrapped command
+        _self_heal_notice(f"whence: self-heal skipped ({type(e).__name__}: {e})")
+        return [{"verdict": "error", "action": "none", "cache_hit": False}]
 
 
 SWEEP_PLIST = pathlib.Path(os.path.expanduser(
@@ -2891,6 +3239,7 @@ def preexec_capture(cwd: str, cfg: dict, post_labels: bool, post_footer: bool) -
     if ((top and (pathlib.Path(top) / ".whence-off").exists())
             or not slug or not br or not repo_allowed(cfg, slug)):
         return ""
+    self_heal_agent_hooks(cfg, top)
     p = collect(cfg, slug)
     p["path"] = sanitize_path(cwd, cfg)
     key = ledger_record("", p, slug, br, "HEAD", cwd, lock_provenance=True)
@@ -3181,7 +3530,11 @@ def self_update(force: bool = False) -> bool:
     _git(str(clone), "pull", "--ff-only", "--quiet")
     after = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
     if before and after and before != after:
-        install_agent_hook("all")
+        # Refresh the shim only. Wiring a config dir is the self-heal's job,
+        # because an automatic path must honour a user's removal or opt-out;
+        # an unattended reinstall into every dir would undo both.
+        if PR_HOOK.exists():
+            _write_pr_hook()
         # hook.sh contains generated wrapper code, not a symlink to this script.
         # Refresh it only for users who already opted into the shell hook.
         if HOOK_FILE.exists():
@@ -3281,6 +3634,9 @@ def main() -> int:
                     help="internal: read an agent's tool JSON from stdin and stamp if it opened a PR")
     ap.add_argument("--pre-exec", metavar="CWD", help=argparse.SUPPRESS)
     ap.add_argument("--retry-key", help=argparse.SUPPRESS)
+    ap.add_argument("--self-heal", metavar="CWD",
+                    help="evaluate the agent-hook self-heal exactly as the wrappers do "
+                         "and print what it did as JSON (diagnostic)")
     args = ap.parse_args()
 
     if args.install_agent_hook:
@@ -3300,6 +3656,11 @@ def main() -> int:
         cfg["labels"] = cfg["labels"] and not args.no_labels
         cfg["footer"] = cfg["footer"] and not args.no_footer
         return retry_pending_pr(args.retry_key, cfg)
+    if args.self_heal:
+        cfg = load_config(args.hide)
+        top = _git(args.self_heal, "rev-parse", "--show-toplevel").stdout.strip()
+        print(json.dumps(self_heal_agent_hooks(cfg, top)))
+        return 0
     if args.pre_exec:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -3415,6 +3776,8 @@ def main() -> int:
         if not args.auto:
             print("whence: this repo is disabled (.whence-off file or repos config) — skipping")
         return 0
+    if args.auto:
+        self_heal_agent_hooks(cfg)
 
     context_cwd = _cmd_cwd(hook_cmd) if args.hook else os.getcwd()
     context_repo = hook_slug or _repo_branch(context_cwd or os.getcwd())[0]
