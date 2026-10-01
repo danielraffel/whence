@@ -31,7 +31,8 @@ CFG_DIR = pathlib.Path.home() / ".config/whence"
 # navigate by — the one you need most to find your way back.
 FIELDS = ["agent", "host", "workspace", "tab", "workstream", "launcher", "terminal",
           "terminal_address", "terminal_instance", "route", "router", "origin_state",
-          "path", "session", "resume", "url", "goals", "jump", "relaunch", "stamped"]
+          "path", "session", "config_home", "resume", "url", "goals", "jump", "relaunch",
+          "stamped"]
 LABEL_FIELDS = ["agent", "host", "workspace", "tab", "route"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700",
                   "tab": "8250df", "route": "d4a72c"}
@@ -41,6 +42,14 @@ NUMBERED_LABEL_RE = re.compile(r"^([1-5])·")
 # still works via the cmux-sourced `relaunch` command below — this is just for a
 # prettier line. Add your agent here (PRs welcome).
 KNOWN_RESUME = {"claude": "claude --resume {sid}", "codex": "codex resume {sid}"}
+# Where each known agent keeps its transcripts, and the variable that moves it.
+# A session launched with its own config home (a subrouter proxy sets
+# CLAUDE_CONFIG_DIR=~/.subrouter/codex/claude-proxy/<hash>) can only be resumed
+# from a shell that points at the same home; a bare `claude --resume <id>`
+# looks in ~/.claude and reports the session missing.
+KNOWN_CONFIG_HOME = {"claude": ("CLAUDE_CONFIG_DIR", "~/.claude"),
+                     "codex": ("CODEX_HOME", "~/.codex")}
+_CONFIG_HOME_RE = re.compile(r"~(?:/[A-Za-z0-9._-]+)+")
 KNOWN_URL = {"claude": "https://claude.ai/code/{bridge}"}
 
 MARK_RE = re.compile(r"<!-- whence( .*?)? -->.*?<!-- /whence -->\n?", re.S)
@@ -981,11 +990,15 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27}", restore)
         sid = m.group(0) if m else ""
     p["session"] = sid
+    if agent in KNOWN_CONFIG_HOME:
+        p["config_home"] = public_config_home(
+            agent, os.environ.get(KNOWN_CONFIG_HOME[agent][0], ""),
+            cfg if cfg is not None else load_config(""))
 
     if "WHENCE_RESUME_COMMAND" in os.environ:
         p["resume"] = safe_public_command(os.environ.get("WHENCE_RESUME_COMMAND", ""))
     elif agent in KNOWN_RESUME and sid:
-        p["resume"] = KNOWN_RESUME[agent].format(sid=sid)
+        p["resume"] = resume_command(agent, sid, p["config_home"])
     if "WHENCE_RELAUNCH_COMMAND" in os.environ:
         p["relaunch"] = safe_public_command(os.environ.get("WHENCE_RELAUNCH_COMMAND", ""))
     if agent in KNOWN_URL:
@@ -996,6 +1009,70 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
     p["_redacted"] = redact(p, cfg if cfg is not None else load_config(""), surface)
     dedupe_terminal_display(p)
     return p
+
+
+def public_config_home(agent: str, raw: str, cfg: dict) -> str:
+    """The agent's config home in publishable form, or "" when the default.
+
+    Published only as a `~/...` path of plain segments: a home outside $HOME
+    would leak a private layout, and a path the denylist had to scrub would
+    no longer point anywhere, so both fall back to the plain resume command."""
+    if agent not in KNOWN_CONFIG_HOME or not raw:
+        return ""
+    default = KNOWN_CONFIG_HOME[agent][1]
+    path = os.path.normpath(os.path.expanduser(str(raw).strip()))
+    if not os.path.isabs(path):
+        return ""
+    if path == os.path.normpath(os.path.expanduser(default)):
+        return ""
+    home = os.path.expanduser("~")
+    if not path.startswith(home + os.sep):
+        return ""
+    public = "~" + path[len(home):]
+    if denied(public, cfg or {}) or not _CONFIG_HOME_RE.fullmatch(public):
+        return ""
+    return public
+
+
+def transcript_config_home(transcript_path: str) -> tuple[str, str]:
+    """(agent, config home) named by a hook payload's transcript path.
+
+    Claude writes `<home>/projects/<project>/<session>.jsonl`; Codex writes
+    `<home>/sessions/YYYY/MM/DD/rollout-*.jsonl`. The path is the fact of where
+    this session lives, so it outranks an environment variable that may have
+    leaked in from another shell."""
+    parts = pathlib.PurePosixPath(transcript_path or "").parts
+    if len(parts) >= 4 and parts[-3] == "projects" and parts[-1].endswith(".jsonl"):
+        return "claude", str(pathlib.PurePosixPath(*parts[:-3]))
+    if (len(parts) >= 6 and parts[-5] == "sessions"
+            and parts[-1].startswith("rollout-") and parts[-1].endswith(".jsonl")):
+        return "codex", str(pathlib.PurePosixPath(*parts[:-5]))
+    return "", ""
+
+
+def apply_hook_config_home(p: dict, home_agent: str, home: str, cfg: dict) -> None:
+    """Settle ``p["config_home"]`` once the hook has named the agent.
+
+    The transcript path is where this session actually lives, so it outranks a
+    config-home variable that may have leaked in from another shell. It only
+    applies when it names the same agent the stamp does; an agent with no
+    known config home carries none."""
+    if home and home_agent == p.get("agent"):
+        p["config_home"] = public_config_home(home_agent, home, cfg)
+    elif p.get("agent") not in KNOWN_CONFIG_HOME:
+        p["config_home"] = ""
+
+
+def resume_command(agent: str, sid: str, config_home: str = "") -> str:
+    """The resume line for a known agent, prefixed with its config home when the
+    session does not live in the default one. `$HOME` rather than `~` so the
+    line works pasted into any POSIX shell, over ssh, and in fish."""
+    if agent not in KNOWN_RESUME or not sid:
+        return ""
+    cmd = KNOWN_RESUME[agent].format(sid=sid)
+    if config_home and agent in KNOWN_CONFIG_HOME and _CONFIG_HOME_RE.fullmatch(config_home):
+        cmd = f'{KNOWN_CONFIG_HOME[agent][0]}="$HOME{config_home[1:]}" {cmd}'
+    return cmd
 
 
 def visible(field: str, p: dict, hide: set) -> bool:
@@ -1041,7 +1118,8 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     # either from GitHub's labels.
     marker_fields = ("agent", "host", "workspace", "tab", "workstream", "launcher",
                      "terminal", "terminal_address", "terminal_instance", "route", "router", "origin_state",
-                     "path", "session", "resume", "url", "goals", "jump", "relaunch")
+                     "path", "session", "config_home", "resume", "url", "goals", "jump",
+                     "relaunch")
     tag = json.dumps({"labels": label_names,
                       "prov": {f: p.get(f, "") for f in marker_fields
                                if visible(f, p, hide)}}, ensure_ascii=False)
@@ -1062,6 +1140,7 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
                          ("terminal_instance", "Terminal instance", True),
                          ("router", "Router", True), ("origin_state", "Origin state", True),
                          ("path", "Directory", True), ("session", "Session", True),
+                         ("config_home", "Config home", True),
                          ("goals", "Goal docs", False)]:
         if visible(f, p, hide):
             if f == "goals":
@@ -3722,7 +3801,7 @@ def main() -> int:
     cfg = load_config(args.hide)
     GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"   # env > config "gh" > "gh"
 
-    hook_agent = hook_sid = hook_cmd = hook_cwd = ""
+    hook_agent = hook_sid = hook_cmd = hook_cwd = hook_home = hook_home_agent = ""
     hook_slug = hook_br = hook_pr = hook_source_ref = ""
     ledger_key = ""
     hook_is_pr = hook_is_push = False
@@ -3740,8 +3819,9 @@ def main() -> int:
             hook_cmd = ti.get("command") or ti.get("cmd") or ""
             hook_sid = d.get("session_id") or ""
             tp = d.get("transcript_path") or ""
+            hook_home_agent, hook_home = transcript_config_home(tp)
             hook_agent = ("codex" if "/.codex" in tp else
-                          "claude" if "/.claude" in tp else "")
+                          "claude" if "/.claude" in tp else hook_home_agent)
             hook_slug, hook_br, hook_pr = parse_outcome(d)
             hook_source_ref = pushed_source_ref(d)
             hook_cwd = d.get("cwd") or ""
@@ -3807,10 +3887,11 @@ def main() -> int:
         if (hook_sid and "session" not in explicit_context
                 and "WHENCE_SESSION_ID" not in os.environ):
             p["session"] = stable_identifier(hook_sid, maxlen=160)
+        apply_hook_config_home(p, hook_home_agent, hook_home, cfg)
         if "resume" in explicit_context:
             pass
         elif p["agent"] in KNOWN_RESUME and p["session"]:
-            p["resume"] = KNOWN_RESUME[p["agent"]].format(sid=p["session"])
+            p["resume"] = resume_command(p["agent"], p["session"], p.get("config_home", ""))
         elif p["agent"] not in KNOWN_RESUME and "WHENCE_RESUME_COMMAND" not in os.environ:
             p["resume"] = ""
         # Capture this branch's provenance while the env is live. Exact retry is
