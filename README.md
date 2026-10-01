@@ -65,7 +65,11 @@ automatically; run `whence --resync` from that tab to refresh its open PRs to th
 current name. The denylist is the one thing that always wins, at every stamp.
 
 - **A visible "🔎 Provenance" footer** in the PR body with the **session id**,
-  the exact **resume command** (`claude --resume …` / `codex resume …`), the
+  the exact **resume command** (`claude --resume …` / `codex resume …`; when the
+  session lives in a non-default config home, such as a subrouter proxy's
+  `CLAUDE_CONFIG_DIR`, the line is prefixed with it —
+  `CLAUDE_CONFIG_DIR="$HOME/…" claude --resume …` — and the home is stamped as
+  `config_home`, so the session resumes from any shell), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
   (`cmux surface focus …`). It can also link one or more committed **goal or
   planning documents**, so the implementation remains traceable to its intent.

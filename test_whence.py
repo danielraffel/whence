@@ -410,6 +410,124 @@ def self_heal_checks() -> int:
     return 1 if bad else 0
 
 
+def config_home_checks() -> int:
+    """A session in a non-default config home must be resumable from another
+    shell: the stamp names the home, and the resume line points at it."""
+    failed = 0
+    home = os.path.expanduser("~")
+    proxy = f"{home}/.subrouter/codex/claude-proxy/08da27d88f7880497c095fb0"
+    public_proxy = "~/.subrouter/codex/claude-proxy/08da27d88f7880497c095fb0"
+    cfg = {"denylist": [], "hide": set()}
+
+    cases = [
+        ("claude default home publishes nothing", "claude", f"{home}/.claude", ""),
+        ("claude default home with trailing slash", "claude", f"{home}/.claude/", ""),
+        ("claude subrouter proxy home", "claude", proxy, public_proxy),
+        ("claude home given as ~", "claude", public_proxy, public_proxy),
+        ("codex default home publishes nothing", "codex", f"{home}/.codex", ""),
+        ("codex custom home", "codex", f"{home}/.codex-work", "~/.codex-work"),
+        ("home outside $HOME is private", "claude", "/private/var/claude-x", ""),
+        ("relative home is not a location", "claude", ".claude-x", ""),
+        ("shell metacharacters never publish", "claude", f"{home}/a b;rm", ""),
+        ("unknown agent carries no home", "qwen", proxy, ""),
+    ]
+    for name, agent, raw, want in cases:
+        got = w.public_config_home(agent, raw, cfg)
+        if got != want:
+            failed += 1
+            print(f"FAIL  config home: {name}: got={got!r} want={want!r}")
+    if w.public_config_home("claude", proxy, {"denylist": ["subrouter"], "hide": set()}):
+        failed += 1
+        print("FAIL  config home: a denied term must drop the home, not publish a scrubbed path")
+
+    resume_cases = [
+        ("claude", "sid-1", "", "claude --resume sid-1"),
+        ("claude", "sid-1", public_proxy,
+         f'CLAUDE_CONFIG_DIR="$HOME/.subrouter/codex/claude-proxy/08da27d88f7880497c095fb0" '
+         f"claude --resume sid-1"),
+        ("codex", "rid-2", "~/.codex-work", 'CODEX_HOME="$HOME/.codex-work" codex resume rid-2'),
+        ("claude", "", public_proxy, ""),
+        ("claude", "sid-1", "/abs/not-public", "claude --resume sid-1"),
+    ]
+    for agent, sid, ch, want in resume_cases:
+        got = w.resume_command(agent, sid, ch)
+        if got != want:
+            failed += 1
+            print(f"FAIL  resume command {agent}/{ch!r}: got={got!r} want={want!r}")
+    # The prefixed line must actually hand the agent the right home when run.
+    line = w.resume_command("claude", "sid-1", public_proxy)
+    probe = subprocess.run(["/bin/sh", "-c", line.replace("claude --resume sid-1",
+                                                          "printenv CLAUDE_CONFIG_DIR")],
+                           capture_output=True, text=True,
+                           env={"HOME": home, "PATH": "/usr/bin:/bin"})
+    if probe.stdout.strip() != proxy:
+        failed += 1
+        print(f"FAIL  resume command does not set the home in a shell: {probe.stdout!r}")
+
+    transcripts = [
+        (f"{proxy}/projects/-Users-me-Code-pulp/abc.jsonl", ("claude", proxy)),
+        (f"{home}/.claude/projects/-Users-me/abc.jsonl", ("claude", f"{home}/.claude")),
+        (f"{home}/.codex/sessions/2026/09/30/rollout-2026-x.jsonl", ("codex", f"{home}/.codex")),
+        ("", ("", "")),
+        (f"{home}/notes/abc.jsonl", ("", "")),
+    ]
+    for tp, want in transcripts:
+        got = w.transcript_config_home(tp)
+        if got != want:
+            failed += 1
+            print(f"FAIL  transcript config home {tp!r}: got={got!r} want={want!r}")
+
+    # collect(): the env var names the home and the resume line carries it.
+    with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sid-9",
+                                      "CLAUDE_CONFIG_DIR": proxy, "HOME": home}, clear=True), \
+         mock.patch.object(w, "host_label", return_value="m5"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("", "")), \
+         mock.patch.object(w, "_process_ancestry", return_value=[]), \
+         mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+        p = w.collect(cfg, "o/r")
+    want_resume = w.resume_command("claude", "sid-9", public_proxy)
+    if p.get("config_home") != public_proxy or p.get("resume") != want_resume:
+        failed += 1
+        print(f"FAIL  collect: config_home={p.get('config_home')!r} resume={p.get('resume')!r}")
+    ft = w.footer(p, {"hide": set()}, [])
+    marker = json.loads(ft.split("<!-- whence ", 1)[1].split(" -->", 1)[0]
+                        .replace("\\u002d", "-"))
+    if (marker["prov"].get("config_home") != public_proxy
+            or "CLAUDE_CONFIG_DIR=" not in ft or "| **Config home** |" not in ft):
+        failed += 1
+        print(f"FAIL  footer does not carry the config home: {marker['prov']!r}")
+    with mock.patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE_SESSION_ID": "sid-9",
+                                      "HOME": home}, clear=True), \
+         mock.patch.object(w, "host_label", return_value="m5"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "cmux_tab_title", return_value=("", "")), \
+         mock.patch.object(w, "_process_ancestry", return_value=[]), \
+         mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
+        plain = w.collect(cfg, "o/r")
+    if plain.get("config_home") or plain.get("resume") != "claude --resume sid-9":
+        failed += 1
+        print(f"FAIL  default home changed the stamp: {plain.get('resume')!r}")
+
+    # Hook: the transcript's home outranks a leaked variable, for the same agent only.
+    p = {"agent": "claude", "config_home": "~/.leaked"}
+    w.apply_hook_config_home(p, "claude", proxy, cfg)
+    q = {"agent": "codex", "config_home": "~/.codex-work"}
+    w.apply_hook_config_home(q, "claude", proxy, cfg)
+    r = {"agent": "qwen", "config_home": "~/.leaked"}
+    w.apply_hook_config_home(r, "", "", cfg)
+    d = {"agent": "claude", "config_home": "~/.leaked"}
+    w.apply_hook_config_home(d, "claude", f"{home}/.claude", cfg)
+    if (p["config_home"] != public_proxy or q["config_home"] != "~/.codex-work"
+            or r["config_home"] or d["config_home"]):
+        failed += 1
+        print(f"FAIL  hook config home precedence: {p} {q} {r} {d}")
+
+    if not failed:
+        print("ok    config home: stamped and carried into the resume line when not the default")
+    return failed
+
+
 def main() -> int:
     failed = 0
 
@@ -2461,6 +2579,9 @@ def main() -> int:
 
     # ── Self-heal: wire the hook into the config dir the session actually reads ──
     failed += self_heal_checks()
+
+    # ── A session in its own config home resumes from any shell ──
+    failed += config_home_checks()
 
     # ── A missed stamp is detectable ──
     listing = json.dumps([
