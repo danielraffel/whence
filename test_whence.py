@@ -2180,9 +2180,17 @@ def main() -> int:
         rw["other-author"] = both(ledger, k_amend, [rw_pr(701, same_diff, T0 + 60)])
         # 1g. The captured change reached main through other work; a later PR
         #     rebased onto that main carries it only as main history.
+        #     The cherry-pick lands on the same parent as `captured` with the
+        #     same author, message and tree, so it must carry its own committer
+        #     date: inherited from the clock, it reproduces `captured`'s exact
+        #     SHA whenever both commits fall in the same second, and the case
+        #     silently becomes "the captured commit itself is on main".
         git("checkout", "-q", "-b", "landed", base)
-        git("cherry-pick", captured)
+        subprocess.run(["git", "-C", str(repo), "cherry-pick", captured],
+                       check=True, capture_output=True,
+                       env={**os.environ, "GIT_COMMITTER_DATE": "2001-01-01T00:00:00Z"})
         landed_main = git("rev-parse", "HEAD")
+        assert landed_main != captured, "via-main must land a distinct commit"
         saved_main = git("rev-parse", "refs/remotes/origin/main")
         git("update-ref", "refs/remotes/origin/main", landed_main)
         later = change("later.txt", "later\n", "feat: later work")
