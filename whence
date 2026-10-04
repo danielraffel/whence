@@ -2237,6 +2237,28 @@ def repo_is_private(client: str, repo: str) -> bool | None:
     return {"true": True, "false": False}.get(out)
 
 
+def stamped_body(body: str, footer_text: str) -> str:
+    """`body` with whence's marked block set to `footer_text`.
+
+    Only the block between `<!-- whence ... -->` and `<!-- /whence -->` is
+    whence's; every other line is the author's and is kept as written. An
+    existing block is replaced where it stands; a body without one gets the
+    block appended. An empty `footer_text` removes the block."""
+    body = body or ""
+    blocks = list(MARK_RE.finditer(body))
+    if blocks:
+        first = blocks[0]
+        # Keep the newline that ended the old block, so a replay is byte-equal.
+        block = (footer_text + ("\n" if first.group(0).endswith("\n") else "")
+                 if footer_text else "")
+        # A second block is a stale duplicate; it goes, and nothing else does.
+        rest = MARK_RE.sub("", body[first.end():])
+        replaced = body[:first.start()] + block + rest
+        return replaced if footer_text else replaced.rstrip() + "\n"
+    stripped = body.rstrip()
+    return (stripped + "\n\n" + footer_text) if footer_text else (stripped + "\n")
+
+
 def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool,
                 repo: str = "", source: str = "manual") -> list:
     """Write the labels + footer for provenance `p` onto PR #pr. Idempotent:
@@ -2316,9 +2338,15 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
             if not numbered_labels_converged(current, keep, cfg):
                 raise RuntimeError(
                     f"whence: PR #{pr} numbered labels did not converge: {current!r}")
-    stripped = MARK_RE.sub("", body).rstrip()
-    newbody = (stripped + "\n\n" + ft) if post_footer else (stripped + "\n")
-    if newbody != body:
+    # The label calls above take seconds, and other writers (the author, a
+    # concurrent hook or sweep) edit the body meanwhile. Rebuild from a body
+    # read now, not the one read at the start, or their edits are lost. This
+    # narrows the race to one request; it does not close it: an edit landing
+    # between this read and the write below is still overwritten.
+    current = github_call(
+        client, "pr", "view", pr, *R, "--json", "body", "-q", ".body").stdout
+    newbody = stamped_body(current, ft if post_footer else "")
+    if newbody != current:
         update_issue_body(client, target_repo, pr, newbody)
     after = {"labels": names, "prov": prior_prov(ft)}
     if before != after:                       # only log a real change, not a no-op re-stamp
