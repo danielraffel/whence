@@ -2458,6 +2458,36 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
     return False, False, None
 
 
+def output_pr_url_counts(cmd: str) -> bool:
+    """Whether a PR URL in this command's output means the command opened a PR.
+
+    The output outranks the command name so that any wrapper which opens a PR
+    is caught. But a GitHub CLI call that is not ``pr create`` (posting a
+    review comment, viewing or listing PRs, any ``api`` call) also prints PR
+    URLs, and stamping on those re-wrote a body an author was editing at the
+    same moment. So a URL counts unless the command is GitHub CLI calls only,
+    none of which opens a PR.
+    """
+    saw_cli = False
+    for tokens in _simple_shell_commands(cmd):
+        i = 0
+        while i < len(tokens) and _ASSIGN_TOKEN_RE.match(tokens[i]):
+            i += 1
+        argv = _peel_command_wrappers(tokens[i:])
+        if not argv or argv[0] == "cd":
+            continue
+        exe = os.path.basename(os.path.expanduser(argv[0]))
+        if exe in ("gh", "ghapp"):
+            if argv[1:3] == ["pr", "create"]:
+                return True
+            saw_cli = True
+            continue
+        if exe in ("cat", "printf", "echo", "jq", "head", "tail", "tee", "true"):
+            continue
+        return True
+    return not saw_cli
+
+
 def command_provenance_context(cmd: str) -> dict[str, str]:
     """Read only literal context supplied to the PR-opening command.
 
@@ -3830,7 +3860,7 @@ def main() -> int:
         # The output outranks the command name: anything that printed a PR URL
         # opened a PR, no matter which wrapper it was spelled with.
         cmd_is_pr, cmd_is_push, _action_cwd = _command_action(hook_cmd)
-        hook_is_pr = bool(hook_pr) or cmd_is_pr
+        hook_is_pr = (bool(hook_pr) and output_pr_url_counts(hook_cmd)) or cmd_is_pr
         hook_is_push = cmd_is_push or bool(hook_slug and hook_br)
         if not (hook_is_pr or hook_is_push):
             return 0
