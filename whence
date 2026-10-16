@@ -547,10 +547,25 @@ def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list
     return rows, row
 
 
-# Set only while collect() runs: the tab title, the ref and the cmux ids of
-# one stamp then come from one lookup, so the hook asks cmux once, not three
-# times. Outside collect() every lookup is live (the sweep re-reads titles).
+# Set only inside one stamp (collect(), or the sweep publishing one PR): the
+# tab title, the ref and the cmux ids then come from one lookup. A surface cmux
+# cannot find costs a full scan of every workspace (about 44 calls, ~3.5 s),
+# and without this the ref fallback after a blank title repeated it. Between
+# stamps every lookup is live, so the sweep still re-reads settled titles.
 _CMUX_LOOKUP_CACHE: dict[tuple[str, str], tuple[list, dict | None, dict]] | None = None
+
+
+@contextlib.contextmanager
+def _cmux_lookup_scope():
+    global _CMUX_LOOKUP_CACHE
+    outer = _CMUX_LOOKUP_CACHE
+    if outer is None:
+        _CMUX_LOOKUP_CACHE = {}
+    try:
+        yield
+    finally:
+        if outer is None:
+            _CMUX_LOOKUP_CACHE = None
 
 
 def _cmux_surface_lookup(surface_id: str, workspace_id: str = ""
@@ -1016,12 +1031,8 @@ def derive_launch(env: dict[str, str], agent: str, origin_kind: str = "",
 
 
 def collect(cfg: dict | None = None, repo: str = "") -> dict:
-    global _CMUX_LOOKUP_CACHE
-    _CMUX_LOOKUP_CACHE = {}
-    try:
+    with _cmux_lookup_scope():
         return _collect(cfg, repo)
-    finally:
-        _CMUX_LOOKUP_CACHE = None
 
 
 def _collect(cfg: dict | None = None, repo: str = "") -> dict:
@@ -3168,8 +3179,9 @@ def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
     with _publication_lock(key, deadline=lock_deadline) as acquired:
         if not acquired:
             return False
-        return _publish_ledger_pr_serialized(
-            key, expected_head, pr, body, cfg, source)
+        with _cmux_lookup_scope():
+            return _publish_ledger_pr_serialized(
+                key, expected_head, pr, body, cfg, source)
 
 
 def _publish_ledger_pr_serialized(key: str, expected_head: str, pr: str,

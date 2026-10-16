@@ -2621,6 +2621,62 @@ def main() -> int:
     else:
         print("ok    six cmux ids recorded; jump is focus-pane by UUID; relaunch is one paste")
 
+    # Inside one stamp a surface cmux cannot find is searched once: the ref
+    # fallback after a blank title reuses the scan instead of repeating ~44 RPCs.
+    scan_calls = []
+    def scan_run(*args, **kwargs):
+        argv = list(args)
+        scan_calls.append(argv)
+        if argv[:3] == ["cmux", "rpc", "workspace.list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"workspaces": [{"id": f"WS-{i}"} for i in range(20)]}), "")
+        if argv[:3] == ["cmux", "rpc", "surface.list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"surfaces": []}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with mock.patch.object(w, "sh", side_effect=scan_run):
+        with w._cmux_lookup_scope():
+            w.cmux_tab_title("S-GONE", "")
+            one_scan = len(scan_calls)
+            w._surface_ref("S-GONE", "")
+            w.cmux_identity("S-GONE", "")
+            scoped = len(scan_calls)
+        scan_calls.clear()
+        w.cmux_tab_title("S-GONE", "")
+        w._surface_ref("S-GONE", "")
+        unscoped = len(scan_calls)
+    if one_scan < 20 or scoped != one_scan or unscoped != 2 * one_scan:
+        failed += 1
+        print(f"FAIL  one cmux scan per stamp: one={one_scan} scoped={scoped} unscoped={unscoped}")
+    else:
+        print("ok    a stamp searches cmux once; the ref fallback reuses the scan")
+
+    # collect() asks the tab's own workspace first (CMUX_WORKSPACE_ID).
+    first_ws = []
+    def own_ws_run(*args, **kwargs):
+        argv = list(args)
+        if argv[:3] == ["cmux", "rpc", "surface.list"]:
+            first_ws.append(json.loads(argv[3])["workspace_id"] if len(argv) > 3 else "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "workspace_id": "WS-AGENT", "workspace_ref": "workspace:9",
+                "surfaces": [{"id": "S-AGENT", "ref": "surface:3", "title": "Fix queue",
+                              "pane_id": "P-AGENT", "pane_ref": "pane:4"}]}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with mock.patch.dict(w.os.environ, {"CODEX_SESSION_ID": "c9"}, clear=True), \
+         mock.patch.object(w, "_process_ancestry", return_value=[]), \
+         mock.patch.object(w, "_launch_env", return_value={
+             "CMUX_SURFACE_ID": "S-AGENT", "CMUX_WORKSPACE_ID": "WS-AGENT"}), \
+         mock.patch.object(w, "host_label", return_value="m5s"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "sh", side_effect=own_ws_run):
+        own = w.collect({"denylist": [], "hide": set()}, "o/r")
+    if (not first_ws or first_ws[0] != "WS-AGENT" or own.get("tab") != "Fix queue"
+            or own.get("jump") != "cmux focus-pane --pane P-AGENT --workspace WS-AGENT"):
+        failed += 1
+        print(f"FAIL  collect own workspace first: calls={first_ws!r} tab={own.get('tab')!r} "
+              f"jump={own.get('jump')!r}")
+    else:
+        print("ok    collect asks the tab's own workspace first")
+
     # check-labels reads open PRs and names every missing or repeated class.
     listing = subprocess.CompletedProcess([], 0, json.dumps([
         {"number": 1, "headRefName": "a", "author": {"login": "x"},
