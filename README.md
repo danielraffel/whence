@@ -23,6 +23,17 @@ follow-up you have no idea which of your twelve open sessions to go ask.
   as a "workspace" label it is at best a duplicate and at worst a *different* tab's
   title, which reads like whence mislabelled the PR. Name a workspace to opt into
   the label; leave it unnamed and you get agent/host/tab only.
+### No footer on a public repository
+
+The footer carries the working directory, the host, the session id and the
+terminal ids. whence reads the repository's visibility before every stamp and
+leaves the footer off a public repository, or one whose visibility it cannot
+read, removing any footer an earlier stamp left there. Labels still go up, and
+the full provenance stays in the local branch ledger
+(`~/.config/whence/branch-ledger.json`). A private repository keeps its
+footer. To publish it on public repositories too, set
+`"public_footer": true` in the config.
+
 ### Keeping names you can\'t publish off a public PR
 
 cmux derives a tab\'s title from the agent\'s prompt, so a title like *"port the
