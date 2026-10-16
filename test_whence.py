@@ -720,7 +720,8 @@ def main() -> int:
     stamp_prov = {field: "" for field in w.FIELDS}
     stamp_prov.update({"agent": "codex", "host": "m5", "stamped": "now"})
     with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
-         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=stateful):
+         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=stateful), \
+         mock.patch.object(w, "repo_is_private", return_value=True):
         first_names = w.apply_stamp(
             "24", stamp_prov, stamp_cfg, True, True,
             repo="danielraffel/whence", source="test")
@@ -754,6 +755,49 @@ def main() -> int:
               f"mutations={stateful.mutations!r}")
     else:
         print("ok    ghapp provenance API covers create/recolor/remove/body/resolve and replay")
+
+    # A public repository never gets the footer: it carries the working
+    # directory, host, session and terminal ids. An earlier stamp's footer is
+    # removed, labels still go up, and a private repository keeps its footer.
+    def stamp_visibility(private, cfg_extra=None):
+        github = StatefulGitHub()
+        github.body = "Body\n\n<!-- whence {\"path\": \"/Users/x/work\"} -->\nold\n<!-- /whence -->\n"
+        cfg = dict(stamp_cfg, **(cfg_extra or {}))
+        prov = {field: "" for field in w.FIELDS}
+        prov.update({"agent": "codex", "host": "m5", "stamped": "now"})
+        with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
+             mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=github), \
+             mock.patch.object(w, "repo_is_private", return_value=private):
+            names = w.apply_stamp("24", prov, cfg, True, True,
+                                  repo="danielraffel/whence", source="test")
+        return github.body, names, github.issue_labels
+
+    public_body, public_names, public_labels = stamp_visibility(False)
+    unknown_body, _, _ = stamp_visibility(None)
+    private_body, _, _ = stamp_visibility(True)
+    optin_body, _, _ = stamp_visibility(False, {"public_footer": True})
+    if ("<!-- whence" in public_body or "/Users/x" in public_body
+            or not public_body.startswith("Body")
+            or set(public_names) != public_labels or not public_names
+            or "<!-- whence" in unknown_body
+            or "<!-- whence" not in private_body
+            or "<!-- whence" not in optin_body):
+        failed += 1
+        print(f"FAIL  public repo footer: public={public_body!r} unknown={unknown_body!r} "
+              f"private={private_body!r} opt-in={optin_body!r} labels={public_labels!r}")
+    else:
+        print("ok    public repo gets labels but no footer; an old footer is removed; private keeps it")
+
+    visibility = [subprocess.CompletedProcess([], 0, "false\n", ""),
+                  subprocess.CompletedProcess([], 0, "true\n", ""),
+                  subprocess.CompletedProcess([], 0, "maybe\n", "")]
+    with mock.patch.object(w, "github_call", side_effect=visibility + [RuntimeError("404")]):
+        seen = [w.repo_is_private(app, "o/r") for _ in range(4)]
+    if seen != [False, True, None, None]:
+        failed += 1
+        print(f"FAIL  repo_is_private: {seen!r}")
+    else:
+        print("ok    repo_is_private reads GitHub's flag and is None when unreadable")
 
     label_pages = lambda labels: subprocess.CompletedProcess(
         [], 0, json.dumps([[{"name": n, "color": c} for n, c in labels.items()]]), "")

@@ -148,6 +148,10 @@ DEFAULT_CONFIG = {
     # alphabetically) renders agent -> host -> workspace -> tab -> route. The footer
     # table already shows this order and stays clean; only the chips get the prefix.
     "order_labels": False,
+    # The footer carries a session id, the working directory, host and terminal
+    # ids. A public repository never gets it unless this is true; its labels
+    # still go up, and the full provenance stays in the local branch ledger.
+    "public_footer": False,
 }
 
 
@@ -419,7 +423,7 @@ def load_config(cli_hide: str) -> dict:
            "provenance": {"default": {}, "repositories": {}},
            "footer": True, "labels": True, "gh": "", "label_maxlen": 24,
            "denylist": [], "redact_placeholder": "(redacted)", "audit_log": False,
-           "order_labels": False}
+           "order_labels": False, "public_footer": False}
     f = CFG_DIR / "config.json"
     if f.exists():
         try:
@@ -448,6 +452,7 @@ def load_config(cli_hide: str) -> dict:
             "denylist", [str(x).lower() for x in v if str(x).strip()]))
         field("redact_placeholder", lambda v: cfg.__setitem__("redact_placeholder", str(v)))
         field("audit_log", lambda v: cfg.__setitem__("audit_log", bool(v)))
+        field("public_footer", lambda v: cfg.__setitem__("public_footer", bool(v)))
         field("order_labels", lambda v: cfg.__setitem__("order_labels", bool(v)))
         # "fields": {"host": false, ...} — the easy per-field on/off switch.
         field("fields", lambda v: [cfg["hide"].add(n) for n, on in v.items() if not on])
@@ -2088,6 +2093,16 @@ def _audit(cfg: dict, record: dict) -> None:
         pass
 
 
+def repo_is_private(client: str, repo: str) -> bool | None:
+    """True or False from GitHub's `private` flag; None when it cannot be read."""
+    try:
+        out = github_call(client, "api", f"repos/{repo}", "--jq", ".private",
+                          repo=repo).stdout.strip()
+    except RuntimeError:
+        return None
+    return {"true": True, "false": False}.get(out)
+
+
 def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool,
                 repo: str = "", source: str = "manual") -> list:
     """Write the labels + footer for provenance `p` onto PR #pr. Idempotent:
@@ -2112,6 +2127,12 @@ def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: boo
     client = github_client_for_repo(
         GH, target_repo, explicit=bool(os.environ.get("WHENCE_GH")))
     R = ["--repo", target_repo]
+    # The footer publishes local paths, the host and session ids. On a public
+    # repository (or one whose visibility cannot be read) it is left off, and
+    # any footer an earlier stamp wrote is removed below.
+    if post_footer and not cfg.get("public_footer") \
+            and repo_is_private(client, target_repo) is not True:
+        post_footer = False
     labels = labels_for(p, cfg) if post_labels else []
     names = [n for n, _ in labels]
     body = github_call(
