@@ -547,8 +547,24 @@ def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list
     return rows, row
 
 
+# Set only while collect() runs: the tab title, the ref and the cmux ids of
+# one stamp then come from one lookup, so the hook asks cmux once, not three
+# times. Outside collect() every lookup is live (the sweep re-reads titles).
+_CMUX_LOOKUP_CACHE: dict[tuple[str, str], tuple[list, dict | None, dict]] | None = None
+
+
 def _cmux_surface_lookup(surface_id: str, workspace_id: str = ""
                          ) -> tuple[list, dict | None, dict]:
+    if _CMUX_LOOKUP_CACHE is None:
+        return _cmux_surface_lookup_uncached(surface_id, workspace_id)
+    key = (surface_id or "", workspace_id or "")
+    if key not in _CMUX_LOOKUP_CACHE:
+        _CMUX_LOOKUP_CACHE[key] = _cmux_surface_lookup_uncached(surface_id, workspace_id)
+    return _CMUX_LOOKUP_CACHE[key]
+
+
+def _cmux_surface_lookup_uncached(surface_id: str, workspace_id: str = ""
+                                  ) -> tuple[list, dict | None, dict]:
     """(surfaces of the workspace holding `surface_id`, that surface's row).
 
     `cmux rpc surface.list` with no parameters lists only the window's SELECTED
@@ -631,12 +647,20 @@ def relaunch_command(surface_id: str) -> str:
 
 
 def worktree_name(cwd: str) -> str:
-    """The basename of the git checkout `cwd` is in, or ""."""
+    """The basename of the git checkout `cwd` is in, or "".
+
+    Found by looking for `.git` in `cwd` and its parents, with no subprocess:
+    the PostToolUse hook runs on every tool call, so it must not fork git."""
     if not cwd:
         return ""
-    r = sh("git", "-C", cwd, "rev-parse", "--show-toplevel")
-    top = (r.stdout or "").strip() if r.returncode == 0 else ""
-    return stable_identifier(os.path.basename(top), maxlen=120) if top else ""
+    current = pathlib.Path(cwd)
+    for folder in (current, *current.parents):
+        try:
+            if (folder / ".git").exists():
+                return stable_identifier(folder.name, maxlen=120)
+        except OSError:
+            return ""
+    return ""
 
 
 def cmux_tab_title(surface_id: str, workspace_id: str = "") -> tuple[str, str]:
@@ -992,6 +1016,15 @@ def derive_launch(env: dict[str, str], agent: str, origin_kind: str = "",
 
 
 def collect(cfg: dict | None = None, repo: str = "") -> dict:
+    global _CMUX_LOOKUP_CACHE
+    _CMUX_LOOKUP_CACHE = {}
+    try:
+        return _collect(cfg, repo)
+    finally:
+        _CMUX_LOOKUP_CACHE = None
+
+
+def _collect(cfg: dict | None = None, repo: str = "") -> dict:
     explicit_agent = stable_identifier(os.environ.get("WHENCE_AGENT", ""))
     agent = explicit_agent or os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
