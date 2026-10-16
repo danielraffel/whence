@@ -821,7 +821,7 @@ def main() -> int:
     private_body, _, _ = stamp_visibility(True)
     optin_body, _, _ = stamp_visibility(False, {"public_footer": True})
     if ("<!-- whence" in public_body or "/Users/x" in public_body
-            or not public_body.startswith("Body")
+            or public_body != "Body\n"
             or set(public_names) != public_labels or not public_names
             or "<!-- whence" in unknown_body
             or "<!-- whence" not in private_body
