@@ -535,46 +535,75 @@ def cmux_workspace(ws_id: str, surface_id: str = "") -> str:
     return ""
 
 
-def cmux_tab_title(surface_id: str) -> tuple[str, str]:
+def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list, dict | None]:
+    """(surfaces of the workspace holding `surface_id`, that surface's row).
+
+    `cmux rpc surface.list` with no parameters lists only the window's SELECTED
+    workspace. An agent in any other workspace (a Codex tab on a host whose
+    focused workspace is elsewhere) is not in that list, which left its tab
+    label and ref empty (`lookup_failed`). So ask its own workspace first, then
+    the selected one, then every workspace cmux reports."""
+    if not surface_id:
+        return [], None
+    def listing(ws: str) -> list:
+        r = (sh("cmux", "rpc", "surface.list", json.dumps({"workspace_id": ws}))
+             if ws else sh("cmux", "rpc", "surface.list"))
+        if r.returncode != 0:
+            return []
+        try:
+            rows = json.loads(r.stdout).get("surfaces", [])
+        except Exception:
+            return []
+        return rows if isinstance(rows, list) else []
+    tried = []
+    for ws in ([workspace_id] if workspace_id else []) + [""]:
+        rows = listing(ws)
+        tried.append(ws)
+        for row in rows:
+            if isinstance(row, dict) and row.get("id") == surface_id:
+                return rows, row
+    r = sh("cmux", "rpc", "workspace.list")
+    if r.returncode == 0:
+        try:
+            workspaces = json.loads(r.stdout).get("workspaces", [])
+        except Exception:
+            workspaces = []
+        for item in workspaces if isinstance(workspaces, list) else []:
+            ws = item.get("id") if isinstance(item, dict) else ""
+            if not ws or ws in tried:
+                continue
+            rows = listing(ws)
+            for row in rows:
+                if isinstance(row, dict) and row.get("id") == surface_id:
+                    return rows, row
+    return [], None
+
+
+def cmux_tab_title(surface_id: str, workspace_id: str = "") -> tuple[str, str]:
     """The per-tab (surface) title — the name you navigate by — plus its cmux
     ref (e.g. `surface:13`) ONLY when another tab shares the same title (so two
     "pulp" tabs are tellable apart, but unique names stay clean). JSON-driven
-    from `cmux rpc surface.list`; re-running whence re-reads the current title."""
-    if not surface_id:
+    from `cmux rpc surface.list` over the surface's own workspace; re-running
+    whence re-reads the current title."""
+    rows, mine = _cmux_surface_listing(surface_id, workspace_id)
+    if mine is None:
         return "", ""
-    r = sh("cmux", "rpc", "surface.list")
-    if r.returncode == 0:
-        try:
-            surfaces = json.loads(r.stdout).get("surfaces", [])
-            counts, mine = {}, None
-            for s in surfaces:
-                t = clean_title(s.get("title") or "")
-                counts[t] = counts.get(t, 0) + 1
-                if s.get("id") == surface_id:
-                    mine = (t, s.get("ref") or "")
-            if mine:
-                t, ref = mine
-                return t, (ref if t and counts.get(t, 0) > 1 else "")
-        except Exception:
-            pass
-    return "", ""
+    counts: dict[str, int] = {}
+    for row in rows:
+        if isinstance(row, dict):
+            t = clean_title(row.get("title") or "")
+            counts[t] = counts.get(t, 0) + 1
+    t = clean_title(mine.get("title") or "")
+    ref = mine.get("ref") or ""
+    return t, (ref if t and counts.get(t, 0) > 1 else "")
 
 
-def _surface_ref(surface_id: str) -> str:
+def _surface_ref(surface_id: str, workspace_id: str = "") -> str:
     """This surface's cmux ref (`surface:16`) — a stable, name-free handle we can
     show when the real title can't be published. Navigation never needs the title:
     the footer's jump command uses the surface UUID regardless."""
-    if not surface_id:
-        return ""
-    r = sh("cmux", "rpc", "surface.list")
-    if r.returncode == 0:
-        try:
-            for sfc in json.loads(r.stdout).get("surfaces", []):
-                if sfc.get("id") == surface_id:
-                    return sfc.get("ref") or ""
-        except Exception:
-            pass
-    return ""
+    _, mine = _cmux_surface_listing(surface_id, workspace_id)
+    return (mine.get("ref") or "") if mine else ""
 
 
 def denied(value: str, cfg: dict) -> str:
@@ -928,7 +957,7 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
     p["agent"] = agent
     p["host"] = host_label()
     p["workspace"] = cmux_workspace(env.get("CMUX_WORKSPACE_ID", ""), surface)
-    tab, ref = cmux_tab_title(surface)
+    tab, ref = cmux_tab_title(surface, env.get("CMUX_WORKSPACE_ID", ""))
     if tab:
         p["tab"] = f"{tab} ({ref})" if ref else tab
         p["origin_state"] = (origin_kind if origin_kind in ("automation", "external")
@@ -937,7 +966,7 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         # cmux shows only a status glyph (🏃/spinner) while the agent is busy, which
         # cleans to empty exactly when a PR is opened. A name-free ref beats a blank
         # label, and the sweep upgrades it to the real name once the title settles.
-        p["tab"] = _surface_ref(surface)
+        p["tab"] = _surface_ref(surface, env.get("CMUX_WORKSPACE_ID", ""))
         p["origin_state"] = (origin_kind if origin_kind in ("automation", "external")
                              else "lookup_failed" if surface else "unnamed")
     if agent == "unresolved":
