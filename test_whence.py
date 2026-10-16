@@ -756,6 +756,46 @@ def main() -> int:
     else:
         print("ok    ghapp provenance API covers create/recolor/remove/body/resolve and replay")
 
+    # surface.list with no parameters lists only the SELECTED workspace. A tab in
+    # another workspace (m5s, 2026-10-16: Codex PRs with no 3·/4· labels and
+    # origin_state lookup_failed) must still be found: its own workspace first,
+    # then every workspace.
+    def fake_cmux(selected, by_ws):
+        calls = []
+        def run(*args, **kwargs):
+            argv = list(args)
+            calls.append(argv)
+            if argv[:3] == ["cmux", "rpc", "surface.list"]:
+                ws = json.loads(argv[3])["workspace_id"] if len(argv) > 3 else selected
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"workspace_id": ws, "surfaces": by_ws.get(ws, [])}), "")
+            if argv[:3] == ["cmux", "rpc", "workspace.list"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, json.dumps({"workspaces": [{"id": k} for k in by_ws]}), "")
+            return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+        return run, calls
+
+    workspaces = {
+        "WS-SELECTED": [{"id": "S-OTHER", "ref": "surface:1", "title": "Coordinator"}],
+        "WS-AGENT": [{"id": "S-AGENT", "ref": "surface:71", "title": "Fix queue"},
+                     {"id": "S-TWIN", "ref": "surface:72", "title": "Fix queue"}],
+    }
+    run, calls = fake_cmux("WS-SELECTED", workspaces)
+    with mock.patch.object(w, "sh", side_effect=run):
+        own = w.cmux_tab_title("S-AGENT", "WS-AGENT")
+        own_calls = len(calls)
+        scanned = w.cmux_tab_title("S-AGENT", "")
+        ref_only = w._surface_ref("S-AGENT", "")
+        missing = w.cmux_tab_title("S-GONE", "")
+    if (own != ("Fix queue", "surface:71") or own_calls != 1
+            or scanned != ("Fix queue", "surface:71") or ref_only != "surface:71"
+            or missing != ("", "")):
+        failed += 1
+        print(f"FAIL  tab lookup across workspaces: own={own!r} calls={own_calls} "
+              f"scanned={scanned!r} ref={ref_only!r} missing={missing!r}")
+    else:
+        print("ok    a tab outside the selected workspace still gets its title and ref")
+
     # A public repository never gets the footer: it carries the working
     # directory, host, session and terminal ids. An earlier stamp's footer is
     # removed, labels still go up, and a private repository keeps its footer.
@@ -2465,7 +2505,7 @@ def main() -> int:
              mock.patch.object(w, "host_label", return_value="m5"), \
              mock.patch.object(w, "cmux_workspace", side_effect=lambda ws, s="": ws[:4]), \
              mock.patch.object(w, "cmux_tab_title",
-                               side_effect=lambda s: (tab_calls.append(s) or ("Fix queue", "") if s else ("", ""))), \
+                               side_effect=lambda s, ws="": (tab_calls.append(s) or ("Fix queue", "") if s else ("", ""))), \
              mock.patch.object(w, "sh", return_value=subprocess.CompletedProcess([], 1, "", "")):
             return w.collect({"denylist": [], "hide": set()}, "Generous-Corp/pulp")
     codex_env = {"CODEX_SESSION_ID": "019a-codex", "SUBROUTER_CODEX_LAUNCHER": "subrouter",
