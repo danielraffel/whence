@@ -2217,7 +2217,15 @@ def main() -> int:
         home, bindir = root / "home", root / "bin"
         cfg_dir = home / ".config" / "whence"
         cfg_dir.mkdir(parents=True); bindir.mkdir()
-        (cfg_dir / ".last-selfupdate").write_text(str(int(time.time())))
+        # The self-update throttle is due (no .last-selfupdate) and a fake git
+        # records any pull: the hook must leave updating to the sweep timer.
+        pull_marker = root / "git-pulled"
+        fake_git = bindir / "git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            f'case " $* " in *" pull "*) echo "$*" >> \'{pull_marker}\';; esac\n'
+            'exec /usr/bin/git "$@"\n')
+        fake_git.chmod(0o755)
         gh_marker = root / "gh-called"
         fake_gh = bindir / "gh"
         fake_gh.write_text(
@@ -2242,15 +2250,19 @@ def main() -> int:
             if inherited.startswith("CMUX_") or inherited.startswith("WHENCE_"):
                 env.pop(inherited, None)
         started = time.monotonic()
-        hook_run = subprocess.run(
-            [sys.executable, str(pathlib.Path(__file__).parent / "whence"), "--hook"],
-            input=json.dumps(payload), env=env, capture_output=True, text=True,
-            timeout=1.5,
-        )
+        try:
+            hook_run = subprocess.run(
+                [sys.executable, str(pathlib.Path(__file__).parent / "whence"), "--hook"],
+                input=json.dumps(payload), env=env, capture_output=True, text=True,
+                timeout=1.5,
+            )
+        except subprocess.TimeoutExpired as e:
+            hook_run = subprocess.CompletedProcess(e.cmd, 124, "", "timed out")
         hook_elapsed = time.monotonic() - started
         hook_ledger = cfg_dir / "branch-ledger.json"
         hook_rows = json.loads(hook_ledger.read_text()) if hook_ledger.exists() else {}
         gh_called = gh_marker.exists()
+        hook_pulled = pull_marker.exists()
     if (hook_run.returncode != 0 or hook_elapsed > 1.0 or gh_called
             or "danielraffel/whence#fix/hook" not in hook_rows):
         failed += 1
@@ -2258,6 +2270,11 @@ def main() -> int:
               f"elapsed={hook_elapsed:.3f} gh_called={gh_called} rows={hook_rows!r}")
     else:
         print("ok    PostToolUse: records push and returns without a global sweep")
+    if hook_pulled:
+        failed += 1
+        print("FAIL  PostToolUse ran git pull; self-update belongs to the sweep")
+    else:
+        print("ok    PostToolUse never pulls, even with the self-update throttle due")
 
     # ── Regression: a review comment is not a PR opening ──
     # On 2026-10-04 a reviewer's comment on a PR quoted "`shipyard pr` does not
@@ -3081,6 +3098,92 @@ def main() -> int:
               f"throttled={second == want} sweeps={swept}")
     else:
         print("ok    the sweep tick fast-forwards the clone once a day and still sweeps")
+
+    # ── A pull killed at the timeout must not wedge every later pull ──
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        git = lambda cwd, *a: subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "commit.gpgsign=false", *a], capture_output=True, text=True)
+        origin, seed, clone = root / "origin.git", root / "seed", root / "clone"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                       capture_output=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(seed)], capture_output=True)
+        def advance(n):
+            (seed / "f").write_text(f"{n}\n"); git(seed, "add", "f")
+            git(seed, "commit", "-q", "-m", str(n)); git(seed, "push", "-q", "origin", "HEAD:main")
+            return git(seed, "rev-parse", "HEAD").stdout.strip()
+        advance(1)
+        subprocess.run(["git", "clone", "-q", str(origin), str(clone)], capture_output=True)
+        cfg_dir = root / "cfg"; cfg_dir.mkdir()
+        log = cfg_dir / "self-update.log"
+        logged = lambda: log.read_text() if log.exists() else ""
+        def plant(rel, age):
+            lock = clone / ".git" / rel
+            lock.parent.mkdir(parents=True, exist_ok=True); lock.write_text("")
+            t = time.time() - age
+            os.utime(lock, (t, t))
+            return lock
+        def update(running=False):
+            with mock.patch.object(w, "_self_clone", return_value=clone), \
+                 mock.patch.object(w, "CFG_DIR", cfg_dir), \
+                 mock.patch.object(w, "PR_HOOK", root / "absent-pr-hook"), \
+                 mock.patch.object(w, "HOOK_FILE", root / "absent-hook.sh"), \
+                 mock.patch.object(w, "_git_running_in", return_value=running), \
+                 mock.patch("sys.stderr", __import__("io").StringIO()):
+                w.self_update(force=True)
+            return git(clone, "rev-parse", "HEAD").stdout.strip()
+        head = lambda: git(clone, "rev-parse", "HEAD").stdout.strip()
+        old_age = w.STALE_GIT_LOCK_AGE + 60
+        # 1. Stale index and ref locks: removed, logged, and the pull lands.
+        two = advance(2)
+        stale = [plant("index.lock", old_age), plant("refs/heads/main.lock", old_age)]
+        cleared = (update() == two and not any(p.exists() for p in stale)
+                   and "removed stale git lock(s)" in logged()
+                   and "index.lock" in logged())
+        # 2. A fresh lock is a live git's: kept, and the failed pull is logged.
+        log.unlink(missing_ok=True)
+        before = head(); advance(3)
+        fresh = plant("index.lock", 1)
+        kept_fresh = (update() == before and fresh.exists()
+                      and "pull failed" in logged())
+        fresh.unlink(missing_ok=True)
+        # 3. An old lock while git is running in the clone: kept and logged.
+        log.unlink(missing_ok=True)
+        busy = plant("index.lock", old_age)
+        kept_busy = (update(running=True) == before and busy.exists()
+                     and "kept old git lock(s)" in logged())
+        busy.unlink(missing_ok=True)
+        # 4. And the next update, lock gone, catches up.
+        four = advance(4)
+        caught_up = update() == four
+    if not (cleared and kept_fresh and kept_busy and caught_up):
+        failed += 1
+        print(f"FAIL  stale git lock: cleared={cleared} kept_fresh={kept_fresh} "
+              f"kept_busy={kept_busy} caught_up={caught_up}")
+    else:
+        print("ok    a stale git lock is removed and logged; a live one is kept, and the failure logged")
+
+    # The busy check itself: a git process whose cwd is the clone counts.
+    with tempfile.TemporaryDirectory() as tmp:
+        clone = pathlib.Path(tmp)
+        sleeper = subprocess.Popen(["/bin/bash", "-c", "exec -a git-fake-busy sleep 300"],
+                                   cwd=tmp)
+        try:
+            time.sleep(0.2)
+            # Control: the instrument resolves the process's working directory.
+            cwd_seen = w._process_cwd(str(sleeper.pid))
+            busy_seen = w._git_running_in(clone)
+        finally:
+            try: sleeper.kill()
+            except OSError: pass      # already exited (macOS reports EPERM for a zombie)
+            sleeper.wait()
+        idle_seen = w._git_running_in(pathlib.Path(tmp) / "nowhere")
+    if not busy_seen or idle_seen or cwd_seen != os.path.realpath(tmp):
+        failed += 1
+        print(f"FAIL  git-running check: busy={busy_seen} idle={idle_seen} cwd={cwd_seen}")
+    else:
+        print("ok    a git process working in the clone blocks lock removal")
 
     # ── `whence --sweep` reaches sweep_tick ──
     # The module above is sliced before main(); load the whole script into its

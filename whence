@@ -3791,7 +3791,7 @@ def gc_labels(cfg: dict, repo: str) -> int:
 # ── Multi-machine sync: self-update (pull) + deploy (fan-out) ────────────────
 # Any machine can be the one you edit whence on. Two mechanisms keep the rest
 # current: self_update() converges each machine to origin/main automatically
-# (throttled, from the hook — no cron, no push from the author); deploy() pushes
+# (throttled, from the sweep timer — no push from the author); deploy() pushes
 # your change and SSHes your personal host list to pull+reinstall instantly. The
 # host list lives only in ~/.config/whence/hosts, never in the repo, because it's
 # specific to your fleet — other whence users don't need it.
@@ -3919,13 +3919,116 @@ def _self_clone() -> pathlib.Path:
 
 
 SELF_UPDATE_RETRY = 600  # seconds; one sweep interval
+# A pull is killed at PROCESS_TIMEOUT, which can leave a .git lock behind; a
+# lock older than this with no git process in the clone is one of those.
+STALE_GIT_LOCK_AGE = PROCESS_TIMEOUT * 2
+SELF_UPDATE_LOG = CFG_DIR / "self-update.log"
+
+
+def _self_update_log(msg: str) -> None:
+    """Note a self-update problem on stderr and in SELF_UPDATE_LOG (the sweep
+    runs under launchd with no output file, so stderr alone is lost)."""
+    line = f"{datetime.datetime.now(datetime.timezone.utc):%Y-%m-%dT%H:%M:%SZ} {msg}"
+    print(f"whence: {msg}", file=sys.stderr)
+    try:
+        log = CFG_DIR / SELF_UPDATE_LOG.name
+        log.parent.mkdir(parents=True, exist_ok=True)
+        old = log.read_text().splitlines()[-199:] if log.exists() else []
+        log.write_text("\n".join(old + [line]) + "\n")
+    except OSError:
+        pass
+
+
+def _git_locks(clone: pathlib.Path) -> list[pathlib.Path]:
+    gitdir = clone / ".git"
+    if not gitdir.is_dir():
+        return []
+    refs = gitdir / "refs"
+    return sorted(set(gitdir.glob("*.lock"))
+                  | (set(refs.rglob("*.lock")) if refs.is_dir() else set()))
+
+
+def _process_cwd(pid: str) -> str | None:
+    proc = pathlib.Path("/proc") / pid / "cwd"
+    if proc.exists():
+        try: return os.path.realpath(proc)
+        except OSError: return None
+    # lsof lives in /usr/sbin on macOS, which a reduced PATH can drop.
+    lsof = shutil.which("lsof") or next(
+        (c for c in ("/usr/sbin/lsof", "/usr/bin/lsof") if os.path.exists(c)), "lsof")
+    r = sh(lsof, "-a", "-p", pid, "-d", "cwd", "-Fn")
+    for line in r.stdout.splitlines():
+        if line.startswith("n"):
+            return os.path.realpath(line[1:])
+    return None
+
+
+def _git_running_in(clone: pathlib.Path) -> bool:
+    """Whether a git process may be working in `clone`. True whenever it cannot
+    tell, so a lock is never removed from under a live git."""
+    root = os.path.realpath(clone)
+    r = sh("ps", "-axo", "pid=,uid=,command=")
+    if r.returncode != 0:
+        return True
+    for line in r.stdout.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3 or fields[1] != str(os.getuid()):
+            continue      # a clone in this user's home is this user's to lock
+        pid, cmd = fields[0], fields[2]
+        argv0 = cmd.split(" ", 1)[0]
+        if not os.path.basename(argv0).startswith("git"):
+            continue
+        if root in cmd or str(clone) in cmd:
+            return True
+        cwd = _process_cwd(pid)
+        if cwd is None:
+            try:
+                os.kill(int(pid), 0)
+            except (ProcessLookupError, ValueError):
+                continue  # it exited between the listing and the lookup
+            except OSError:
+                pass
+            return True
+        if cwd == root or cwd.startswith(root + os.sep):
+            return True
+    return False
+
+
+def _clear_stale_git_locks(clone: pathlib.Path) -> list[str]:
+    """Remove locks a killed pull left behind; otherwise every later pull fails.
+    Returns the paths removed (relative to the clone)."""
+    now = time.time()
+    stale = []
+    for lock in _git_locks(clone):
+        try:
+            if now - lock.stat().st_mtime > STALE_GIT_LOCK_AGE:
+                stale.append(lock)
+        except OSError:
+            pass
+    if not stale:
+        return []
+    names = [str(lock.relative_to(clone)) for lock in stale]
+    if _git_running_in(clone):
+        _self_update_log(f"kept old git lock(s) in {clone}, a git process may be "
+                         f"using it: {', '.join(names)}")
+        return []
+    removed = []
+    for lock, name in zip(stale, names):
+        try:
+            lock.unlink()
+            removed.append(name)
+        except OSError as e:
+            _self_update_log(f"could not remove stale git lock {clone}/{name}: {e}")
+    if removed:
+        _self_update_log(f"removed stale git lock(s) in {clone}: {', '.join(removed)}")
+    return removed
 
 
 def self_update(force: bool = False) -> bool:
     """Fast-forward this whence clone to origin/main so every machine picks up a
-    change made on any other machine — no matter which one made it. Throttled to
-    once/day across the agent hook and the sweep timer; refreshes the installed
-    hooks only if the clone moved."""
+    change made on any other machine — no matter which one made it. Run by the
+    sweep timer and `--self-update`, throttled to once/day; refreshes the
+    installed hooks only if the clone moved. Problems go to SELF_UPDATE_LOG."""
     clone = _self_clone()
     if not (clone / ".git").exists():
         return False
@@ -3934,10 +4037,16 @@ def self_update(force: bool = False) -> bool:
     # holds the slot for the full day.
     if not force and not _throttled("selfupdate", 86400, claim=SELF_UPDATE_RETRY):
         return False
+    _clear_stale_git_locks(clone)
     before = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
-    pulled = _git(str(clone), "pull", "--ff-only", "--quiet").returncode == 0
+    pull = _git(str(clone), "pull", "--ff-only", "--quiet")
+    pulled = pull.returncode == 0
     if pulled:
         _throttle_done("selfupdate")
+    else:
+        detail = (pull.stderr or "").strip().splitlines()
+        _self_update_log(f"pull failed in {clone} (exit {pull.returncode}): "
+                         f"{detail[-1] if detail else 'no output'}")
     after = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
     if before and after and before != after:
         # Refresh the shim only. Wiring a config dir is the self-heal's job,
@@ -4253,8 +4362,7 @@ def main() -> int:
         if hook_is_pr or hook_is_push:
             ledger_key = ledger_record(hook_cmd, p, hook_slug, hook_br,
                                        hook_source_ref, hook_cwd)
-        try: self_update()                       # throttled once/day internally
-        except Exception: pass
+        # No self-update here: the sweep timer does it, off the hook's path.
         maybe_retry_deferred_pr(hook_is_pr, hook_pr, ledger_key,
                                 cfg, post_labels, post_footer)
         if not hook_is_pr:                        # a push records; timer backfills
