@@ -3963,16 +3963,22 @@ def _process_cwd(pid: str) -> str | None:
     return None
 
 
-def _read_process_environ(pid: str) -> dict[str, str] | None:
-    """Another process's whole environment (this user's processes only), or None
-    when it cannot be read: /proc on Linux, KERN_PROCARGS2 on macOS. Unlike
-    _process_env() it is exact for values with spaces (paths) and tells an
-    unreadable environment apart from an empty one. macOS withholds it for SIP
-    platform binaries such as /bin/sleep, but not for git."""
-    proc = pathlib.Path("/proc") / pid / "environ"
-    if proc.exists():
-        try: raw = proc.read_bytes().split(b"\0")
-        except OSError: return None
+def _read_procargs(pid: str) -> tuple[list[str], dict[str, str]] | None:
+    """Another process's exact argv and whole environment (this user's processes
+    only), or None when they cannot be read: /proc on Linux, KERN_PROCARGS2 on
+    macOS. Unlike _process_env() it is exact for values with spaces (paths) and
+    tells an unreadable environment apart from an empty one. macOS withholds
+    the environment (not argv) of SIP platform binaries such as /bin/sleep,
+    but not git's."""
+    proc = pathlib.Path("/proc") / pid
+    if (proc / "environ").exists():
+        try:
+            args = proc.joinpath("cmdline").read_bytes().split(b"\0")
+            raw = proc.joinpath("environ").read_bytes().split(b"\0")
+        except OSError:
+            return None
+        if args and args[-1] == b"":
+            args.pop()
     elif sys.platform == "darwin":
         import ctypes, ctypes.util
         try:
@@ -3993,7 +3999,7 @@ def _read_process_environ(pid: str) -> dict[str, str] | None:
         i = 1
         while i < len(parts) and parts[i] == b"":
             i += 1
-        raw = parts[i + argc:]
+        args, raw = parts[i:i + argc], parts[i + argc:]
     else:
         return None
     env = {}
@@ -4005,7 +4011,45 @@ def _read_process_environ(pid: str) -> dict[str, str] | None:
         key, eq, value = item.decode("utf-8", "replace").partition("=")
         if eq:
             env[key] = value
-    return env
+    return [a.decode("utf-8", "replace") for a in args], env
+
+
+def _read_process_environ(pid: str) -> dict[str, str] | None:
+    got = _read_procargs(pid)
+    return got[1] if got else None
+
+
+def _git_cli_paths(argv: list[str], cwd: str,
+                   chdir_done: bool = False) -> tuple[str, list[str]]:
+    """Where a git invocation works: its directory after every `-C` (each
+    relative to the one before, as git applies them), and the paths its
+    `--git-dir`/`--work-tree` name, resolved against that directory.
+
+    git chdir()s for each -C while parsing its options, so a running git's
+    cwd normally has them applied already: pass chdir_done=True to resolve
+    against `cwd` as it is."""
+    here, paths, i = cwd, [], 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "-C" and i + 1 < len(argv):
+            if not chdir_done:
+                here = os.path.join(here, argv[i + 1])
+            i += 2
+            continue
+        if arg == "-c" and i + 1 < len(argv):
+            i += 2
+            continue
+        name, eq, value = arg.partition("=")
+        if name in ("--git-dir", "--work-tree"):
+            if eq:
+                paths.append(os.path.join(here, value))
+            elif i + 1 < len(argv):
+                paths.append(os.path.join(here, argv[i + 1]))
+                i += 1
+        elif not arg.startswith("-"):
+            break                                   # the subcommand
+        i += 1
+    return os.path.realpath(here), [os.path.realpath(p) for p in paths]
 
 
 def _alive(pid: str) -> bool:
@@ -4040,21 +4084,28 @@ def _git_running_in(clone: pathlib.Path) -> bool:
             if not _alive(pid):
                 continue  # it exited between the listing and the lookup
             return True
-        if cwd == root or cwd.startswith(root + os.sep):
+        inside = lambda path: path == root or path.startswith(root + os.sep)
+        if inside(cwd):
             return True
-        # `GIT_DIR=<clone>/.git git ...` works in the clone from anywhere.
-        env = _read_process_environ(pid)
-        if env is None:
+        got = _read_procargs(pid)
+        if got is None:
             if not _alive(pid):
-                continue
+                continue  # it exited between the listing and the lookup
             return True
-        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
-            value = env.get(key)
-            if not value:
-                continue
-            target = os.path.realpath(os.path.join(cwd, value))
-            if target == root or target.startswith(root + os.sep):
+        argv, env = got
+        # `git -C clone ...` or `git --git-dir=clone/.git ...` from the parent
+        # directory works in the clone; relative paths resolve as git's do.
+        # The cwd read is normally after git applied its -C, but may be just
+        # before; either reading landing in the clone counts.
+        for chdir_done in (True, False):
+            here, cli_paths = _git_cli_paths(argv or cmd.split(), cwd, chdir_done)
+            if inside(here) or any(inside(p) for p in cli_paths):
                 return True
+            # `GIT_DIR=<clone>/.git git ...` works in the clone from anywhere.
+            for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+                value = env.get(key)
+                if value and inside(os.path.realpath(os.path.join(here, value))):
+                    return True
     return False
 
 
