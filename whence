@@ -3909,7 +3909,8 @@ def _self_clone() -> pathlib.Path:
 def self_update(force: bool = False) -> bool:
     """Fast-forward this whence clone to origin/main so every machine picks up a
     change made on any other machine — no matter which one made it. Throttled to
-    once/day from the hook; reinstalls the agent hook only if the clone moved."""
+    once/day across the agent hook and the sweep timer; refreshes the installed
+    hooks only if the clone moved."""
     clone = _self_clone()
     if not (clone / ".git").exists():
         return False
@@ -3935,7 +3936,7 @@ def self_update(force: bool = False) -> bool:
 def deploy() -> int:
     """Push local whence changes, then SSH each host in ~/.config/whence/hosts to
     pull + reinstall — instant propagation from whichever machine you edited on.
-    Unreachable hosts are skipped (they self-update on their next stamp)."""
+    Unreachable hosts are skipped (they self-update on their next sweep)."""
     clone = _self_clone()
     ahead = _git(str(clone), "rev-list", "--count", "@{u}..HEAD").stdout.strip()
     if ahead not in ("", "0"):
@@ -3954,9 +3955,31 @@ def deploy() -> int:
                   "./whence --install-hook >/dev/null 2>&1; } && echo whence-ok")
         r = sh("ssh", "-o", "ConnectTimeout=8", h, remote)
         ok = r.returncode == 0 and "whence-ok" in r.stdout
-        print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on next stamp'}")
+        print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on its next sweep'}")
         rc = rc or (0 if ok else 1)
     return rc
+
+
+def sweep_tick(hide: str, no_labels: bool = False, no_footer: bool = False) -> int:
+    """One run of the 10-minute sweep timer every host runs."""
+    # Inbound config catch-up. A machine that was offline when you edited
+    # converges here after it wakes.
+    cfg, config_changed = _config_for_sweep(hide)
+    if config_changed:
+        print("whence: pulled updated fleet config")
+    # Code catch-up too. The agent hook is not enough on its own: a host whose
+    # PRs come from plain shells only ever runs --pre-exec, which never
+    # updates, so its clone stayed weeks behind. The new code takes effect from
+    # the next tick.
+    try:
+        if self_update():
+            print("whence: updated to latest")
+    except Exception:
+        pass
+    cfg["labels"] = cfg["labels"] and not no_labels
+    cfg["footer"] = cfg["footer"] and not no_footer
+    print(f"whence: swept {sweep(cfg)} PR(s)")
+    return 0
 
 
 def main() -> int:
@@ -4061,15 +4084,7 @@ def main() -> int:
         preexec_capture(args.pre_exec, cfg, post_labels, post_footer)
         return 0
     if args.sweep:
-        # Inbound config catch-up on the same 10-min tick every host already runs.
-        # A machine that was offline when you edited converges here after it wakes.
-        cfg, config_changed = _config_for_sweep(args.hide)
-        if config_changed:
-            print("whence: pulled updated fleet config")
-        cfg["labels"] = cfg["labels"] and not args.no_labels
-        cfg["footer"] = cfg["footer"] and not args.no_footer
-        print(f"whence: swept {sweep(cfg)} PR(s)")
-        return 0
+        return sweep_tick(args.hide, args.no_labels, args.no_footer)
     if args.setup:
         return setup(args.host)
     if args.print_hook:
