@@ -839,6 +839,11 @@ def main() -> int:
             ("shipyard", f"cd {tmp} && shipyard pr --base main; cd /tmp", (True, True, tmp)),
             ("pulp", f"env PULP_X=1 pulp pr", (True, True, None)),
             ("gh", "command gh pr create --fill", (True, False, None)),
+            ("gh with a global repo flag", "gh -R owner/repo pr create --fill",
+             (True, False, None)),
+            ("gh api POST to pulls", "gh api -X POST repos/o/r/pulls -f head=x -f base=main",
+             (True, False, None)),
+            ("gh api GET of pulls", "gh api repos/o/r/pulls", (False, False, None)),
             ("nested background shell",
              f"nohup bash -lc 'cd {tmp} && exec shipyard pr --base main' >/tmp/ship.log 2>&1 &",
              (True, True, tmp)),
@@ -2123,6 +2128,17 @@ def main() -> int:
         "ghapp pr view 705 --json url": False,
         "cat review.md | ghapp api repos/o/r/issues/705/comments -F body=@-": False,
         "gh pr create --fill": True,
+        # A PR opened with a global option first, or through the API, still
+        # counts (stamped=False on m1 before these forms were recognised).
+        "gh -R owner/repo pr create --fill": True,
+        "ghapp --repo owner/repo pr create --title t --body b": True,
+        "gh --repo=owner/repo pr create --fill": True,
+        "gh api -X POST repos/o/r/pulls -f head=fix -f base=main -f title=t": True,
+        "ghapp api --method POST /repos/o/r/pulls --input pr.json": True,
+        "gh api -XPOST repos/o/r/pulls -f head=fix": True,
+        # Control: reading the pulls list is not opening one.
+        "gh api repos/o/r/pulls": False,
+        "gh -R owner/repo pr view 7": False,
         "./ship.sh": True,
         "timeout 900 shipyard pr": True,
     }

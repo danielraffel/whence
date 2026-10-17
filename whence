@@ -2442,7 +2442,7 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
             continue
         if exe in ("shipyard", "pulp") and len(argv) > 1 and argv[1] == "pr":
             return True, True, cwd
-        if exe in ("gh", "ghapp") and argv[1:3] == ["pr", "create"]:
+        if exe in ("gh", "ghapp") and _gh_opens_pr(argv):
             return True, False, cwd
         if exe == "git":
             git_cwd, j = cwd, 1
@@ -2456,6 +2456,49 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
             if j < len(argv) and argv[j] == "push":
                 return False, True, git_cwd
     return False, False, None
+
+
+# GitHub CLI options that come before the subcommand and take a value.
+_GH_GLOBAL_VALUE_FLAGS = ("-R", "--repo", "--hostname")
+# `gh api` options that take a value, so the endpoint is the first other word.
+_GH_API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H",
+                       "--header", "--input", "-q", "--jq", "-t", "--template",
+                       "--cache", "-p", "--preview", "--hostname")
+
+
+def _gh_opens_pr(argv: list[str]) -> bool:
+    """Whether a `gh`/`ghapp` argv opens a pull request: `pr create`, after any
+    global options (`gh -R owner/repo pr create`), or `api` with a POST to a
+    `.../pulls` endpoint (`gh api -X POST repos/o/r/pulls -f head=...`)."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        flag = argv[i].split("=", 1)[0]
+        i += 2 if flag in _GH_GLOBAL_VALUE_FLAGS and "=" not in argv[i] else 1
+    rest = argv[i:]
+    if rest[:2] == ["pr", "create"]:
+        return True
+    if not rest or rest[0] != "api":
+        return False
+    method, endpoint, j = "", "", 1
+    while j < len(rest):
+        word = rest[j]
+        flag, eq, value = word.partition("=")
+        if flag in ("-X", "--method"):
+            method = value if eq else (rest[j + 1] if j + 1 < len(rest) else "")
+            j += 1 if eq else 2
+            continue
+        if word.startswith("-X") and len(word) > 2:
+            method, j = word[2:], j + 1
+            continue
+        if flag in _GH_API_VALUE_FLAGS:
+            j += 1 if eq else 2
+            continue
+        if word.startswith("-"):
+            j += 1
+            continue
+        endpoint = endpoint or word
+        j += 1
+    return method.upper() == "POST" and endpoint.rstrip("/").endswith("/pulls")
 
 
 def output_pr_url_counts(cmd: str) -> bool:
@@ -2478,7 +2521,7 @@ def output_pr_url_counts(cmd: str) -> bool:
             continue
         exe = os.path.basename(os.path.expanduser(argv[0]))
         if exe in ("gh", "ghapp"):
-            if argv[1:3] == ["pr", "create"]:
+            if _gh_opens_pr(argv):
                 return True
             saw_cli = True
             continue
