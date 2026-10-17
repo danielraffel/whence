@@ -31,8 +31,15 @@ CFG_DIR = pathlib.Path.home() / ".config/whence"
 # navigate by — the one you need most to find your way back.
 FIELDS = ["agent", "host", "workspace", "tab", "workstream", "launcher", "terminal",
           "terminal_address", "terminal_instance", "route", "router", "origin_state",
-          "path", "session", "config_home", "resume", "url", "goals", "jump", "relaunch",
-          "stamped"]
+          "path", "worktree", "session", "config_home", "resume", "url", "goals", "jump",
+          "relaunch", "cmux_workspace_id", "cmux_workspace_ref", "cmux_pane_id",
+          "cmux_pane_ref", "cmux_surface_id", "cmux_surface_ref", "stamped"]
+# The cmux identity of the tab a PR came from, kept whole in the ledger. The
+# commands use only the UUIDs; the refs are display handles.
+CMUX_ID_FIELDS = ("cmux_workspace_id", "cmux_workspace_ref", "cmux_pane_id",
+                  "cmux_pane_ref", "cmux_surface_id", "cmux_surface_ref")
+# Every PR gets all five numbered labels; a value whence cannot learn is this.
+UNKNOWN_LABEL = "unknown"
 LABEL_FIELDS = ["agent", "host", "workspace", "tab", "route"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700",
                   "tab": "8250df", "route": "d4a72c"}
@@ -536,6 +543,43 @@ def cmux_workspace(ws_id: str, surface_id: str = "") -> str:
 
 
 def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list, dict | None]:
+    rows, row, _ = _cmux_surface_lookup(surface_id, workspace_id)
+    return rows, row
+
+
+# Set only inside one stamp (collect(), or the sweep publishing one PR): the
+# tab title, the ref and the cmux ids then come from one lookup. A surface cmux
+# cannot find costs a full scan of every workspace (about 44 calls, ~3.5 s),
+# and without this the ref fallback after a blank title repeated it. Between
+# stamps every lookup is live, so the sweep still re-reads settled titles.
+_CMUX_LOOKUP_CACHE: dict[tuple[str, str], tuple[list, dict | None, dict]] | None = None
+
+
+@contextlib.contextmanager
+def _cmux_lookup_scope():
+    global _CMUX_LOOKUP_CACHE
+    outer = _CMUX_LOOKUP_CACHE
+    if outer is None:
+        _CMUX_LOOKUP_CACHE = {}
+    try:
+        yield
+    finally:
+        if outer is None:
+            _CMUX_LOOKUP_CACHE = None
+
+
+def _cmux_surface_lookup(surface_id: str, workspace_id: str = ""
+                         ) -> tuple[list, dict | None, dict]:
+    if _CMUX_LOOKUP_CACHE is None:
+        return _cmux_surface_lookup_uncached(surface_id, workspace_id)
+    key = (surface_id or "", workspace_id or "")
+    if key not in _CMUX_LOOKUP_CACHE:
+        _CMUX_LOOKUP_CACHE[key] = _cmux_surface_lookup_uncached(surface_id, workspace_id)
+    return _CMUX_LOOKUP_CACHE[key]
+
+
+def _cmux_surface_lookup_uncached(surface_id: str, workspace_id: str = ""
+                                  ) -> tuple[list, dict | None, dict]:
     """(surfaces of the workspace holding `surface_id`, that surface's row).
 
     `cmux rpc surface.list` with no parameters lists only the window's SELECTED
@@ -544,24 +588,27 @@ def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list
     label and ref empty (`lookup_failed`). So ask its own workspace first, then
     the selected one, then every workspace cmux reports."""
     if not surface_id:
-        return [], None
-    def listing(ws: str) -> list:
+        return [], None, {}
+    def listing(ws: str) -> tuple[list, dict]:
         r = (sh("cmux", "rpc", "surface.list", json.dumps({"workspace_id": ws}))
              if ws else sh("cmux", "rpc", "surface.list"))
         if r.returncode != 0:
-            return []
+            return [], {}
         try:
-            rows = json.loads(r.stdout).get("surfaces", [])
+            reply = json.loads(r.stdout)
+            rows = reply.get("surfaces", [])
         except Exception:
-            return []
-        return rows if isinstance(rows, list) else []
+            return [], {}
+        meta = {"workspace_id": reply.get("workspace_id") or "",
+                "workspace_ref": reply.get("workspace_ref") or ""}
+        return (rows if isinstance(rows, list) else []), meta
     tried = []
     for ws in ([workspace_id] if workspace_id else []) + [""]:
-        rows = listing(ws)
+        rows, meta = listing(ws)
         tried.append(ws)
         for row in rows:
             if isinstance(row, dict) and row.get("id") == surface_id:
-                return rows, row
+                return rows, row, meta
     r = sh("cmux", "rpc", "workspace.list")
     if r.returncode == 0:
         try:
@@ -572,11 +619,63 @@ def _cmux_surface_listing(surface_id: str, workspace_id: str = "") -> tuple[list
             ws = item.get("id") if isinstance(item, dict) else ""
             if not ws or ws in tried:
                 continue
-            rows = listing(ws)
+            rows, meta = listing(ws)
             for row in rows:
                 if isinstance(row, dict) and row.get("id") == surface_id:
-                    return rows, row
-    return [], None
+                    return rows, row, meta
+    return [], None, {}
+
+
+def cmux_identity(surface_id: str, workspace_id: str = "") -> dict[str, str]:
+    """The six cmux ids of a tab: its workspace, pane and surface, each as a
+    stable UUID and a display ref. A value cmux does not report is ""."""
+    _, row, meta = _cmux_surface_lookup(surface_id, workspace_id)
+    ids = {field: "" for field in CMUX_ID_FIELDS}
+    ids["cmux_surface_id"] = surface_id or ""
+    if row is None:
+        ids["cmux_workspace_id"] = workspace_id or ""
+        return ids
+    ids.update({
+        "cmux_workspace_id": meta.get("workspace_id") or workspace_id or "",
+        "cmux_workspace_ref": meta.get("workspace_ref") or "",
+        "cmux_pane_id": row.get("pane_id") or "",
+        "cmux_pane_ref": row.get("pane_ref") or "",
+        "cmux_surface_ref": row.get("ref") or "",
+    })
+    return {k: stable_identifier(str(v), maxlen=160) for k, v in ids.items()}
+
+
+def jump_command(ids: dict) -> str:
+    """Focus the tab's pane in its workspace. `cmux surface focus` does not
+    exist ("Unsupported surface subcommand: focus"); `focus-pane` does."""
+    pane, workspace = ids.get("cmux_pane_id", ""), ids.get("cmux_workspace_id", "")
+    if not (pane and workspace):
+        return ""
+    return f"cmux focus-pane --pane {pane} --workspace {workspace}"
+
+
+def relaunch_command(surface_id: str) -> str:
+    """One paste: run the command cmux recorded to restart this tab's agent
+    (its exact argv, provider configuration and working directory)."""
+    return (f'eval "$(cmux surface resume get --surface {surface_id})"'
+            if surface_id else "")
+
+
+def worktree_name(cwd: str) -> str:
+    """The basename of the git checkout `cwd` is in, or "".
+
+    Found by looking for `.git` in `cwd` and its parents, with no subprocess:
+    the PostToolUse hook runs on every tool call, so it must not fork git."""
+    if not cwd:
+        return ""
+    current = pathlib.Path(cwd)
+    for folder in (current, *current.parents):
+        try:
+            if (folder / ".git").exists():
+                return stable_identifier(folder.name, maxlen=120)
+        except OSError:
+            return ""
+    return ""
 
 
 def cmux_tab_title(surface_id: str, workspace_id: str = "") -> tuple[str, str]:
@@ -768,14 +867,6 @@ def terminal_instance_id(value: str) -> str:
     return value
 
 
-def dedupe_terminal_display(p: dict) -> None:
-    """Do not publish the same mutable display location twice."""
-    workspace = (p.get("workspace") or "").strip()
-    tab = (p.get("tab") or "").strip()
-    if workspace and tab and workspace.casefold() == tab.casefold():
-        p["workspace"] = ""
-
-
 def configured_provenance(cfg: dict, repo: str = "") -> dict[str, str]:
     """Resolve explicit fleet defaults plus one exact repository override.
 
@@ -940,6 +1031,11 @@ def derive_launch(env: dict[str, str], agent: str, origin_kind: str = "",
 
 
 def collect(cfg: dict | None = None, repo: str = "") -> dict:
+    with _cmux_lookup_scope():
+        return _collect(cfg, repo)
+
+
+def _collect(cfg: dict | None = None, repo: str = "") -> dict:
     explicit_agent = stable_identifier(os.environ.get("WHENCE_AGENT", ""))
     agent = explicit_agent or os.environ.get("CMUX_AGENT_LAUNCH_KIND") or (
         "claude" if os.environ.get("CLAUDECODE") else
@@ -979,6 +1075,7 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
             p["origin_state"] = "known"
     p["stamped"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     p["path"] = sanitize_path(os.getcwd(), cfg if cfg is not None else load_config(""))
+    p["worktree"] = worktree_name(os.getcwd())
     p["goals"] = normalize_goals(os.environ.get("WHENCE_GOALS", ""))
     context = configured_provenance(cfg or {}, repo)
     derived = derive_launch(env, agent, origin_kind, ancestry)
@@ -1003,8 +1100,9 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         r = sh("cmux", "surface", "resume", "get", "--surface", surface)
         if r.returncode == 0:
             restore = r.stdout.strip()
-        p["jump"] = f"cmux surface focus {surface}"
-        p["relaunch"] = f"cmux surface resume get --surface {surface}"  # exact cmd, any agent
+        p.update(cmux_identity(surface, env.get("CMUX_WORKSPACE_ID", "")))
+        p["jump"] = jump_command(p)
+        p["relaunch"] = relaunch_command(surface)
 
     # Session id must be CONSISTENT with the detected agent — never pair claude's
     # session with codex's resume syntax (or vice versa) if both env vars leak in.
@@ -1032,7 +1130,7 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
     if "WHENCE_RESUME_COMMAND" in os.environ:
         p["resume"] = safe_public_command(os.environ.get("WHENCE_RESUME_COMMAND", ""))
     elif agent in KNOWN_RESUME and sid:
-        p["resume"] = resume_command(agent, sid, p["config_home"])
+        p["resume"] = resume_command(agent, sid, p["config_home"], p.get("route", ""))
     if "WHENCE_RELAUNCH_COMMAND" in os.environ:
         p["relaunch"] = safe_public_command(os.environ.get("WHENCE_RELAUNCH_COMMAND", ""))
     if agent in KNOWN_URL:
@@ -1041,7 +1139,6 @@ def collect(cfg: dict | None = None, repo: str = "") -> dict:
         if bridge:
             p["url"] = KNOWN_URL[agent].format(bridge=bridge)
     p["_redacted"] = redact(p, cfg if cfg is not None else load_config(""), surface)
-    dedupe_terminal_display(p)
     return p
 
 
@@ -1097,12 +1194,18 @@ def apply_hook_config_home(p: dict, home_agent: str, home: str, cfg: dict) -> No
         p["config_home"] = ""
 
 
-def resume_command(agent: str, sid: str, config_home: str = "") -> str:
+def resume_command(agent: str, sid: str, config_home: str = "", route: str = "") -> str:
     """The resume line for a known agent, prefixed with its config home when the
     session does not live in the default one. `$HOME` rather than `~` so the
-    line works pasted into any POSIX shell, over ssh, and in fish."""
+    line works pasted into any POSIX shell, over ssh, and in fish.
+
+    A Codex session on the subrouter route talks to subrouter's local proxy,
+    which a bare `codex resume` would not use; `sr codex` passes the same
+    arguments through with subrouter's provider configuration."""
     if agent not in KNOWN_RESUME or not sid:
         return ""
+    if agent == "codex" and route == "subrouter":
+        return f"sr codex resume {sid}"
     cmd = KNOWN_RESUME[agent].format(sid=sid)
     if config_home and agent in KNOWN_CONFIG_HOME and _CONFIG_HOME_RE.fullmatch(config_home):
         cmd = f'{KNOWN_CONFIG_HOME[agent][0]}="$HOME{config_home[1:]}" {cmd}'
@@ -1137,8 +1240,10 @@ def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
     out = []
     order = cfg.get("order_labels")
     for i, f in enumerate(LABEL_FIELDS):
-        if visible(f, p, cfg["hide"]):
-            name = _clip(p[f], cfg.get("label_maxlen", 24))
+        # Every PR carries all five, in one format: a value whence could not
+        # learn is "unknown" rather than a missing label.
+        if f not in cfg["hide"]:
+            name = _clip(p.get(f) or UNKNOWN_LABEL, cfg.get("label_maxlen", 24))
             if order:
                 name = f"{i + 1}\u00b7{name}"          # 1·  2·  3·  4·  5·
             out.append((name, cfg["colors"].get(f, "ededed")))
@@ -1152,8 +1257,8 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
     # either from GitHub's labels.
     marker_fields = ("agent", "host", "workspace", "tab", "workstream", "launcher",
                      "terminal", "terminal_address", "terminal_instance", "route", "router", "origin_state",
-                     "path", "session", "config_home", "resume", "url", "goals", "jump",
-                     "relaunch")
+                     "path", "worktree", "session", "config_home", "resume", "url", "goals",
+                     "jump", "relaunch", *CMUX_ID_FIELDS)
     tag = json.dumps({"labels": label_names,
                       "prov": {f: p.get(f, "") for f in marker_fields
                                if visible(f, p, hide)}}, ensure_ascii=False)
@@ -1173,7 +1278,7 @@ def footer(p: dict, cfg: dict, label_names: list[str]) -> str:
                          ("terminal_address", "Terminal address", True),
                          ("terminal_instance", "Terminal instance", True),
                          ("router", "Router", True), ("origin_state", "Origin state", True),
-                         ("path", "Directory", True), ("session", "Session", True),
+                         ("path", "Directory", True), ("worktree", "Worktree", True), ("session", "Session", True),
                          ("config_home", "Config home", True),
                          ("goals", "Goal docs", False)]:
         if visible(f, p, hide):
@@ -3074,8 +3179,9 @@ def _publish_ledger_pr(key: str, expected_head: str, pr: str, body: str,
     with _publication_lock(key, deadline=lock_deadline) as acquired:
         if not acquired:
             return False
-        return _publish_ledger_pr_serialized(
-            key, expected_head, pr, body, cfg, source)
+        with _cmux_lookup_scope():
+            return _publish_ledger_pr_serialized(
+                key, expected_head, pr, body, cfg, source)
 
 
 def _publish_ledger_pr_serialized(key: str, expected_head: str, pr: str,
@@ -3377,6 +3483,49 @@ def preexec_capture(cwd: str, cfg: dict, post_labels: bool, post_footer: bool) -
     return key
 
 
+def label_problems(labels: list) -> list[str]:
+    """What is wrong with a PR's numbered labels: a class with no label, or one
+    with more than one. Empty means all five are present once each."""
+    by_class: dict[str, list[str]] = {}
+    for item in labels or []:
+        name = item.get("name", "") if isinstance(item, dict) else str(item or "")
+        m = NUMBERED_LABEL_RE.match(name)
+        if m:
+            by_class.setdefault(m.group(1), []).append(name)
+    problems = []
+    for cls in "12345":
+        values = by_class.get(cls, [])
+        if not values:
+            problems.append(f"missing {cls}·")
+        elif len(values) > 1:
+            problems.append(f"{cls}· {len(values)} times ({', '.join(sorted(values))})")
+    return problems
+
+
+def check_labels(repo: str, limit: int) -> int:
+    """List open PRs in ``repo`` whose numbered labels are missing or repeated;
+    exit 1 if any. Every PR whence stamps carries all five exactly once."""
+    client = github_client_for_repo(GH, repo, explicit=bool(os.environ.get("WHENCE_GH")))
+    res = github_call(client, "pr", "list", "--repo", repo, "--state", "open",
+                      "--limit", str(max(1, limit)), "--json",
+                      "number,headRefName,author,labels", repo=repo)
+    try:
+        prs = json.loads(res.stdout or "[]")
+    except Exception:
+        prs = []
+    bad = 0
+    for pr in prs:
+        problems = label_problems(pr.get("labels") or [])
+        if problems:
+            bad += 1
+            author = (pr.get("author") or {}).get("login", "")
+            print(f"#{pr.get('number')}\t{author}\t{pr.get('headRefName', '')}\t"
+                  + "; ".join(problems))
+    print(f"whence: {bad} of {len(prs)} open PR(s) in {repo} have missing or repeated "
+          "numbered labels", file=sys.stderr)
+    return 1 if bad else 0
+
+
 def unstamped(repo: str, limit: int) -> int:
     """List recent PRs in ``repo`` that carry no whence stamp; exit 1 if any.
 
@@ -3392,7 +3541,10 @@ def unstamped(repo: str, limit: int) -> int:
     try: prs = json.loads(res.stdout or "[]")
     except Exception: prs = []
     ledger = _load_ledger()
-    missing = [pr for pr in prs if not is_stamped(pr.get("body") or "")]
+    # A public repository's PRs carry labels and no footer, so a full label set
+    # is a stamp too.
+    missing = [pr for pr in prs if not is_stamped(pr.get("body") or "")
+               and label_problems(pr.get("labels") or [])]
     for pr in missing:
         rec = ledger.get(f"{repo}#{pr.get('headRefName', '')}")
         where = ("ledger: pending sweep" if rec and not rec.get("done")
@@ -3731,7 +3883,10 @@ def main() -> int:
                     help="force open-PR label chips into agent/host/workspace/tab/route order")
     ap.add_argument("--unstamped", metavar="OWNER/REPO",
                     help="list recent PRs with no whence stamp (exit 1 if any)")
-    ap.add_argument("--limit", type=int, default=50, help="with --unstamped: PRs to check")
+    ap.add_argument("--check-labels", metavar="OWNER/REPO",
+                    help="list open PRs whose numbered labels are missing or repeated (exit 1 if any)")
+    ap.add_argument("--limit", type=int, default=50,
+                    help="with --unstamped or --check-labels: PRs to check")
     ap.add_argument("--log", nargs="?", type=int, const=20, metavar="N",
                     help="show the last N audit entries (label changes; default 20)")
     ap.add_argument("--audit", choices=("on", "off"),
@@ -3825,6 +3980,10 @@ def main() -> int:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
         return gc_labels(cfg, args.gc_labels)
+    if args.check_labels:
+        cfg = load_config(args.hide)
+        GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
+        return check_labels(args.check_labels, args.limit)
     if args.unstamped:
         cfg = load_config(args.hide)
         GH = os.environ.get("WHENCE_GH") or cfg.get("gh") or "gh"
@@ -3922,11 +4081,11 @@ def main() -> int:
                 and "tab" in explicit_context):
             p["origin_state"] = "known"
         redact(p, cfg, p.get("terminal_address", "") if p.get("terminal") == "cmux" else "")
-        dedupe_terminal_display(p)
     if args.goal:
         p["goals"] = normalize_goals([*p.get("goals", "").splitlines(), *args.goal])
     if args.hook:
         p["path"] = sanitize_path(_cmd_cwd(hook_cmd) or hook_cwd or os.getcwd(), cfg)
+        p["worktree"] = worktree_name(_cmd_cwd(hook_cmd) or hook_cwd or os.getcwd())
         # Prefer the hook payload's identity over env (which can leak across
         # sessions): the session id is authoritative; use the transcript's agent
         # only when env couldn't name one. Keep resume consistent with both.
@@ -3941,7 +4100,8 @@ def main() -> int:
         if "resume" in explicit_context:
             pass
         elif p["agent"] in KNOWN_RESUME and p["session"]:
-            p["resume"] = resume_command(p["agent"], p["session"], p.get("config_home", ""))
+            p["resume"] = resume_command(p["agent"], p["session"], p.get("config_home", ""),
+                                         p.get("route", ""))
         elif p["agent"] not in KNOWN_RESUME and "WHENCE_RESUME_COMMAND" not in os.environ:
             p["resume"] = ""
         # Capture this branch's provenance while the env is live. Exact retry is

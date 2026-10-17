@@ -18,11 +18,15 @@ follow-up you have no idea which of your twelve open sessions to go ask.
   (Two tabs sharing a title get the cmux `surface:N` ref appended so you can still
   tell them apart.)
 
-  The workspace label appears only if you **named** the workspace. cmux auto-titles
-  an unnamed one after a tab inside it, so an auto-title is just some tab's name —
-  as a "workspace" label it is at best a duplicate and at worst a *different* tab's
-  title, which reads like whence mislabelled the PR. Name a workspace to opt into
-  the label; leave it unnamed and you get agent/host/tab only.
+  Every PR gets all five numbered labels (`1·` agent, `2·` host, `3·` workspace,
+  `4·` tab, `5·` route), always in that format. A value whence cannot learn is
+  `unknown` rather than a missing label: an unnamed workspace is `3·unknown`
+  (cmux auto-titles it after one of its tabs, which would read as a wrong
+  workspace name), and a PR pushed from a shell no agent owns is
+  `1·unresolved` with route `5·shell`. PRs opened by CI bots (a GitHub Actions
+  version bump, say) never pass through whence on a host, so they carry no
+  labels. `whence --check-labels OWNER/REPO` lists open PRs whose labels are
+  missing or inconsistent.
 ### No footer on a public repository
 
 The footer carries the working directory, the host, the session id and the
@@ -82,7 +86,7 @@ current name. The denylist is the one thing that always wins, at every stamp.
   `CLAUDE_CONFIG_DIR="$HOME/…" claude --resume …` — and the home is stamped as
   `config_home`, so the session resumes from any shell), the
   restorable **`claude.ai/code` URL**, and a **jump-to-tab** command
-  (`cmux surface focus …`). It can also link one or more committed **goal or
+  (`cmux focus-pane --pane … --workspace …`). It can also link one or more committed **goal or
   planning documents**, so the implementation remains traceable to its intent.
   Launchers can also stamp a stable **workstream**, **launcher**, **route**, and
   **router**. Agent identity stays separate from transport, so `codex` through
@@ -705,7 +709,7 @@ flag lives in the synced config, turning it on or off reaches the whole fleet.
 ## What it doesn't do
 
 There's no clickable `cmux://` deep-link — cmux only registers its URL scheme
-for auth — so "jump to tab" is a copy-paste `cmux surface focus <id>` command.
+for auth — so "jump to tab" is a copy-paste `cmux focus-pane --pane <pane id> --workspace <workspace id>` command.
 If cmux ships a workspace-open URL, this will use it.
 
 ## License

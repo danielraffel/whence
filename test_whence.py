@@ -9,11 +9,13 @@ real-world output shapes are pinned here.
 
 Run: python3 test_whence.py
 """
+import contextlib
 import datetime
 import importlib.util
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -740,11 +742,13 @@ def main() -> int:
     supported_grammar_only = all(
         call[0] == "api" or call[:2] in (("pr", "view"), ("repo", "view"))
         for call in stateful.calls)
-    if (first_names != ["1·codex", "2·m5"] or second_names != first_names
-            or third_names != ["1·claude", "2·m5"]
+    unknowns = ["3·unknown", "4·unknown", "5·unknown"]
+    if (first_names != ["1·codex", "2·m5", *unknowns] or second_names != first_names
+            or third_names != ["1·claude", "2·m5", *unknowns]
             or stateful.issue_labels != set(third_names)
             or stateful.repo_labels != {"1·codex": "1f6feb", "1·claude": "1f6feb",
-                                        "2·m5": "1a7f37"}
+                                        "2·m5": "1a7f37", "3·unknown": "bf8700",
+                                        "4·unknown": "8250df", "5·unknown": "d4a72c"}
             or w.prior_stamp(first_body) != "now" or w.prior_stamp(stateful.body) != "later"
             or replay_body != first_body or replay_mutation_count != first_mutation_count
             or len(stateful.mutations) == replay_mutation_count
@@ -817,7 +821,7 @@ def main() -> int:
     private_body, _, _ = stamp_visibility(True)
     optin_body, _, _ = stamp_visibility(False, {"public_footer": True})
     if ("<!-- whence" in public_body or "/Users/x" in public_body
-            or not public_body.startswith("Body")
+            or public_body != "Body\n"
             or set(public_names) != public_labels or not public_names
             or "<!-- whence" in unknown_body
             or "<!-- whence" not in private_body
@@ -1416,7 +1420,7 @@ def main() -> int:
     required_portable = {
         "agent": "qwen", "terminal": "herdr", "terminal_address": "pane:42",
         "terminal_instance": "herdr-run-8f7c",
-        "workspace": "", "tab": "Fix queue",
+        "workspace": "Fix queue", "tab": "Fix queue",
         "session": "qwen-session-42", "resume": "qwen resume qwen-session-42",
         "relaunch": "herdr attach pane:42", "route": "subrouter", "router": "m3",
     }
@@ -1424,7 +1428,6 @@ def main() -> int:
         portable, {"hide": {"session", "resume", "relaunch"}}, []))
     if (any(portable.get(k) != v for k, v in required_portable.items())
             or any(portable_marker.get(k) != v for k, v in required_portable.items() if v)
-            or "workspace" in portable_marker
             or any(k in hidden_marker for k in ("session", "resume", "relaunch"))):
         failed += 1
         print(f"FAIL  portable recovery provenance: p={portable!r} marker={portable_marker!r} "
@@ -2558,6 +2561,144 @@ def main() -> int:
         print("ok    launch derivation: subrouter codex (scrubbed env) and sr claude route "
               "subrouter, nearest ancestor restores the cmux surface, explicit wins, "
               "fallbacks are named, and no label reads unresolved")
+
+    # Consistency: every launcher path yields all five numbered labels, once
+    # each, in order and in one format, and one command shape for resume,
+    # jump and relaunch.
+    label_cfg = {"hide": set(), "colors": dict(w.DEFAULT_COLORS), "label_maxlen": 24,
+                 "denylist": [], "redact_placeholder": "(redacted)", "order_labels": True}
+    jump_shape = re.compile(r"cmux focus-pane --pane \S+ --workspace \S+")
+    relaunch_shape = re.compile(r'eval "\$\(cmux surface resume get --surface \S+\)"')
+    inconsistent = {}
+    for name, prov in lc.items():
+        labels = [n for n, _ in w.labels_for(prov, label_cfg)]
+        problems = []
+        if [n.split("·", 1)[0] for n in labels] != ["1", "2", "3", "4", "5"]:
+            problems.append(f"labels {labels}")
+        if any(not n.split("·", 1)[1] for n in labels):
+            problems.append(f"empty label value {labels}")
+        if w.label_problems(labels):
+            problems.append(f"label_problems {w.label_problems(labels)}")
+        if prov.get("jump") and not jump_shape.fullmatch(prov["jump"]):
+            problems.append(f"jump {prov['jump']!r}")
+        if prov.get("relaunch") and not (relaunch_shape.fullmatch(prov["relaunch"])
+                                         or "WHENCE_RELAUNCH_COMMAND" in str(prov)):
+            problems.append(f"relaunch {prov['relaunch']!r}")
+        if problems:
+            inconsistent[name] = problems
+    resume_ok = (lc["m5-codex"]["resume"] == "sr codex resume 019a-codex"
+                 and lc["bare-codex"]["resume"] == "codex resume c2"
+                 and lc["cmux-direct"]["resume"].endswith("claude --resume cl-1"))
+    if inconsistent or not resume_ok or not all(lc.values()):
+        failed += 1
+        print(f"FAIL  label/command consistency: {inconsistent} resume_ok={resume_ok} "
+              f"resumes={ {k: v['resume'] for k, v in lc.items()} }")
+    else:
+        print("ok    every launcher path gets five numbered labels and one command shape")
+
+    # The six cmux ids, the jump that focuses the pane, and the one-paste relaunch.
+    def cmux_ids_run(*args, **kwargs):
+        argv = list(args)
+        if argv[:3] == ["cmux", "rpc", "surface.list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "workspace_id": "WS-UUID", "workspace_ref": "workspace:2",
+                "surfaces": [{"id": "SF-UUID", "ref": "surface:71", "title": "t",
+                              "pane_id": "PN-UUID", "pane_ref": "pane:2"}]}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with mock.patch.object(w, "sh", side_effect=cmux_ids_run):
+        ids = w.cmux_identity("SF-UUID", "WS-UUID")
+    want_ids = {"cmux_workspace_id": "WS-UUID", "cmux_workspace_ref": "workspace:2",
+                "cmux_pane_id": "PN-UUID", "cmux_pane_ref": "pane:2",
+                "cmux_surface_id": "SF-UUID", "cmux_surface_ref": "surface:71"}
+    if (ids != want_ids
+            or w.jump_command(ids) != "cmux focus-pane --pane PN-UUID --workspace WS-UUID"
+            or w.relaunch_command("SF-UUID")
+               != 'eval "$(cmux surface resume get --surface SF-UUID)"'
+            or w.jump_command({"cmux_workspace_id": "WS-UUID"}) != ""
+            or not set(want_ids) <= set(w.FIELDS)):
+        failed += 1
+        print(f"FAIL  cmux identity and commands: ids={ids!r} jump={w.jump_command(ids)!r}")
+    else:
+        print("ok    six cmux ids recorded; jump is focus-pane by UUID; relaunch is one paste")
+
+    # Inside one stamp a surface cmux cannot find is searched once: the ref
+    # fallback after a blank title reuses the scan instead of repeating ~44 RPCs.
+    scan_calls = []
+    def scan_run(*args, **kwargs):
+        argv = list(args)
+        scan_calls.append(argv)
+        if argv[:3] == ["cmux", "rpc", "workspace.list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(
+                {"workspaces": [{"id": f"WS-{i}"} for i in range(20)]}), "")
+        if argv[:3] == ["cmux", "rpc", "surface.list"]:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"surfaces": []}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with mock.patch.object(w, "sh", side_effect=scan_run):
+        with w._cmux_lookup_scope():
+            w.cmux_tab_title("S-GONE", "")
+            one_scan = len(scan_calls)
+            w._surface_ref("S-GONE", "")
+            w.cmux_identity("S-GONE", "")
+            scoped = len(scan_calls)
+        scan_calls.clear()
+        w.cmux_tab_title("S-GONE", "")
+        w._surface_ref("S-GONE", "")
+        unscoped = len(scan_calls)
+    if one_scan < 20 or scoped != one_scan or unscoped != 2 * one_scan:
+        failed += 1
+        print(f"FAIL  one cmux scan per stamp: one={one_scan} scoped={scoped} unscoped={unscoped}")
+    else:
+        print("ok    a stamp searches cmux once; the ref fallback reuses the scan")
+
+    # collect() asks the tab's own workspace first (CMUX_WORKSPACE_ID).
+    first_ws = []
+    def own_ws_run(*args, **kwargs):
+        argv = list(args)
+        if argv[:3] == ["cmux", "rpc", "surface.list"]:
+            first_ws.append(json.loads(argv[3])["workspace_id"] if len(argv) > 3 else "")
+            return subprocess.CompletedProcess(argv, 0, json.dumps({
+                "workspace_id": "WS-AGENT", "workspace_ref": "workspace:9",
+                "surfaces": [{"id": "S-AGENT", "ref": "surface:3", "title": "Fix queue",
+                              "pane_id": "P-AGENT", "pane_ref": "pane:4"}]}), "")
+        return subprocess.CompletedProcess(argv, 1, "", "")
+    with mock.patch.dict(w.os.environ, {"CODEX_SESSION_ID": "c9"}, clear=True), \
+         mock.patch.object(w, "_process_ancestry", return_value=[]), \
+         mock.patch.object(w, "_launch_env", return_value={
+             "CMUX_SURFACE_ID": "S-AGENT", "CMUX_WORKSPACE_ID": "WS-AGENT"}), \
+         mock.patch.object(w, "host_label", return_value="m5s"), \
+         mock.patch.object(w, "cmux_workspace", return_value=""), \
+         mock.patch.object(w, "sh", side_effect=own_ws_run):
+        own = w.collect({"denylist": [], "hide": set()}, "o/r")
+    if (not first_ws or first_ws[0] != "WS-AGENT" or own.get("tab") != "Fix queue"
+            or own.get("jump") != "cmux focus-pane --pane P-AGENT --workspace WS-AGENT"):
+        failed += 1
+        print(f"FAIL  collect own workspace first: calls={first_ws!r} tab={own.get('tab')!r} "
+              f"jump={own.get('jump')!r}")
+    else:
+        print("ok    collect asks the tab's own workspace first")
+
+    # check-labels reads open PRs and names every missing or repeated class.
+    listing = subprocess.CompletedProcess([], 0, json.dumps([
+        {"number": 1, "headRefName": "a", "author": {"login": "x"},
+         "labels": [{"name": f"{i}·v"} for i in range(1, 6)]},
+        {"number": 2, "headRefName": "b", "author": {"login": "y"},
+         "labels": [{"name": "1·codex"}, {"name": "2·m5s"}, {"name": "5·subrouter"}]},
+        {"number": 3, "headRefName": "c", "author": {"login": "z"},
+         "labels": [{"name": f"{i}·v"} for i in range(1, 6)] + [{"name": "1·claude"}]},
+    ]), "")
+    out = __import__("io").StringIO()
+    with mock.patch.object(w, "github_client_for_repo", return_value="gh"), \
+         mock.patch.object(w, "github_call", return_value=listing), \
+         contextlib.redirect_stdout(out), contextlib.redirect_stderr(__import__("io").StringIO()):
+        rc = w.check_labels("o/r", 50)
+    rows = out.getvalue().splitlines()
+    if (rc != 1 or len(rows) != 2 or not rows[0].startswith("#2\t")
+            or "missing 3·; missing 4·" not in rows[0]
+            or not rows[1].startswith("#3\t") or "1· 2 times" not in rows[1]):
+        failed += 1
+        print(f"FAIL  check-labels: rc={rc} rows={rows!r}")
+    else:
+        print("ok    check-labels lists missing and repeated numbered labels")
 
     # The two process readers against real processes, not mocks.
     # macOS hides the environment of platform (SIP) binaries such as /bin/zsh or
