@@ -2625,7 +2625,7 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
             continue
         if exe in ("shipyard", "pulp") and len(argv) > 1 and argv[1] == "pr":
             return True, True, cwd
-        if exe in ("gh", "ghapp") and argv[1:3] == ["pr", "create"]:
+        if exe in ("gh", "ghapp") and _gh_opens_pr(argv):
             return True, False, cwd
         if exe == "git":
             git_cwd, j = cwd, 1
@@ -2639,6 +2639,86 @@ def _command_action(cmd: str, initial_cwd: str | None = None) -> tuple[bool, boo
             if j < len(argv) and argv[j] == "push":
                 return False, True, git_cwd
     return False, False, None
+
+
+# GitHub CLI options that come before the subcommand and take a value.
+_GH_GLOBAL_VALUE_FLAGS = ("-R", "--repo", "--hostname")
+# `gh api` options that take a value, so the endpoint is the first other word.
+_GH_API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H",
+                       "--header", "--input", "-q", "--jq", "-t", "--template",
+                       "--cache", "-p", "--preview", "--hostname")
+# `gh api` options that give the request a body, which makes POST the default.
+_GH_API_BODY_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
+
+
+def _gh_opens_pr(argv: list[str]) -> bool:
+    """Whether a `gh`/`ghapp` argv opens a pull request: `pr create`, after any
+    global options (`gh -R owner/repo pr create`), or `api` with a POST to a
+    `.../pulls` endpoint. `gh api` sends a POST when given fields or an input
+    body and no explicit method, so `gh api repos/o/r/pulls -f head=...` opens
+    a PR while `gh api -X GET repos/o/r/pulls -f state=open` does not."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        flag = argv[i].split("=", 1)[0]
+        i += 2 if flag in _GH_GLOBAL_VALUE_FLAGS and "=" not in argv[i] else 1
+    rest = argv[i:]
+    if rest[:2] == ["pr", "create"]:
+        return True
+    if not rest or rest[0] != "api":
+        return False
+    method, endpoint, has_body, j = "", "", False, 1
+    while j < len(rest):
+        word = rest[j]
+        flag, eq, value = word.partition("=")
+        if flag in _GH_API_BODY_FLAGS or (word[:2] in ("-f", "-F") and len(word) > 2):
+            has_body = True
+        if flag in ("-X", "--method"):
+            method = value if eq else (rest[j + 1] if j + 1 < len(rest) else "")
+            j += 1 if eq else 2
+            continue
+        if word.startswith("-X") and len(word) > 2:
+            method, j = word[2:], j + 1
+            continue
+        if flag in _GH_API_VALUE_FLAGS:
+            j += 1 if eq else 2
+            continue
+        if word.startswith("-"):
+            j += 1
+            continue
+        endpoint = endpoint or word
+        j += 1
+    effective = method.upper() or ("POST" if has_body else "GET")
+    return effective == "POST" and endpoint.rstrip("/").endswith("/pulls")
+
+
+def output_pr_url_counts(cmd: str) -> bool:
+    """Whether a PR URL in this command's output means the command opened a PR.
+
+    The output outranks the command name so that any wrapper which opens a PR
+    is caught. But a GitHub CLI call that is not ``pr create`` (posting a
+    review comment, viewing or listing PRs, any ``api`` call) also prints PR
+    URLs, and stamping on those re-wrote a body an author was editing at the
+    same moment. So a URL counts unless the command is GitHub CLI calls only,
+    none of which opens a PR.
+    """
+    saw_cli = False
+    for tokens in _simple_shell_commands(cmd):
+        i = 0
+        while i < len(tokens) and _ASSIGN_TOKEN_RE.match(tokens[i]):
+            i += 1
+        argv = _peel_command_wrappers(tokens[i:])
+        if not argv or argv[0] == "cd":
+            continue
+        exe = os.path.basename(os.path.expanduser(argv[0]))
+        if exe in ("gh", "ghapp"):
+            if _gh_opens_pr(argv):
+                return True
+            saw_cli = True
+            continue
+        if exe in ("cat", "printf", "echo", "jq", "head", "tail", "tee", "true"):
+            continue
+        return True
+    return not saw_cli
 
 
 def command_provenance_context(cmd: str) -> dict[str, str]:
@@ -4067,7 +4147,7 @@ def main() -> int:
         # The output outranks the command name: anything that printed a PR URL
         # opened a PR, no matter which wrapper it was spelled with.
         cmd_is_pr, cmd_is_push, _action_cwd = _command_action(hook_cmd)
-        hook_is_pr = bool(hook_pr) or cmd_is_pr
+        hook_is_pr = (bool(hook_pr) and output_pr_url_counts(hook_cmd)) or cmd_is_pr
         hook_is_push = cmd_is_push or bool(hook_slug and hook_br)
         if not (hook_is_pr or hook_is_push):
             return 0

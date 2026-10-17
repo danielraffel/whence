@@ -978,6 +978,15 @@ def main() -> int:
             ("shipyard", f"cd {tmp} && shipyard pr --base main; cd /tmp", (True, True, tmp)),
             ("pulp", f"env PULP_X=1 pulp pr", (True, True, None)),
             ("gh", "command gh pr create --fill", (True, False, None)),
+            ("gh with a global repo flag", "gh -R owner/repo pr create --fill",
+             (True, False, None)),
+            ("gh api POST to pulls", "gh api -X POST repos/o/r/pulls -f head=x -f base=main",
+             (True, False, None)),
+            ("gh api GET of pulls", "gh api repos/o/r/pulls", (False, False, None)),
+            ("gh api implicit POST to pulls", "gh api repos/o/r/pulls -f head=x -f base=main",
+             (True, False, None)),
+            ("gh api explicit GET with fields", "gh api -X GET repos/o/r/pulls -f state=open",
+             (False, False, None)),
             ("nested background shell",
              f"nohup bash -lc 'cd {tmp} && exec shipyard pr --base main' >/tmp/ship.log 2>&1 &",
              (True, True, tmp)),
@@ -2249,6 +2258,77 @@ def main() -> int:
               f"elapsed={hook_elapsed:.3f} gh_called={gh_called} rows={hook_rows!r}")
     else:
         print("ok    PostToolUse: records push and returns without a global sweep")
+
+    # ── Regression: a review comment is not a PR opening ──
+    # On 2026-10-04 a reviewer's comment on a PR quoted "`shipyard pr` does not
+    # arm by default". The pre-filter matched the phrase, the comment API's
+    # JSON reply carried the PR's URL, and the hook stamped the PR, racing an
+    # author's body edit. A GitHub CLI call that opens no PR must not stamp.
+    url_cases = {
+        'ghapp api -X POST repos/o/r/issues/705/comments -f body="`shipyard pr` does not arm"': False,
+        "gh pr comment 705 --body 'run git push first'": False,
+        "ghapp pr view 705 --json url": False,
+        "cat review.md | ghapp api repos/o/r/issues/705/comments -F body=@-": False,
+        "gh pr create --fill": True,
+        # A PR opened with a global option first, or through the API, still
+        # counts (stamped=False on m1 before these forms were recognised).
+        "gh -R owner/repo pr create --fill": True,
+        "ghapp --repo owner/repo pr create --title t --body b": True,
+        "gh --repo=owner/repo pr create --fill": True,
+        "gh api -X POST repos/o/r/pulls -f head=fix -f base=main -f title=t": True,
+        "ghapp api --method POST /repos/o/r/pulls --input pr.json": True,
+        "gh api -XPOST repos/o/r/pulls -f head=fix": True,
+        # With fields or an input body and no method, gh api sends a POST, the
+        # commonest form (stamped=False on m1 for each of these first three).
+        "gh api repos/o/r/pulls -f head=b -f base=main -f title=t": True,
+        "gh api repos/o/r/pulls -F head=b -F base=main -F title=t": True,
+        "gh api --input pr.json repos/o/r/pulls": True,
+        "ghapp api repos/o/r/pulls --raw-field head=b --field base=main": True,
+        "gh api repos/o/r/pulls -fhead=b": True,
+        # An explicit GET with fields stays a read.
+        "gh api -X GET repos/o/r/pulls -f state=open": False,
+        "gh api --method GET repos/o/r/pulls -F per_page=100": False,
+        # Control: reading the pulls list is not opening one.
+        "gh api repos/o/r/pulls": False,
+        "gh -R owner/repo pr view 7": False,
+        "./ship.sh": True,
+        "timeout 900 shipyard pr": True,
+    }
+    url_got = {cmd: w.output_pr_url_counts(cmd) for cmd in url_cases}
+    with tempfile.TemporaryDirectory() as tmp:
+        home = pathlib.Path(tmp)
+        bindir = home / "bin"; bindir.mkdir()
+        marker = home / "gh-called"
+        for name in ("gh", "ghapp"):
+            fake = bindir / name
+            fake.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+            fake.chmod(0o755)
+        comment_payload = {
+            "tool_input": {"command": url_cases and next(iter(url_cases))},
+            "tool_response": {"stdout": json.dumps({
+                "html_url": "https://github.com/o/r/pull/705#issuecomment-1",
+                "body": "`shipyard pr` does not arm"})},
+            "cwd": str(home),
+            "session_id": "hook-comment-test",
+            "transcript_path": str(home / ".claude" / "session.jsonl"),
+        }
+        env = dict(__import__("os").environ)
+        env.update({"HOME": str(home), "PATH": f"{bindir}:/usr/bin:/bin"})
+        for inherited in list(env):
+            if inherited.startswith("CMUX_") or inherited.startswith("WHENCE_"):
+                env.pop(inherited, None)
+        comment_run = subprocess.run(
+            [sys.executable, str(pathlib.Path(__file__).parent / "whence"), "--hook"],
+            input=json.dumps(comment_payload), env=env, capture_output=True, text=True,
+            timeout=10,
+        )
+        comment_gh_called = marker.exists()
+    if url_got != url_cases or comment_run.returncode != 0 or comment_gh_called:
+        failed += 1
+        print(f"FAIL  review comment stamped: got={url_got!r} rc={comment_run.returncode} "
+              f"gh_called={comment_gh_called} err={comment_run.stderr[-300:]!r}")
+    else:
+        print("ok    a review comment that quotes a PR verb does not stamp the PR")
 
     # ── Regression: an orchestrator commits on top of the captured HEAD ──
     # The shell wrapper captures HEAD before `shipyard pr` runs; Shipyard then
