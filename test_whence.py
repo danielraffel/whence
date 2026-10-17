@@ -3223,6 +3223,76 @@ def main() -> int:
     else:
         print("ok    a git aimed at the clone by GIT_DIR or GIT_WORK_TREE blocks lock removal")
 
+    # Relative `-C`, `--git-dir` and `--work-tree` resolve against the git's
+    # cwd (each -C against the one before), as git itself resolves them.
+    with tempfile.TemporaryDirectory() as tmp:
+        b = os.path.realpath(tmp)
+        j = lambda *p: os.path.join(b, *p)
+        cli_cases = [
+            (["git", "-C", "clone", "status"], (j("clone"), [])),
+            (["git", "-C", "a", "-C", "b", "status"], (j("a", "b"), [])),
+            (["git", "--git-dir=clone/.git", "status"], (b, [j("clone", ".git")])),
+            (["git", "--git-dir", "clone/.git", "--work-tree", "clone", "log"],
+             (b, [j("clone", ".git"), j("clone")])),
+            (["git", "-C", "clone", "--git-dir=.git", "log"], (j("clone"), [j("clone", ".git")])),
+            (["git", "-c", "core.x=y", "status", "-C", "nope"], (b, [])),
+        ]
+        cli_got = [w._git_cli_paths(argv, b) for argv, _ in cli_cases]
+        # A running git has already chdir()ed for its -C.
+        cli_got.append(w._git_cli_paths(
+            ["git", "-C", "away", "--git-dir=../clone/.git", "log"], j("away"), True))
+    cli_want = [want for _, want in cli_cases] + [(j("away"), [j("clone", ".git")])]
+    if cli_got != cli_want:
+        failed += 1
+        print(f"FAIL  git -C/--git-dir/--work-tree resolution: got={cli_got} want={cli_want}")
+    else:
+        print("ok    git -C/--git-dir/--work-tree resolve against the cwd, -C cumulatively")
+
+    # And live: a git started from the clone's parent with only relative
+    # arguments and no GIT_* environment works in the clone.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp)
+        clone, away = base / "clone", base / "away"
+        for repo in (clone, away):
+            subprocess.run(["git", "init", "-q", str(repo)], capture_output=True)
+        def args_busy(args, extra_env=None, cwd_read_before_chdir=False):
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(base)}
+            env.update(extra_env or {})
+            proc = subprocess.Popen(["git", *args, "cat-file", "--batch"], cwd=str(base),
+                                    env=env, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(0.5)
+                got = w._read_procargs(str(proc.pid))
+                if cwd_read_before_chdir:
+                    # The cwd was read before git applied its -C.
+                    with mock.patch.object(w, "_process_cwd",
+                                           return_value=os.path.realpath(base)):
+                        busy = w._git_running_in(clone)
+                else:
+                    busy = w._git_running_in(clone)
+            finally:
+                try: proc.kill()
+                except OSError: pass
+                proc.wait()
+            # Control: the instrument read this process's arguments.
+            return busy, bool(got) and got[0][-len(args) - 2:-2] == args
+        live = [args_busy(["-C", "clone"]),
+                args_busy(["--git-dir=clone/.git"]),
+                args_busy(["--git-dir", "clone/.git"]),
+                args_busy(["--git-dir=away/.git", "--work-tree=clone"]),
+                # git has chdir()ed into away; its relative paths resolve there.
+                args_busy(["-C", "away", "--git-dir=../clone/.git"]),
+                args_busy(["-C", "away"], {"GIT_DIR": "../clone/.git"}),
+                args_busy(["-C", "clone"], cwd_read_before_chdir=True),
+                args_busy(["-C", "away"])]
+    live_want = [(True, True)] * 7 + [(False, True)]
+    if live != live_want:
+        failed += 1
+        print(f"FAIL  git aimed at the clone by relative arguments: got={live} want={live_want}")
+    else:
+        print("ok    a git aimed at the clone by relative -C/--git-dir/--work-tree blocks removal")
+
     # ── `whence --sweep` reaches sweep_tick ──
     # The module above is sliced before main(); load the whole script into its
     # own namespace (its __main__ guard does not fire) to test the dispatch.
