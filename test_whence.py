@@ -2781,6 +2781,33 @@ def main() -> int:
     else:
         print("ok    a stamp searches cmux once; the ref fallback reuses the scan")
 
+    # The test above opens the scope itself, so it cannot see a stamp that
+    # forgets to. collect() and the sweep's publication of one PR must each run
+    # inside a scope, and leave none open behind them.
+    seen = {}
+    def scoped_probe(name):
+        def probe(*args, **kwargs):
+            seen[name] = w._CMUX_LOOKUP_CACHE is not None
+            return {} if name == "collect" else True
+        return probe
+    @contextlib.contextmanager
+    def lock_acquired(*args, **kwargs):
+        yield True
+    with mock.patch.object(w, "_collect", side_effect=scoped_probe("collect")):
+        w.collect({}, "o/r")
+    after_collect = w._CMUX_LOOKUP_CACHE is None
+    with mock.patch.object(w, "_publication_lock", lock_acquired), \
+         mock.patch.object(w, "_publish_ledger_pr_serialized",
+                           side_effect=scoped_probe("publish")):
+        w._publish_ledger_pr("o/r#1", "abc", "1", "", {}, "sweep")
+    after_publish = w._CMUX_LOOKUP_CACHE is None
+    if seen != {"collect": True, "publish": True} or not (after_collect and after_publish):
+        failed += 1
+        print(f"FAIL  stamps open the cmux lookup scope: seen={seen} "
+              f"closed_after={after_collect, after_publish}")
+    else:
+        print("ok    collect() and the sweep's publication each run inside one cmux lookup scope")
+
     # collect() asks the tab's own workspace first (CMUX_WORKSPACE_ID).
     first_ws = []
     def own_ws_run(*args, **kwargs):
