@@ -2464,12 +2464,16 @@ _GH_GLOBAL_VALUE_FLAGS = ("-R", "--repo", "--hostname")
 _GH_API_VALUE_FLAGS = ("-X", "--method", "-f", "--raw-field", "-F", "--field", "-H",
                        "--header", "--input", "-q", "--jq", "-t", "--template",
                        "--cache", "-p", "--preview", "--hostname")
+# `gh api` options that give the request a body, which makes POST the default.
+_GH_API_BODY_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
 
 
 def _gh_opens_pr(argv: list[str]) -> bool:
     """Whether a `gh`/`ghapp` argv opens a pull request: `pr create`, after any
     global options (`gh -R owner/repo pr create`), or `api` with a POST to a
-    `.../pulls` endpoint (`gh api -X POST repos/o/r/pulls -f head=...`)."""
+    `.../pulls` endpoint. `gh api` sends a POST when given fields or an input
+    body and no explicit method, so `gh api repos/o/r/pulls -f head=...` opens
+    a PR while `gh api -X GET repos/o/r/pulls -f state=open` does not."""
     i = 1
     while i < len(argv) and argv[i].startswith("-"):
         flag = argv[i].split("=", 1)[0]
@@ -2479,10 +2483,12 @@ def _gh_opens_pr(argv: list[str]) -> bool:
         return True
     if not rest or rest[0] != "api":
         return False
-    method, endpoint, j = "", "", 1
+    method, endpoint, has_body, j = "", "", False, 1
     while j < len(rest):
         word = rest[j]
         flag, eq, value = word.partition("=")
+        if flag in _GH_API_BODY_FLAGS or (word[:2] in ("-f", "-F") and len(word) > 2):
+            has_body = True
         if flag in ("-X", "--method"):
             method = value if eq else (rest[j + 1] if j + 1 < len(rest) else "")
             j += 1 if eq else 2
@@ -2498,7 +2504,8 @@ def _gh_opens_pr(argv: list[str]) -> bool:
             continue
         endpoint = endpoint or word
         j += 1
-    return method.upper() == "POST" and endpoint.rstrip("/").endswith("/pulls")
+    effective = method.upper() or ("POST" if has_body else "GET")
+    return effective == "POST" and endpoint.rstrip("/").endswith("/pulls")
 
 
 def output_pr_url_counts(cmd: str) -> bool:

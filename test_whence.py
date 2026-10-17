@@ -844,6 +844,10 @@ def main() -> int:
             ("gh api POST to pulls", "gh api -X POST repos/o/r/pulls -f head=x -f base=main",
              (True, False, None)),
             ("gh api GET of pulls", "gh api repos/o/r/pulls", (False, False, None)),
+            ("gh api implicit POST to pulls", "gh api repos/o/r/pulls -f head=x -f base=main",
+             (True, False, None)),
+            ("gh api explicit GET with fields", "gh api -X GET repos/o/r/pulls -f state=open",
+             (False, False, None)),
             ("nested background shell",
              f"nohup bash -lc 'cd {tmp} && exec shipyard pr --base main' >/tmp/ship.log 2>&1 &",
              (True, True, tmp)),
@@ -2136,6 +2140,16 @@ def main() -> int:
         "gh api -X POST repos/o/r/pulls -f head=fix -f base=main -f title=t": True,
         "ghapp api --method POST /repos/o/r/pulls --input pr.json": True,
         "gh api -XPOST repos/o/r/pulls -f head=fix": True,
+        # With fields or an input body and no method, gh api sends a POST, the
+        # commonest form (stamped=False on m1 for each of these first three).
+        "gh api repos/o/r/pulls -f head=b -f base=main -f title=t": True,
+        "gh api repos/o/r/pulls -F head=b -F base=main -F title=t": True,
+        "gh api --input pr.json repos/o/r/pulls": True,
+        "ghapp api repos/o/r/pulls --raw-field head=b --field base=main": True,
+        "gh api repos/o/r/pulls -fhead=b": True,
+        # An explicit GET with fields stays a read.
+        "gh api -X GET repos/o/r/pulls -f state=open": False,
+        "gh api --method GET repos/o/r/pulls -F per_page=100": False,
         # Control: reading the pulls list is not opening one.
         "gh api repos/o/r/pulls": False,
         "gh -R owner/repo pr view 7": False,
