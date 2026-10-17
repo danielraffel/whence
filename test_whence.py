@@ -842,6 +842,57 @@ def main() -> int:
         print(f"FAIL  repo_is_private: {seen!r}")
     else:
         print("ok    repo_is_private reads GitHub's flag and is None when unreadable")
+    # (A private repository, so the footer is written: a public one gets none.)
+    # The 2026-10-04 #9477 loss: an author added an Evidence section while a
+    # stamp was mid-flight (its label calls take seconds). The stamp then wrote
+    # back the body it had read before the edit, and the section was gone. A
+    # stamp must keep every line it does not own, whenever it was written.
+    class RacingGitHub(StatefulGitHub):
+        def __init__(self, author_edit_on_first_mutation):
+            super().__init__()
+            self.body = "Summary\n"
+            self.author_edit = author_edit_on_first_mutation
+
+        def __call__(self, *args, **kwargs):
+            argv = list(args[1:])
+            if self.author_edit and argv and argv[0] == "api" and "--method" in argv:
+                self.body += "\n## Evidence\n\nThe author's proof.\n"
+                self.author_edit = False
+            return super().__call__(*args, **kwargs)
+
+    race_cfg = dict(stamp_cfg)
+    race_prov = {field: "" for field in w.FIELDS}
+    race_prov.update({"agent": "codex", "host": "m5", "stamped": "now"})
+    racing = RacingGitHub(author_edit_on_first_mutation=True)
+    with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
+         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=racing), \
+         mock.patch.object(w, "repo_is_private", return_value=True):
+        w.apply_stamp("24", race_prov, race_cfg, True, True,
+                      repo="danielraffel/whence", source="test")
+    if "## Evidence" not in racing.body or not w.is_stamped(racing.body):
+        failed += 1
+        print(f"FAIL  stamp dropped an edit made while it ran: {racing.body!r}")
+    else:
+        print("ok    a section added while a stamp runs survives the stamp")
+
+    # Restamping replaces whence's own block where it stands and keeps an
+    # author section written after it, byte for byte.
+    restamp = RacingGitHub(author_edit_on_first_mutation=False)
+    restamp.body = ("Summary\n\n" + w.footer(race_prov, race_cfg, ["1·codex"])
+                    + "\n\n## Evidence\n\nKept.\n")
+    race_prov.update({"agent": "claude", "stamped": "later"})
+    with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
+         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=restamp), \
+         mock.patch.object(w, "repo_is_private", return_value=True):
+        w.apply_stamp("24", race_prov, race_cfg, True, True,
+                      repo="danielraffel/whence", source="test")
+    kept = restamp.body.split("<!-- /whence -->", 1)[-1]
+    if (kept != "\n\n## Evidence\n\nKept.\n" or not restamp.body.startswith("Summary\n\n")
+            or w.prior_prov(restamp.body).get("agent") != "claude"):
+        failed += 1
+        print(f"FAIL  restamp moved or dropped the author's section: {restamp.body!r}")
+    else:
+        print("ok    a restamp replaces only whence's block and keeps the author's section")
 
     label_pages = lambda labels: subprocess.CompletedProcess(
         [], 0, json.dumps([[{"name": n, "color": c} for n, c in labels.items()]]), "")
