@@ -3185,6 +3185,44 @@ def main() -> int:
     else:
         print("ok    a git process working in the clone blocks lock removal")
 
+    # A git aimed at the clone through its environment, from a cwd elsewhere,
+    # counts too: GIT_DIR (absolute, or relative to its cwd) or GIT_WORK_TREE.
+    # A real, long-running git (`cat-file --batch` waits on stdin) is used:
+    # macOS withholds the environment of SIP platform binaries such as sleep.
+    with tempfile.TemporaryDirectory() as tmp:
+        base = pathlib.Path(tmp)
+        clone, away = base / "clone", base / "away"
+        for repo in (clone, away):
+            subprocess.run(["git", "init", "-q", str(repo)], capture_output=True)
+        def env_busy(extra):
+            env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            env.update(extra)
+            proc = subprocess.Popen(["git", "cat-file", "--batch"], cwd=str(away), env=env,
+                                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+            try:
+                time.sleep(0.5)
+                seen_env = w._read_process_environ(str(proc.pid)) or {}
+                busy = w._git_running_in(clone)
+            finally:
+                try: proc.kill()
+                except OSError: pass
+                proc.wait()
+            # Control: the instrument read this process's environment.
+            return busy, all(seen_env.get(k) == v for k, v in extra.items())
+        gitdir_abs = env_busy({"GIT_DIR": str(clone / ".git")})
+        gitdir_rel = env_busy({"GIT_DIR": "../clone/.git"})
+        worktree = env_busy({"GIT_DIR": str(away / ".git"), "GIT_WORK_TREE": str(clone)})
+        unrelated = env_busy({"GIT_DIR": str(away / ".git")})
+    want_env = [(True, True), (True, True), (True, True), (False, True)]
+    got_env = [gitdir_abs, gitdir_rel, worktree, unrelated]
+    if got_env != want_env:
+        failed += 1
+        print(f"FAIL  git aimed at the clone by environment: got={got_env} want={want_env} "
+              "(busy, env read)")
+    else:
+        print("ok    a git aimed at the clone by GIT_DIR or GIT_WORK_TREE blocks lock removal")
+
     # ── `whence --sweep` reaches sweep_tick ──
     # The module above is sliced before main(); load the whole script into its
     # own namespace (its __main__ guard does not fire) to test the dispatch.

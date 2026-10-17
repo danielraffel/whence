@@ -3963,6 +3963,61 @@ def _process_cwd(pid: str) -> str | None:
     return None
 
 
+def _read_process_environ(pid: str) -> dict[str, str] | None:
+    """Another process's whole environment (this user's processes only), or None
+    when it cannot be read: /proc on Linux, KERN_PROCARGS2 on macOS. Unlike
+    _process_env() it is exact for values with spaces (paths) and tells an
+    unreadable environment apart from an empty one. macOS withholds it for SIP
+    platform binaries such as /bin/sleep, but not for git."""
+    proc = pathlib.Path("/proc") / pid / "environ"
+    if proc.exists():
+        try: raw = proc.read_bytes().split(b"\0")
+        except OSError: return None
+    elif sys.platform == "darwin":
+        import ctypes, ctypes.util
+        try:
+            libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            mib = (ctypes.c_int * 3)(1, 49, int(pid))   # CTL_KERN, KERN_PROCARGS2
+            size = ctypes.c_size_t(1 << 20)
+            buf = ctypes.create_string_buffer(size.value)
+            if libc.sysctl(mib, 3, buf, ctypes.byref(size), None, 0) != 0:
+                return None
+        except (OSError, ValueError, AttributeError):
+            return None
+        data = buf.raw[:size.value]
+        if len(data) < 4:
+            return None
+        # argc, the exec path, NUL padding, argc arguments, then the environment.
+        argc = int.from_bytes(data[:4], sys.byteorder)
+        parts = data[4:].split(b"\0")
+        i = 1
+        while i < len(parts) and parts[i] == b"":
+            i += 1
+        raw = parts[i + argc:]
+    else:
+        return None
+    env = {}
+    for item in raw:
+        if not item:
+            if env:
+                break
+            continue
+        key, eq, value = item.decode("utf-8", "replace").partition("=")
+        if eq:
+            env[key] = value
+    return env
+
+
+def _alive(pid: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+    except (ProcessLookupError, ValueError):
+        return False
+    except OSError:
+        pass
+    return True
+
+
 def _git_running_in(clone: pathlib.Path) -> bool:
     """Whether a git process may be working in `clone`. True whenever it cannot
     tell, so a lock is never removed from under a live git."""
@@ -3982,15 +4037,24 @@ def _git_running_in(clone: pathlib.Path) -> bool:
             return True
         cwd = _process_cwd(pid)
         if cwd is None:
-            try:
-                os.kill(int(pid), 0)
-            except (ProcessLookupError, ValueError):
+            if not _alive(pid):
                 continue  # it exited between the listing and the lookup
-            except OSError:
-                pass
             return True
         if cwd == root or cwd.startswith(root + os.sep):
             return True
+        # `GIT_DIR=<clone>/.git git ...` works in the clone from anywhere.
+        env = _read_process_environ(pid)
+        if env is None:
+            if not _alive(pid):
+                continue
+            return True
+        for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE"):
+            value = env.get(key)
+            if not value:
+                continue
+            target = os.path.realpath(os.path.join(cwd, value))
+            if target == root or target.startswith(root + os.sep):
+                return True
     return False
 
 
