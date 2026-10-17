@@ -3002,6 +3002,101 @@ def main() -> int:
     else:
         print("ok    --unstamped: lists unstamped PRs with their ledger state, exit 1")
 
+    # ── The sweep timer updates the clone ──
+    # A host whose PRs come from plain shells only runs --pre-exec, which never
+    # self-updates; on m1 the clone sat weeks behind origin. The 10-minute sweep
+    # runs on every host, so it fast-forwards the clone (once a day) itself.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        git = lambda cwd, *a: subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.name=t", "-c", "user.email=t@t",
+             "-c", "commit.gpgsign=false", *a], capture_output=True, text=True)
+        origin, seed, clone = root / "origin.git", root / "seed", root / "clone"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                       capture_output=True)
+        subprocess.run(["git", "clone", "-q", str(origin), str(seed)], capture_output=True)
+        (seed / "f").write_text("1\n"); git(seed, "add", "f")
+        git(seed, "commit", "-q", "-m", "one"); git(seed, "push", "-q", "origin", "HEAD:main")
+        subprocess.run(["git", "clone", "-q", str(origin), str(clone)], capture_output=True)
+        (seed / "f").write_text("2\n"); git(seed, "commit", "-q", "-am", "two")
+        git(seed, "push", "-q", "origin", "HEAD:main")
+        want = git(seed, "rev-parse", "HEAD").stdout.strip()
+        cfg_dir = root / "cfg"; cfg_dir.mkdir()
+        sweeps = []
+        def tick():
+            with mock.patch.object(w, "_config_for_sweep",
+                                   return_value=({"labels": True, "footer": True}, False)), \
+                 mock.patch.object(w, "sweep", side_effect=lambda cfg: sweeps.append(1) or 0), \
+                 mock.patch.object(w, "_self_clone", return_value=clone), \
+                 mock.patch.object(w, "CFG_DIR", cfg_dir), \
+                 mock.patch.object(w, "PR_HOOK", root / "absent-pr-hook"), \
+                 mock.patch.object(w, "HOOK_FILE", root / "absent-hook.sh"), \
+                 mock.patch("sys.stdout", __import__("io").StringIO()):
+                return w.sweep_tick("")
+        rc1 = tick()
+        first = git(clone, "rev-parse", "HEAD").stdout.strip()
+        (seed / "f").write_text("3\n"); git(seed, "commit", "-q", "-am", "three")
+        git(seed, "push", "-q", "origin", "HEAD:main")
+        rc2 = tick()
+        second = git(clone, "rev-parse", "HEAD").stdout.strip()
+        # A failing update must not cost the tick its sweep.
+        with mock.patch.object(w, "self_update", side_effect=RuntimeError("offline")):
+            rc3 = tick()
+        swept = len(sweeps)
+        # A failed pull retries the same day: offline at T, still held at T+60,
+        # pulled at T+700 once the origin is back, then held for a full day.
+        stamp = cfg_dir / ".last-selfupdate"
+        stamp.unlink()
+        (seed / "f").write_text("4\n"); git(seed, "commit", "-q", "-am", "four")
+        git(seed, "push", "-q", "origin", "HEAD:main")
+        four = git(seed, "rev-parse", "HEAD").stdout.strip()
+        T = 2_000_000_000
+        away = root / "origin-away.git"
+        retry = []
+        def tick_at(t):
+            with mock.patch.object(w, "_now_epoch", return_value=t):
+                tick()
+            retry.append((t, git(clone, "rev-parse", "HEAD").stdout.strip(),
+                          stamp.read_text().strip() if stamp.exists() else ""))
+        origin.rename(away)
+        tick_at(T)
+        away.rename(origin)
+        tick_at(T + 60)
+        tick_at(T + 700)
+        (seed / "f").write_text("5\n"); git(seed, "commit", "-q", "-am", "five")
+        git(seed, "push", "-q", "origin", "HEAD:main")
+        tick_at(T + 800)
+    want_retry = [(T, second, str(T - 86400 + w.SELF_UPDATE_RETRY)),
+                  (T + 60, second, str(T - 86400 + w.SELF_UPDATE_RETRY)),
+                  (T + 700, four, str(T + 700)),
+                  (T + 800, four, str(T + 700))]
+    if retry != want_retry:
+        failed += 1
+        print(f"FAIL  a failed self-update retries the same day: got={retry} want={want_retry}")
+    else:
+        print("ok    a failed self-update retries after one sweep interval, not a day")
+    if (rc1, rc2, rc3) != (0, 0, 0) or first != want or second != want or swept != 3:
+        failed += 1
+        print(f"FAIL  sweep self-update: rc={(rc1, rc2, rc3)} first={first == want} "
+              f"throttled={second == want} sweeps={swept}")
+    else:
+        print("ok    the sweep tick fast-forwards the clone once a day and still sweeps")
+
+    # ── `whence --sweep` reaches sweep_tick ──
+    # The module above is sliced before main(); load the whole script into its
+    # own namespace (its __main__ guard does not fire) to test the dispatch.
+    full = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("whence_full", loader=None))
+    exec((pathlib.Path(__file__).parent / "whence").read_text(), full.__dict__)  # noqa: S102
+    with mock.patch.object(sys, "argv", ["whence", "--sweep", "--no-footer"]), \
+         mock.patch.object(full, "sweep_tick", return_value=7) as tick_stub:
+        dispatched = full.main()
+    if dispatched != 7 or tick_stub.call_args_list != [mock.call(None, False, True)]:
+        failed += 1
+        print(f"FAIL  --sweep dispatch: rc={dispatched} calls={tick_stub.call_args_list}")
+    else:
+        print("ok    `whence --sweep` dispatches to sweep_tick with its flags")
+
     print(f"\n{'ALL PASS' if not failed else f'{failed} FAILED'}")
     return 1 if failed else 0
 

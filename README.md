@@ -410,14 +410,16 @@ If you drive whence from more than one machine, you want a change made on *any*
 one of them to reach the others — without caring which machine you edited on. The
 repo is the source of truth; two mechanisms keep every machine current:
 
-- **Automatic (self-update).** On its next stamp, each machine fast-forwards its
-  own clone to the repo (throttled to once/day) and reinstalls the hook if
-  anything moved. Zero setup, no cron — a machine that was offline catches up on
-  its own. Force it now with `whence --self-update`.
+- **Automatic (self-update).** On its next agent-hook stamp or sweep tick
+  (every 10 minutes), each machine fast-forwards its own clone to the repo
+  (throttled to once/day) and reinstalls the hook if anything moved. The sweep
+  covers machines whose PRs only ever come from plain shells, which no agent
+  hook runs on. A machine that was offline catches up on its own. Force it now
+  with `whence --self-update`.
 - **Instant (deploy fan-out).** Right after you push a change, `whence --deploy`
   pushes your local commits, then SSHes each host in `~/.config/whence/hosts`
   (one hostname per line) to pull + reinstall immediately. Unreachable hosts are
-  skipped — they'll self-update on their next stamp. Shell-wrapper generation is
+  skipped — they'll self-update on their next sweep. Shell-wrapper generation is
   deterministic: a reduced non-interactive SSH `PATH` cannot drop wrappers for
   tools that are available in the later interactive shell.
 

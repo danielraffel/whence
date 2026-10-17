@@ -2192,17 +2192,29 @@ def _now_epoch() -> int:
     return int(datetime.datetime.now(datetime.timezone.utc).timestamp())
 
 
-def _throttled(name: str, secs: int) -> bool:
+def _throttled(name: str, secs: int, claim: int | None = None) -> bool:
     """True at most once per `secs`, recording the tick — so the maintenance the
-    hook does (sweep, self-update) doesn't run on every single tool call."""
+    hook does (sweep, self-update) doesn't run on every single tool call.
+
+    With `claim`, the tick holds the slot for only `claim` seconds: the caller
+    marks success with _throttle_done(), and until then (or if it fails) the
+    next attempt is due `claim` seconds later instead of `secs`."""
     st = CFG_DIR / f".last-{name}"
     try: last = int(st.read_text().strip())
     except Exception: last = 0
-    if _now_epoch() - last < secs:
+    now = _now_epoch()
+    if now - last < secs:
         return False
     st.parent.mkdir(parents=True, exist_ok=True)
-    st.write_text(str(_now_epoch()))
+    st.write_text(str(now if claim is None else now - secs + claim))
     return True
+
+
+def _throttle_done(name: str) -> None:
+    """Record a successful claimed tick, so the next one is a full period away."""
+    st = CFG_DIR / f".last-{name}"
+    st.parent.mkdir(parents=True, exist_ok=True)
+    st.write_text(str(_now_epoch()))
 
 
 def is_stamped(body: str) -> bool:
@@ -3906,17 +3918,26 @@ def _self_clone() -> pathlib.Path:
     return here if (here / ".git").exists() else (pathlib.Path.home() / ".local/share/whence")
 
 
+SELF_UPDATE_RETRY = 600  # seconds; one sweep interval
+
+
 def self_update(force: bool = False) -> bool:
     """Fast-forward this whence clone to origin/main so every machine picks up a
     change made on any other machine — no matter which one made it. Throttled to
-    once/day from the hook; reinstalls the agent hook only if the clone moved."""
+    once/day across the agent hook and the sweep timer; refreshes the installed
+    hooks only if the clone moved."""
     clone = _self_clone()
     if not (clone / ".git").exists():
         return False
-    if not force and not _throttled("selfupdate", 86400):
+    # A failed pull (offline, a lock held by a concurrent tick) retries after
+    # SELF_UPDATE_RETRY rather than waiting a day; only a pull that succeeded
+    # holds the slot for the full day.
+    if not force and not _throttled("selfupdate", 86400, claim=SELF_UPDATE_RETRY):
         return False
     before = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
-    _git(str(clone), "pull", "--ff-only", "--quiet")
+    pulled = _git(str(clone), "pull", "--ff-only", "--quiet").returncode == 0
+    if pulled:
+        _throttle_done("selfupdate")
     after = _git(str(clone), "rev-parse", "HEAD").stdout.strip()
     if before and after and before != after:
         # Refresh the shim only. Wiring a config dir is the self-heal's job,
@@ -3935,7 +3956,7 @@ def self_update(force: bool = False) -> bool:
 def deploy() -> int:
     """Push local whence changes, then SSH each host in ~/.config/whence/hosts to
     pull + reinstall — instant propagation from whichever machine you edited on.
-    Unreachable hosts are skipped (they self-update on their next stamp)."""
+    Unreachable hosts are skipped (they self-update on their next sweep)."""
     clone = _self_clone()
     ahead = _git(str(clone), "rev-list", "--count", "@{u}..HEAD").stdout.strip()
     if ahead not in ("", "0"):
@@ -3954,9 +3975,31 @@ def deploy() -> int:
                   "./whence --install-hook >/dev/null 2>&1; } && echo whence-ok")
         r = sh("ssh", "-o", "ConnectTimeout=8", h, remote)
         ok = r.returncode == 0 and "whence-ok" in r.stdout
-        print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on next stamp'}")
+        print(f"  {h}: {'updated' if ok else 'unreachable — will self-update on its next sweep'}")
         rc = rc or (0 if ok else 1)
     return rc
+
+
+def sweep_tick(hide: str, no_labels: bool = False, no_footer: bool = False) -> int:
+    """One run of the 10-minute sweep timer every host runs."""
+    # Inbound config catch-up. A machine that was offline when you edited
+    # converges here after it wakes.
+    cfg, config_changed = _config_for_sweep(hide)
+    if config_changed:
+        print("whence: pulled updated fleet config")
+    # Code catch-up too. The agent hook is not enough on its own: a host whose
+    # PRs come from plain shells only ever runs --pre-exec, which never
+    # updates, so its clone stayed weeks behind. The new code takes effect from
+    # the next tick.
+    try:
+        if self_update():
+            print("whence: updated to latest")
+    except Exception:
+        pass
+    cfg["labels"] = cfg["labels"] and not no_labels
+    cfg["footer"] = cfg["footer"] and not no_footer
+    print(f"whence: swept {sweep(cfg)} PR(s)")
+    return 0
 
 
 def main() -> int:
@@ -4061,15 +4104,7 @@ def main() -> int:
         preexec_capture(args.pre_exec, cfg, post_labels, post_footer)
         return 0
     if args.sweep:
-        # Inbound config catch-up on the same 10-min tick every host already runs.
-        # A machine that was offline when you edited converges here after it wakes.
-        cfg, config_changed = _config_for_sweep(args.hide)
-        if config_changed:
-            print("whence: pulled updated fleet config")
-        cfg["labels"] = cfg["labels"] and not args.no_labels
-        cfg["footer"] = cfg["footer"] and not args.no_footer
-        print(f"whence: swept {sweep(cfg)} PR(s)")
-        return 0
+        return sweep_tick(args.hide, args.no_labels, args.no_footer)
     if args.setup:
         return setup(args.host)
     if args.print_hook:
