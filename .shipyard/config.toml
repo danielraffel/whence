@@ -3,6 +3,11 @@ name = "whence"
 type = "python"
 platforms = ["macos"]
 
+# This repository has no skill-sync or version-bump gate scripts, so
+# `shipyard pr` skips those gates instead of refusing to start.
+[validation]
+pr_gates = false
+
 # Keep this identical to Whence's canonical local acceptance on the deployed
 # Python 3.9 runtime and the current developer Python.
 [validation.default]
