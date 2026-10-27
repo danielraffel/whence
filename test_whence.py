@@ -832,6 +832,16 @@ def main() -> int:
     else:
         print("ok    public repo gets labels but no footer; an old footer is removed; private keeps it")
 
+    # A public PR body may carry ghapp's protected session stamp. With no
+    # Whence footer requested and no old Whence block present, stamping labels
+    # must not rewrite that author body just to normalize its final newline.
+    protected = "Body\n<!-- session: ghapp-owned -->"
+    if w.stamped_body(protected, "") != protected:
+        failed += 1
+        print("FAIL  public body without footer was rewritten")
+    else:
+        print("ok    public body without footer is preserved byte-for-byte")
+
     visibility = [subprocess.CompletedProcess([], 0, "false\n", ""),
                   subprocess.CompletedProcess([], 0, "true\n", ""),
                   subprocess.CompletedProcess([], 0, "maybe\n", "")]

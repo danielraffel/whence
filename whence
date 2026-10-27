@@ -2258,6 +2258,12 @@ def stamped_body(body: str, footer_text: str) -> str:
     block appended. An empty `footer_text` removes the block."""
     body = body or ""
     blocks = list(MARK_RE.finditer(body))
+    # Public repositories normally suppress the provenance footer. Preserve the
+    # author's body byte-for-byte when there is no old Whence block to remove;
+    # ghapp protects its own session stamp and rejects an otherwise pointless
+    # PATCH that only adds a trailing newline.
+    if not footer_text and not blocks:
+        return body
     if blocks:
         first = blocks[0]
         # Keep the newline that ended the old block, so a replay is byte-equal.
@@ -2268,7 +2274,7 @@ def stamped_body(body: str, footer_text: str) -> str:
         replaced = body[:first.start()] + block + rest
         return replaced if footer_text else replaced.rstrip() + "\n"
     stripped = body.rstrip()
-    return (stripped + "\n\n" + footer_text) if footer_text else (stripped + "\n")
+    return stripped + "\n\n" + footer_text
 
 
 def apply_stamp(pr: str, p: dict, cfg: dict, post_labels: bool, post_footer: bool,
@@ -3487,7 +3493,13 @@ def _sweep_serialized(cfg: dict, max_items: int,
                 except RuntimeError:
                     if deadline - time.monotonic() <= PROCESS_TERM_GRACE * 2:
                         break
-                    raise
+                    # One protected author/session body must not strand every
+                    # later ledger entry. Leave this record retryable and let
+                    # the next sweep revisit it after the underlying condition
+                    # is fixed.
+                    print(f"whence: sweep could not publish {key} PR #{pr['number']}",
+                          file=sys.stderr)
+                    continue
     if last_attempted:
         _write_sweep_cursor(last_attempted)
     # Network discovery above intentionally runs without holding the process
