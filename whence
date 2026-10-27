@@ -369,6 +369,18 @@ def ensure_repo_labels(client: str, repo: str,
         found = find(name)
         current_name, current = found if found else (name, None)
         if current is not None and current.lower() == color:
+            if current_name == name:
+                continue
+            # Converge spelling too. The API identity is case-insensitive, but
+            # the PR label chip is not; keep the captured canonical form so the
+            # post-write numbered-label check sees the same value.
+            github_call(
+                client, "api", "--method", "PATCH",
+                _api_endpoint(repo, f"labels/{_encoded_path(current_name)}"),
+                "-f", f"new_name={name}", "-f", f"color={color}",
+                repo=repo)
+            existing.pop(current_name, None)
+            existing[name] = color
             continue
         if current is None:
             try:
