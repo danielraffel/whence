@@ -354,9 +354,20 @@ def ensure_repo_labels(client: str, repo: str,
     successful provenance stamp.
     """
     existing = _repo_labels(client, repo)
+
+    def find(name: str) -> tuple[str, str] | None:
+        # GitHub treats label names case-insensitively, while the list API keeps
+        # the original spelling. Match that identity before attempting a create
+        # so a title-cased label from an older stamp cannot produce 422
+        # already_exists errors.
+        folded = name.casefold()
+        return next(((actual, value) for actual, value in existing.items()
+                     if actual.casefold() == folded), None)
+
     for name, color in labels:
         color = color.lower()
-        current = existing.get(name)
+        found = find(name)
+        current_name, current = found if found else (name, None)
         if current is not None and current.lower() == color:
             continue
         if current is None:
@@ -370,19 +381,23 @@ def ensure_repo_labels(client: str, repo: str,
                 # A concurrent hook may have created the same label after our
                 # complete read. Accept only authoritative convergence; any
                 # absent label or subsequent correction failure remains fatal.
-                raced = _repo_labels(client, repo).get(name)
+                raced_labels = _repo_labels(client, repo)
+                raced = next(((actual, value) for actual, value in raced_labels.items()
+                              if actual.casefold() == name.casefold()), None)
                 if raced is None:
                     raise mutation_error
-                if raced.lower() == color:
-                    existing[name] = raced
+                current_name, raced_color = raced
+                if raced_color.lower() == color:
+                    existing[current_name] = raced_color
                     continue
-                current = raced
+                current = raced_color
         if current is not None:
             github_call(
                 client, "api", "--method", "PATCH",
-                _api_endpoint(repo, f"labels/{_encoded_path(name)}"),
+                _api_endpoint(repo, f"labels/{_encoded_path(current_name)}"),
                 "-f", f"new_name={name}", "-f", f"color={color}",
                 repo=repo)
+            existing.pop(current_name, None)
         existing[name] = color
 
 

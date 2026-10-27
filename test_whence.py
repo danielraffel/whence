@@ -760,6 +760,22 @@ def main() -> int:
     else:
         print("ok    ghapp provenance API covers create/recolor/remove/body/resolve and replay")
 
+    # GitHub label identity is case-insensitive even though its list response
+    # preserves spelling. A captured lowercase tab must converge on an older
+    # title-cased label without attempting a duplicate create.
+    mixed = StatefulGitHub()
+    mixed.repo_labels = {"4·Apple Silicon DSP…": "8250df"}
+    with mock.patch.dict(w.os.environ, {"WHENCE_GH": app}, clear=True), \
+         mock.patch.object(w, "GH", app), mock.patch.object(w, "sh", side_effect=mixed):
+        w.ensure_repo_labels(app, "danielraffel/whence", [("4·apple silicon dsp…", "8250df")])
+    mixed_creates = [m for m in mixed.mutations if m[1] == "POST"
+                    and m[2].endswith("/labels")]
+    if mixed_creates:
+        failed += 1
+        print("FAIL  case-insensitive repository label matching attempted a duplicate create")
+    else:
+        print("ok    repository label matching is case-insensitive")
+
     # surface.list with no parameters lists only the SELECTED workspace. A tab in
     # another workspace (m5s, 2026-10-16: Codex PRs with no 3·/4· labels and
     # origin_state lookup_failed) must still be found: its own workspace first,
