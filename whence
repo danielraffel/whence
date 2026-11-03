@@ -42,8 +42,8 @@ CMUX_ID_FIELDS = ("cmux_workspace_id", "cmux_workspace_ref", "cmux_pane_id",
 UNKNOWN_LABEL = "unknown"
 LABEL_FIELDS = ["agent", "host", "workspace", "tab", "route"]
 DEFAULT_COLORS = {"agent": "1f6feb", "host": "1a7f37", "workspace": "bf8700",
-                  "tab": "8250df", "route": "d4a72c"}
-NUMBERED_LABEL_RE = re.compile(r"^([1-5])·")
+                  "tab": "8250df", "route": "d4a72c", "client": "6f42c1"}
+NUMBERED_LABEL_RE = re.compile(r"^([1-6])·")
 
 # Friendly resume syntax for agents whose CLI we've verified. ANY other agent
 # still works via the cmux-sourced `relaunch` command below — this is just for a
@@ -883,7 +883,7 @@ def safe_public_display(value: str, maxlen: int = 160) -> str:
 
 def terminal_runtime(value: str, default: str = "") -> str:
     value = stable_identifier(value)
-    return value if value in ("cmux", "herdr") else default
+    return value if value in ("cmux", "herdr", "orca") else default
 
 
 def terminal_instance_id(value: str) -> str:
@@ -1274,6 +1274,12 @@ def labels_for(p: dict, cfg: dict) -> list[tuple[str, str]]:
             if order:
                 name = f"{i + 1}\u00b7{name}"          # 1·  2·  3·  4·  5·
             out.append((name, cfg["colors"].get(f, "ededed")))
+    client = terminal_runtime(p.get("terminal", ""))
+    if client and "terminal" not in cfg["hide"]:
+        name = _clip(client, cfg.get("label_maxlen", 24))
+        if order:
+            name = f"6\u00b7{name}"
+        out.append((name, cfg["colors"].get("client", "6f42c1")))
     return out
 
 
@@ -3768,7 +3774,9 @@ def reorder_labels(cfg: dict, repo: str) -> int:
     footer is untouched either way. New tab labels created later get the newest ids
     and naturally sort last; re-run this only if a new agent/host/workspace appears."""
     color2role = {cfg["colors"].get(r, ""): r for r in LABEL_FIELDS}
+    color2role[cfg["colors"].get("client", "6f42c1")] = "client"
     order = {r: i for i, r in enumerate(LABEL_FIELDS)}
+    order["client"] = len(LABEL_FIELDS)
     res = sh(GH, "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
              "--json", "number,labels")
     try: prs = json.loads(res.stdout or "[]")

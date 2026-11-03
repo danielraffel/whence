@@ -18,8 +18,10 @@ follow-up you have no idea which of your twelve open sessions to go ask.
   (Two tabs sharing a title get the cmux `surface:N` ref appended so you can still
   tell them apart.)
 
-  Every PR gets all five numbered labels (`1·` agent, `2·` host, `3·` workspace,
-  `4·` tab, `5·` route), always in that format. A value whence cannot learn is
+  Every PR gets all five numbered identity labels (`1·` agent, `2·` host, `3·` workspace,
+  `4·` tab, `5·` route), always in that format. When the terminal client is known,
+  Whence also adds an optional `6·` client label (`cmux`, `orca`, or `herdr`). A value
+  whence cannot learn is
   `unknown` rather than a missing label: an unnamed workspace is `3·unknown`
   (cmux auto-titles it after one of its tabs, which would read as a wrong
   workspace name), and a PR pushed from a shell no agent owns is
@@ -649,7 +651,7 @@ in `host-label`.
 generic native session and recovery fields above; cmux otherwise discovers the
 tab and universal relaunch command automatically.
 
-### Label order — agent, host, workspace, tab, route
+### Label order — agent, host, workspace, tab, route, client
 
 whence adds labels in agent→host→workspace→tab→route order, but **GitHub decides how the
 chips display**, and — confirmed by reading the rendered DOM — it uses *two

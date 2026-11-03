@@ -1341,6 +1341,7 @@ def main() -> int:
         else: print(f"ok    safe_public_command({src!r}) -> {got!r}")
 
     if (w.terminal_runtime("cmux") != "cmux" or w.terminal_runtime("herdr") != "herdr"
+            or w.terminal_runtime("orca") != "orca"
             or w.terminal_runtime("subrouter") != ""
             or w.terminal_instance_id("pane:42") != ""
             or w.terminal_instance_id("pane:abc") != ""
@@ -2747,7 +2748,8 @@ def main() -> int:
     for name, prov in lc.items():
         labels = [n for n, _ in w.labels_for(prov, label_cfg)]
         problems = []
-        if [n.split("·", 1)[0] for n in labels] != ["1", "2", "3", "4", "5"]:
+        expected_classes = ["1", "2", "3", "4", "5"] + (["6"] if prov.get("terminal") else [])
+        if [n.split("·", 1)[0] for n in labels] != expected_classes:
             problems.append(f"labels {labels}")
         if any(not n.split("·", 1)[1] for n in labels):
             problems.append(f"empty label value {labels}")
@@ -2768,7 +2770,7 @@ def main() -> int:
         print(f"FAIL  label/command consistency: {inconsistent} resume_ok={resume_ok} "
               f"resumes={ {k: v['resume'] for k, v in lc.items()} }")
     else:
-        print("ok    every launcher path gets five numbered labels and one command shape")
+        print("ok    every launcher path gets required labels plus a client label when terminal runtime is known")
 
     # The six cmux ids, the jump that focuses the pane, and the one-paste relaunch.
     def cmux_ids_run(*args, **kwargs):
