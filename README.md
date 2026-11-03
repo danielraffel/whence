@@ -567,7 +567,9 @@ WHENCE_ROUTE=subrouter \
 shipyard pr
 ```
 
-`WHENCE_TERMINAL_WORKSPACE` is optional; HerdR normally needs only a tab/pane.
+`WHENCE_TERMINAL_WORKSPACE` is optional; HerdR normally needs only a tab/pane. Orca
+uses `WHENCE_TERMINAL_RUNTIME=orca` for the same portable client distinction; current
+Orca builds set that marker automatically for local PTYs.
 Whence omits it when it duplicates the tab. `terminal_address` is a reusable
 location such as `pane:42`; it is not identity. `terminal_instance` is optional
 and must come only from an adapter that can prove a non-reusable incarnation.
@@ -653,7 +655,7 @@ tab and universal relaunch command automatically.
 
 ### Label order — agent, host, workspace, tab, route, client
 
-whence adds labels in agent→host→workspace→tab→route order, but **GitHub decides how the
+whence adds labels in agent→host→workspace→tab→route→client order when the client is known, but **GitHub decides how the
 chips display**, and — confirmed by reading the rendered DOM — it uses *two
 different* sort orders depending on where you look:
 
